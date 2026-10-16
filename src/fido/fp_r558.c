@@ -589,9 +589,7 @@ fp_result_t fp_enroll(uint16_t *slot_out) {
         }
         if (res == FP_OK) {
             uint8_t code = 0xFF;
-            fp_led_saving(true);
             fp_sensor_status_t st = fp_sensor_store(fp_uart_transport(), &s, FP_BUF_1, slot, &code);
-            fp_led_saving(false);
             if (st != FP_SENSOR_OK || code != FP_CONF_OK) {
                 res = FP_ERR_SENSOR;
             }

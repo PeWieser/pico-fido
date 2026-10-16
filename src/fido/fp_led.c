@@ -32,6 +32,7 @@ static tNeopixel ring_pixels[FP_LED_COUNT];
 
 static volatile bool requesting = false;
 static volatile bool saving = false;
+static volatile bool enrolling = false;
 static volatile uint8_t result = 0;          /* 0 none, 1 success, 2 failure */
 static volatile uint32_t result_until = 0;
 
@@ -48,6 +49,10 @@ void fp_led_op_end(bool ok) {
 
 void fp_led_saving(bool on) {
     saving = on;
+}
+
+void fp_led_enrolling(bool on) {
+    enrolling = on;
 }
 
 /* Same colour order mapping as led_neopixel.c, so the PHY LED order setting applies to the ring too. */
@@ -91,6 +96,13 @@ static void ring_set_color(uint8_t color, uint32_t led_brightness, float progres
         float x = (float)phase / (float)FP_LED_PULSE_PERIOD_MS;      /* 0..1 */
         float tri = x < 0.5f ? 2.0f * x : 2.0f * (1.0f - x);          /* triangle 0..1..0 */
         b = (uint8_t)(20.0f + 235.0f * tri);
+    }
+    else if (enrolling) {
+        /* Breathing between light blue (about 15 %) and full blue. */
+        uint32_t phase = now % FP_LED_BREATH_PERIOD_MS;
+        float x = (float)phase / (float)FP_LED_BREATH_PERIOD_MS;
+        float tri = x < 0.5f ? 2.0f * x : 2.0f * (1.0f - x);
+        b = (uint8_t)(40.0f + 215.0f * tri);
     }
     else if (result != 0 && now < result_until) {
         if (result == 1) {
@@ -137,6 +149,10 @@ void fp_led_op_end(bool ok) {
 }
 
 void fp_led_saving(bool on) {
+    (void)on;
+}
+
+void fp_led_enrolling(bool on) {
     (void)on;
 }
 

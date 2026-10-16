@@ -348,6 +348,7 @@ static int cbor_vendor_generic(uint8_t cmd, const uint8_t *data, size_t len) {
          *   0x03 enroll            -> {1: slot}
          *   0x04 delete            -> key 2 param {1: slot as 2 bytes BE, 0xFFFF = all}, or no param = all
          *   0x05 unlock            -> {}
+         * No user presence button is required: the PIN token authorises, the sensor is the interaction.
          */
         if (vendorCmd == 0x01) {
             fp_status_t st;
@@ -375,9 +376,7 @@ static int cbor_vendor_generic(uint8_t cmd, const uint8_t *data, size_t len) {
             if (auth_ret != 0) {
                 CBOR_ERROR(auth_ret);
             }
-            if (check_user_presence() == false) {
-                CBOR_ERROR(CTAP2_ERR_OPERATION_DENIED);
-            }
+            /* No button: the PIN token is the authorisation, the fingerprint sensor is the only user interaction. */
             fp_result_t fres = FP_OK;
             uint16_t value = 0;
             if (vendorCmd == 0x02) {
@@ -387,7 +386,9 @@ static int cbor_vendor_generic(uint8_t cmd, const uint8_t *data, size_t len) {
             }
             else if (vendorCmd == 0x03) {
                 fp_led_op_begin();
+                fp_led_enrolling(true);
                 fres = fp_enroll(&value);
+                fp_led_enrolling(false);
                 fp_led_op_end(fres == FP_OK);
             }
             else if (vendorCmd == 0x04) {

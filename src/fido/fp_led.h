@@ -19,7 +19,8 @@
  * Ring behaviour:
  *   idle                    off
  *   passkey request         blue, steady
- *   saving a credential     blue, pulsing
+ *   saving a passkey        blue, pulsing
+ *   enrolling a finger      blue, breathing (light to strong blue)
  *   success                 green, steady for FP_LED_RESULT_MS
  *   failure                 red, steady for FP_LED_RESULT_MS
  */
@@ -38,7 +39,10 @@ void fp_led_op_begin(void);
 /* The operation ended: green on success, red otherwise. */
 void fp_led_op_end(bool ok);
 
-/* Credential or template is being written to flash: blue pulse while true. */
+/* A passkey is being written to flash: blue pulse while true. */
 void fp_led_saving(bool on);
+
+/* Fingerprint enrollment is running: blue breathing between light and strong blue while true. */
+void fp_led_enrolling(bool on);
 
 #endif /* FP_LED_H_ */

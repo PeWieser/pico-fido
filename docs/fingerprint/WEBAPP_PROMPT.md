@@ -86,17 +86,18 @@ Die PIN selbst: nur für den Token-Schritt verwenden, nicht speichern, nicht in 
    Das klar anzeigen und keinen Fingerabdruck-Bereich zeigen.
 2. **Nicht gekoppelt (`paired = false`).** Hinweis zeigen: „Koppelt nur den Sensor, der in dieses Gerät eingebaut ist.
    Ein anderer Sensor wird nur akzeptiert, wenn der bisherige Sensor nicht mehr angeschlossen ist.“
-   PIN abfragen → Token holen → `pair` senden. Während der Anfrage Spinner und Text „Bitte am Gerät bestätigen,
-   falls der Taster konfiguriert ist“.
+   PIN abfragen → Token holen → `pair` senden. Während der Anfrage Spinner und Text „Der Sensor wird eingerichtet.“
+   Kein Tastendruck nötig.
 3. **Gekoppelt, aber gesperrt (`locked = true`).** Nachricht: „Fingerabdruck gesperrt (zu viele Fehlversuche oder
-   Manipulation). Mit PIN entsperren.“ Button → PIN → Token → `unlock`.
+   Manipulation). Mit PIN entsperren.“ Button → PIN → Token → `unlock`. Kein Tastendruck am Gerät nötig.
    Bei Manipulation ist das Entsperren nur bewusst durch den Benutzer zu bestätigen.
 4. **Anlernen (`enroll`).** Vor dem Start erklären:
    „Du legst den Finger zweimal auf den Sensor. Dazwischen hebst du ihn ab.“ Dann einen Button „Anlernen starten“.
    Nach dem Klick: PIN → Token → `enroll`. Während die Anfrage läuft:
    - Hinweis „Finger jetzt auflegen“, dann nach etwa 3 Sekunden „Finger abheben und warten“, dann „Finger erneut auflegen“.
      Die Anfrage liefert **keine** Zwischenstände. Die Texte sind nur eine Zeitschätzung.
-     Der Ring am Gerät zeigt den tatsächlichen Stand (blau = bereit für Finger, blau pulsierend = Speichern).
+     Der Ring am Gerät atmet blau (leichtes bis starkes Blau) während des Anlernens. Er ist die einzige
+     Rückmeldung am Gerät. Es gibt keinen Taster.
    - Ergebnis: Erfolg → Slot anzeigen und Liste aktualisieren. Fehler → Fehlermeldung aus der Tabelle unten,
      Button „Erneut versuchen“.
 5. **Liste der Slots.** Aus `status` (Schlüssel 4). Pro Slot „Löschen“ (PIN, Bestätigungsdialog).
@@ -114,7 +115,7 @@ Die PIN selbst: nur für den Token-Schritt verwenden, nicht speichern, nicht in 
 | `0x2C` | INVALID_OPTION | Es ist kein Fingerabdruck angelernt (z. B. beim Löschen eines leeren Slots). |
 | `0x21` | PROCESSING | Sensorfehler. Verkabelung und Stromversorgung prüfen. |
 | `0x28` | KEY_STORE_FULL | Sensor ist voll. Ein Fingerabdruck muss zuerst gelöscht werden. |
-| `0x27` | OPERATION_DENIED | Tastendruck am Gerät erforderlich oder abgebrochen. |
+| `0x27` | OPERATION_DENIED | Vorgang abgebrochen. Die Fingerabdruck-Befehle verlangen keinen Tastendruck. |
 | `0x33` | PIN_AUTH_INVALID | PIN falsch oder Token ungültig. Neu eingeben. |
 | `0x35` | PIN_NOT_SET | Zuerst eine PIN am Gerät setzen. |
 | `0x36` | PUAT_REQUIRED | Kein gültiges Token. Neu anmelden. |

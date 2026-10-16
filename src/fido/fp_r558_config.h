@@ -50,6 +50,9 @@
 #ifndef FP_LED_PULSE_PERIOD_MS
 #define FP_LED_PULSE_PERIOD_MS 1200
 #endif
+#ifndef FP_LED_BREATH_PERIOD_MS
+#define FP_LED_BREATH_PERIOD_MS 2400  /* one light-to-strong-blue cycle during enrollment */
+#endif
 
 /* Policy. */
 #ifndef FP_VERIFY_TIMEOUT_MS

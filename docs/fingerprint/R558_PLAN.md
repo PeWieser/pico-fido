@@ -15,12 +15,14 @@ Siehe Abschnitt 9.
 |---|---|---|
 | 1 | Sensor R558 an ESP32-S3 Super Mini | UART-Anbindung, `src/fido/fp_r558_*.c` |
 | 2 | Angreifer darf keinen anderen Sensor anstecken und Zugriff auf Keys erhalten | Sensor-Pairing mit PIN, geheimes Passwort und Adresse, Prüfung vor jeder Verifikation, Sperre bei Manipulation (Abschnitt 4) |
-| 3 | Anlernen von Fingerabdrücken ausschließlich über die Webapp | Vendor-Befehl `CTAP_VENDOR_FP` (0x09) mit PIN-Token (ACFG). Keine Taster- oder Geräte-seitige Anlernfunktion (Abschnitt 5) |
+| 3 | Anlernen von Fingerabdrücken ausschließlich über die Webapp | Vendor-Befehl `CTAP_VENDOR_FP` (0x09) mit PIN-Token (ACFG), ohne Taster. Keine Geräte-seitige Anlernfunktion (Abschnitt 5) |
 | 4 | Prompt für eine andere KI zur Integration des Anlern-UI | `docs/fingerprint/WEBAPP_PROMPT.md` |
 | 5 | LED: Ruhe aus | Ring aus, wenn kein FIDO-Vorgang läuft |
 | 6 | LED: Passkey-Abfrage vom PC blau | `fp_led_op_begin()` in `cbor.c` (MakeCredential, GetAssertion) |
 | 7 | LED: Erfolg grün, Fehlschlag rot | `fp_led_op_end(ok)`, 1,5 s |
-| 8 | LED: Key-Speicherung blau pulsierend | `fp_led_saving(true)` um die Credential-Speicherung und das Template-Speichern |
+| 8 | LED: Passkey-Speicherung blau pulsierend | `fp_led_saving(true)` um die Passkey-Speicherung (nur Credentials, nicht Templates) |
+| 8a | LED: Anlernen blau atmend (leicht → stark) | `fp_led_enrolling(true)` während `fp_enroll()`; kein Taster |
+| 8b | Keine Taster-Pflicht | Pairing, Anlernen, Löschen und Entsperren brauchen nur das PIN-Token; der Sensor ist die einzige Benutzerinteraktion |
 
 ---
 
@@ -122,7 +124,7 @@ fp_led.c:  Ring-Treiber auf NeoPixel-Basis, überschreibt led_driver (nur ESP mi
 |---|---|
 | Fremder Sensor (Werkszustand) wird angesteckt, Verifikation wird verlangt | Der Sensor antwortet nicht auf die gespeicherte Adresse → `FP_ERR_SENSOR`, **kein** UV, **keine** Sperre, nichts wird verändert. |
 | Fremder Sensor mit eigenem Passwort, das aber an der gespeicherten Adresse antwortet | `VfyPwd` schlägt fehl → `FP_ERR_SENSOR_AUTH`, **sofortige Sperre** der UV. |
-| Fremder Sensor wird **neu gepairt** | Nur mit PIN-Token und (falls konfiguriert) Tastendruck. Es ist nur möglich, wenn der **bisherige** Sensor nicht mehr antwortet. Vor dem Pairing werden alle Templates des neuen Sensors gelöscht. |
+| Fremder Sensor wird **neu gepairt** | Nur mit PIN-Token (kein Tastendruck). Es ist nur möglich, wenn der **bisherige** Sensor nicht mehr antwortet. Vor dem Pairing werden alle Templates des neuen Sensors gelöscht. |
 | Sensor mit bereits gesetztem Passwort (anderer Besitzer) | `FP_ERR_NOT_FACTORY`, wird abgelehnt. |
 | Sensor enthält Template, das diese Firmware nicht angelegt hat | Engine prüft den Slot gegen die eigene Belegungsliste. Unbekannter Slot → Sperre. |
 | Fehlversuche (Finger passt nicht) | Nach `FP_MAX_FAILED_ATTEMPTS` (Standard 5) in Folge Sperre. Entsperren nur mit PIN-Token (`0x05`). Timeouts zählen nicht. |
@@ -145,9 +147,9 @@ UV-Zugriff.** Dafür braucht man die PIN.
   und die Adresse. Ein Wiederverwenden desselben Sensors erfordert dann ein Zurücksetzen des Sensors auf Werks-
   einstellung (Flash löschen, Befehl `RestSetting` laut Handbuch, noch zu prüfen). Ein neuer Sensor geht
   sofort.
-- **R4 – Tastendruck ist optional.** Wie beim restlichen Pico FIDO hängt die Benutzerpräsenz für Pairing,
-  Enrollment, Löschen und Entsperren vom konfigurierten Taster (`up_btn`) ab. Ohne konfigurierten Taster
-  genügt die PIN. Für hohe Sicherheit den Taster aktivieren.
+- **R4 – Kein Tastendruck.** Pairing, Enrollment, Löschen und Entsperren verlangen nur das PIN-Token. Der
+  Fingerabdrucksensor ist die einzige Interaktion am Gerät. Die Vendor-Befehle 0x02–0x05 prüfen bewusst
+  keinen `up_btn`. Die Sicherheit beruht auf PIN plus Sensorbindung (Abschnitt 4.1).
 - **R5 – Enrollment-Unterbrechung.** Ein abgebrochenes Enrollment hinterlässt keinen Eintrag (der Slot wird erst
   nach erfolgreichem `Store` belegt). Ein Template könnte aber im Sensor liegen, wenn der Stromausfall genau
   zwischen `Store` und dem Flash-Commit passiert. Dieses Template liegt dann in einem freien Slot und wird beim
@@ -158,6 +160,7 @@ UV-Zugriff.** Dafür braucht man die PIN.
 
 ## 5. Enrollment über die Webapp
 
+- Anlernen ist **nur** über die Webapp möglich, ohne Taster. Der Sensor ist die einzige Interaktion am Gerät.
 - Die Firmware hat **keine** Anlernfunktion am Gerät. Alle Befehle des Unterbefehls-Satzes `CTAP_VENDOR_FP` sind
   PIN-geschützt (mit Ausnahme von `0x01 status`).
 - Der Ablauf für das Anlernen (2 Scans, Finger abheben zwischen den Scans) steht in `fp_enroll()`.
@@ -173,10 +176,11 @@ UV-Zugriff.** Dafür braucht man die PIN.
 |---|---|
 | Ruhe | aus |
 | Passkey-Anfrage (MakeCredential/GetAssertion läuft, auch während der Fingerprint-Abfrage) | blau, stetig |
-| Credential oder Template wird gespeichert | blau, pulsierend (Periode 1,2 s) |
+| Enrollment läuft (Vendor-Befehl 0x03) | blau, atmend zwischen leichtem und starkem Blau (Periode 2,4 s) |
+| Passkey (Credential) wird gespeichert | blau, pulsierend (Periode 1,2 s). Template-Speicherung pulsiert **nicht** |
 | Erfolg | grün, 1,5 s, dann aus |
 | Fehlschlag (kein Match, Timeout, Sperre, Fehler) | rot, 1,5 s, dann aus |
-| Enrollment / Pairing / Löschen (Vendor-Befehl) | wie oben über `fp_led_op_begin/end` |
+| Pairing / Löschen / Entsperren (Vendor-Befehl) | blau, stetig, dann grün oder rot über `fp_led_op_begin/end` |
 
 Hinweis: Die bestehenden LED-Modi des SDK (Mounted, Suspended, Button, ...) werden **auf dem Ring ignoriert**. Der
 Onboard-RGB-LED (GPIO48) wird nicht mehr angesteuert, sobald der Ring aktiv ist.
@@ -223,14 +227,13 @@ Kopf von `run_r558_engine_test.sh`.
 
 ## 9. Offene Entscheidungen (Rückfragen an dich)
 
-1. **LED-Ring:** Typ (WS2812, SK6812, Pixelanzahl), Datenpin, Versorgung (5 V über Pegelwandler?). Standard: 12 Pixel, GPIO4.
-2. **Verkabelung:** Sind GPIO17/18 und GPIO4 frei auf deinem Board?
-3. **Zählung für die Blaupulsierung:** Ist „beim Speichern eines Keys“ das **Speichern eines Passkeys**
-   (MakeCredential mit Resident-Key) oder das **Speichern des Fingerabdruck-Templates** beim Anlernen?
-   Umgesetzt sind **beide** Fälle.
-4. **Tastendruck:** Soll das Pairing, das Anlernen, das Löschen und das Entsperren zusätzlich einen Tastendruck
-   verlangen? Derzeit nur, wenn der Taster konfiguriert ist.
+1. **LED-Ring:** Beantwortet. Standard übernommen: WS2812, 12 Pixel, Daten GPIO4.
+2. **Verkabelung:** Beantwortet. Sensor UART TX GPIO17, RX GPIO18. Ring GPIO4.
+3. **Blaupulsierung:** Beantwortet. Pulsieren nur beim **Speichern eines Passkeys**. Template-Speicherung nicht.
+   Das Anlernen zeigt stattdessen blaues Atmen (Abschnitt 6).
+4. **Tastendruck:** Beantwortet. Kein Tastendruck. PIN genügt. Der Sensor ist die einzige Interaktion.
 5. **Fehlgrenze:** 5 Fehlversuche in Folge, danach Sperre bis PIN-Entsperren. Passt das?
-6. **Secure Boot und Flash-Verschlüsselung** für den ESP32-S3: Soll das aktiviert werden? (Empfohlen, siehe R1.)
+6. **Secure Boot und Flash-Verschlüsselung** für den ESP32-S3: Beantwortet. Vorbereiten als Folgeschritt (siehe R1). Noch
+   nicht umgesetzt. `sdkconfig.defaults` enthält derzeit weder Secure Boot noch Flash-Encryption.
 7. **Enrollment-Transport:** Umgesetzt als CTAP-HID-Vendor-CBOR über WebHID. Alternativ wäre eine
    REST-Route über lwIP möglich, das ist aber nur mit USB-Netzwerk verfügbar und daher nicht empfohlen.
