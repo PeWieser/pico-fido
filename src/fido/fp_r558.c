@@ -324,6 +324,7 @@ bool fp_uv_available(void) {
 
 void fp_get_status(fp_status_t *st) {
     memset(st, 0, sizeof(*st));
+    st->supported = FP_FEATURE_ON;
     if (!FP_FEATURE_ON) {
         return;
     }

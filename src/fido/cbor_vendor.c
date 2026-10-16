@@ -343,17 +343,18 @@ static int cbor_vendor_generic(uint8_t cmd, const uint8_t *data, size_t len) {
         /*
          * Subcommands (key 1). 0x01 is read-only. The others need a PIN token with the
          * authenticatorConfig permission and a user presence check.
-         *   0x01 status            -> {1: paired, 2: locked, 3: capacity, 4: [enrolled slots], 5: failed attempts}
+         *   0x01 status            -> {1: paired, 2: locked, 3: capacity, 4: [enrolled slots], 5: failed attempts,
+         *                              6: supported (firmware built with the R558 feature)}
          *   0x02 pair              -> {1: capacity}
          *   0x03 enroll            -> {1: slot}
          *   0x04 delete            -> key 2 param {1: slot as 2 bytes BE, 0xFFFF = all}, or no param = all
          *   0x05 unlock            -> {}
-         * No user presence button is required: the PIN token authorises, the sensor is the interaction.
+         * Subcommands 0x02-0x05 need a PIN token (ACFG). No button: the sensor is the only interaction.
          */
         if (vendorCmd == 0x01) {
             fp_status_t st;
             fp_get_status(&st);
-            CBOR_CHECK(cbor_encoder_create_map(&encoder, &mapEncoder, 5));
+            CBOR_CHECK(cbor_encoder_create_map(&encoder, &mapEncoder, 6));
             CBOR_CHECK(cbor_encode_uint(&mapEncoder, 0x01));
             CBOR_CHECK(cbor_encode_boolean(&mapEncoder, st.paired));
             CBOR_CHECK(cbor_encode_uint(&mapEncoder, 0x02));
@@ -370,6 +371,8 @@ static int cbor_vendor_generic(uint8_t cmd, const uint8_t *data, size_t len) {
             CBOR_CHECK(cbor_encoder_close_container(&mapEncoder, &arrEncoder));
             CBOR_CHECK(cbor_encode_uint(&mapEncoder, 0x05));
             CBOR_CHECK(cbor_encode_uint(&mapEncoder, st.failed_attempts));
+            CBOR_CHECK(cbor_encode_uint(&mapEncoder, 0x06));
+            CBOR_CHECK(cbor_encode_boolean(&mapEncoder, st.supported));
         }
         else if (vendorCmd >= 0x02 && vendorCmd <= 0x05) {
             int auth_ret = fp_pin_auth((uint8_t)pinUvAuthProtocol, &pinUvAuthParam, raw_vendor_params, raw_vendor_params_len, vendorCmd);

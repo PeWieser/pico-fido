@@ -45,7 +45,7 @@ Das Gerät akzeptiert Fingerabdrücke **nur** über den unten beschriebenen Vend
 
 | Code | Name | Auth | Parameter | Antwort (Map) |
 |---|---|---|---|---|
-| `0x01` | status | keine | – | `{1: bool paired, 2: bool locked, 3: uint capacity, 4: [uint slots], 5: uint failedAttempts}` |
+| `0x01` | status | keine | – | `{1: bool paired, 2: bool locked, 3: uint capacity, 4: [uint slots], 5: uint failedAttempts, 6: bool supported}` |
 | `0x02` | pair | PIN-Token, Berechtigung ACFG | – | `{1: uint capacity}` |
 | `0x03` | enroll | PIN-Token, Berechtigung ACFG | – | `{1: uint slot}` |
 | `0x04` | delete | PIN-Token, Berechtigung ACFG | Schlüssel 2 optional: `{1: bytes(2)}` = Slot als 2 Byte Big-Endian, `0xFFFF` = alle. Ohne Schlüssel 2 werden **alle** gelöscht. | `{}` |
@@ -81,9 +81,11 @@ Die PIN selbst: nur für den Token-Schritt verwenden, nicht speichern, nicht in 
 
 ## Ablauf in der UI
 
-1. **Verbinden.** Gerät auswählen, `status` abfragen. Antwortet das Gerät auf `status` mit `0x02`
-   (INVALID_PARAMETER) oder `0x3E` (INVALID_SUBCOMMAND), ist die Firmware ohne Fingerabdruck-Unterstützung.
-   Das klar anzeigen und keinen Fingerabdruck-Bereich zeigen.
+1. **Verbinden.** Gerät auswählen, `status` abfragen. Ist `6: supported` = `false`, ist die Firmware ohne
+   Fingerabdruck-Unterstützung gebaut. Das klar anzeigen und keinen Fingerabdruck-Bereich zeigen.
+   Ein Gerät mit `supported = true`, aber `paired = false`, ist normal: Dann ist der Sensor nur noch nicht gekoppelt.
+   Antwortet `status` mit `0x3E` (INVALID_SUBCOMMAND) oder `0x02` (INVALID_PARAMETER), ist die Firmware
+   zu alt (ohne `0x09`). Das ebenfalls klar anzeigen.
 2. **Nicht gekoppelt (`paired = false`).** Hinweis zeigen: „Koppelt nur den Sensor, der in dieses Gerät eingebaut ist.
    Ein anderer Sensor wird nur akzeptiert, wenn der bisherige Sensor nicht mehr angeschlossen ist.“
    PIN abfragen → Token holen → `pair` senden. Während der Anfrage Spinner und Text „Der Sensor wird eingerichtet.“
@@ -155,3 +157,4 @@ nicht selbst führen, soll aber bei `0x33` deutlich auf die Restversuche hinweis
 - Ein gelöschter Slot verschwindet aus `status`.
 - Bei gesperrtem Zustand ist Enrollment nicht möglich, Entsperren schon.
 - Die Anfrage-Kodierung entspricht exakt den Tabellen oben (Tests grün).
+- Ist `supported = false`, zeigt die App keinen Fingerabdruck-Bereich und sendet keine Befehle außer `status`.

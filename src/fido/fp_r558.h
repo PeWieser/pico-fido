@@ -59,6 +59,7 @@ typedef struct {
     uint16_t capacity;
     uint16_t enrolled;
     uint8_t failed_attempts;
+    bool supported;   /* firmware built with the R558 feature */
 } fp_status_t;
 
 /* Call once at boot (after the file system is scanned). Initialises UART and loads configuration. */

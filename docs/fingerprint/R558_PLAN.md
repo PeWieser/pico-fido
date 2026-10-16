@@ -147,7 +147,7 @@ UV-Zugriff.** Dafür braucht man die PIN.
   „echt“ ist, lässt sich nicht prüfen. Die Sicherheit beruht allein auf dem geheimen Passwort und der Adresse (R1).
 - **R3 – FIDO-Reset.** Ein Reset des Authenticators löscht `EF_FP_CONF`. Der Sensor behält aber das alte Passwort
   und die Adresse. Ein Wiederverwenden desselben Sensors erfordert dann ein Zurücksetzen des Sensors auf Werks-
-  einstellung (Flash löschen, Befehl `RestSetting` laut Handbuch, noch zu prüfen). Ein neuer Sensor geht
+  einstellung (Flash löschen, Befehl `RestSetting 0x3B` laut Datenblatt; ob er ohne Passwort funktioniert, ist noch zu prüfen). Ein neuer Sensor geht
   sofort.
 - **R4 – Kein Tastendruck.** Pairing, Enrollment, Löschen und Entsperren verlangen nur das PIN-Token. Der
   Fingerabdrucksensor ist die einzige Interaktion am Gerät. Die Vendor-Befehle 0x02–0x05 prüfen bewusst
