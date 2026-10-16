@@ -63,6 +63,20 @@ configure_bool_option(
     "OTP Application: \t\t disabled"
 )
 
+# The R558 sensor is wired to the ESP32-S3 board only, so it is on by default there and off everywhere else.
+if(ESP_PLATFORM)
+    set(_R558_DEFAULT ON)
+else()
+    set(_R558_DEFAULT OFF)
+endif()
+option(ENABLE_R558_FINGERPRINT "Enable/disable R558 fingerprint sensor (UV via fingerprint, ESP32 only for hardware)" ${_R558_DEFAULT})
+configure_bool_option(
+    ENABLE_R558_FINGERPRINT
+    ENABLE_R558_FINGERPRINT
+    "R558 fingerprint sensor: \t enabled"
+    "R558 fingerprint sensor: \t disabled"
+)
+
 if(FORBID_DISABLE_AUV)
     add_compile_definitions(FORBID_DISABLE_AUV=1)
 endif()
@@ -120,6 +134,11 @@ list(APPEND SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/src/fido/cbor_large_blobs.c
     ${CMAKE_CURRENT_LIST_DIR}/src/fido/management.c
     ${CMAKE_CURRENT_LIST_DIR}/src/fido/defs.c
+    ${CMAKE_CURRENT_LIST_DIR}/src/fido/fp_r558_sensor.c
+    ${CMAKE_CURRENT_LIST_DIR}/src/fido/fp_r558_uart.c
+    ${CMAKE_CURRENT_LIST_DIR}/src/fido/fp_r558.c
+    ${CMAKE_CURRENT_LIST_DIR}/src/fido/fp_led.c
+    ${CMAKE_CURRENT_LIST_DIR}/src/fido/fp_init.c
 )
 
 if(ENABLE_OATH_APP)

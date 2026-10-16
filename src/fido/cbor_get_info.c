@@ -21,6 +21,7 @@
 #include "fido.h"
 #include "ctap.h"
 #include "files.h"
+#include "fp_r558.h"
 #include "apdu.h"
 #include "version.h"
 #include "crypto_utils.h"
@@ -122,7 +123,8 @@ int cbor_get_info(void) {
     CBOR_CHECK(cbor_encode_byte_string(&mapEncoder, aaguid, sizeof(aaguid)));
 
     CBOR_CHECK(cbor_encode_uint(&mapEncoder, 0x04));
-    CBOR_CHECK(cbor_encoder_create_map(&mapEncoder, &arrayEncoder, enterprise_profile ? 11 : 10));
+    bool fp_uv_ok = fp_uv_available();
+    CBOR_CHECK(cbor_encoder_create_map(&mapEncoder, &arrayEncoder, (enterprise_profile ? 11 : 10) + (fp_uv_ok ? 1 : 0)));
     if (enterprise_profile) {
         CBOR_CHECK(cbor_encode_text_stringz(&arrayEncoder, "ep"));
         CBOR_CHECK(cbor_encode_boolean(&arrayEncoder, true));
@@ -147,6 +149,11 @@ int cbor_get_info(void) {
     CBOR_CHECK(cbor_encode_boolean(&arrayEncoder, true));
     CBOR_CHECK(cbor_encode_text_stringz(&arrayEncoder, "makeCredUvNotRqd"));
     CBOR_CHECK(cbor_encode_boolean(&arrayEncoder, get_opts() & FIDO2_OPT_AUV ? false : get_opts() & FIDO2_OPT_MCUV_NOTRQD));
+    if (fp_uv_ok) {
+        /* Built-in UV: the R558 fingerprint is paired, not locked and has at least one enrolled finger. */
+        CBOR_CHECK(cbor_encode_text_stringz(&arrayEncoder, "uv"));
+        CBOR_CHECK(cbor_encode_boolean(&arrayEncoder, true));
+    }
     CBOR_CHECK(cbor_encoder_close_container(&mapEncoder, &arrayEncoder));
 
     CBOR_CHECK(cbor_encode_uint(&mapEncoder, 0x05));
