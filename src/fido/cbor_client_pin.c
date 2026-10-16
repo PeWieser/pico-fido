@@ -52,7 +52,7 @@ static int minpin_read_length(const file_t *ef, uint8_t *min_pin) {
     if (!min_pin) {
         return PICOKEYS_ERR_NULL_PARAM;
     }
-    *min_pin = 4;
+    *min_pin = FIDO_MIN_PIN_LENGTH_DEFAULT;
     if (!ef || !ef->data) {
         return PICOKEYS_OK;
     }
@@ -540,7 +540,7 @@ int cbor_client_pin(const uint8_t *data, size_t len) {
             pin_byte_len++;
         }
         uint16_t pin_codepoints = pin_codepoint_len(paddedNewPin, pin_byte_len);
-        uint8_t minPin = 4;
+        uint8_t minPin = FIDO_MIN_PIN_LENGTH_DEFAULT;
         file_t *ef_minpin = file_search_by_fid(EF_MINPINLEN, NULL, SPECIFY_EF);
         if (minpin_read_length(ef_minpin, &minPin) != PICOKEYS_OK) {
             CBOR_ERROR(CTAP2_ERR_PROCESSING);
@@ -718,7 +718,7 @@ int cbor_client_pin(const uint8_t *data, size_t len) {
             pin_byte_len++;
         }
         uint16_t pin_codepoints = pin_codepoint_len(paddedNewPin, pin_byte_len);
-        uint8_t minPin = 4;
+        uint8_t minPin = FIDO_MIN_PIN_LENGTH_DEFAULT;
         file_t *ef_minpin = file_search_by_fid(EF_MINPINLEN, NULL, SPECIFY_EF);
         if (minpin_read_length(ef_minpin, &minPin) != PICOKEYS_OK) {
             CBOR_ERROR(CTAP2_ERR_PROCESSING);

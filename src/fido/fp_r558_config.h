@@ -54,6 +54,19 @@
 #define FP_LED_BREATH_PERIOD_MS 2400  /* one light-to-strong-blue cycle during enrollment */
 #endif
 
+/* Flash encryption requirement (R1). On ESP32 it follows the Kconfig option in src/fido/Kconfig.projbuild.
+ * Host builds have no flash encryption; the requirement is off there unless set explicitly. */
+#if defined(ESP_PLATFORM)
+#include "sdkconfig.h"
+#ifndef CONFIG_PICO_FIDO_R558_REQUIRE_FLASH_ENCRYPTION
+#define CONFIG_PICO_FIDO_R558_REQUIRE_FLASH_ENCRYPTION 1
+#endif
+#define FP_REQUIRE_FLASH_ENCRYPTION CONFIG_PICO_FIDO_R558_REQUIRE_FLASH_ENCRYPTION
+#endif
+#ifndef FP_REQUIRE_FLASH_ENCRYPTION
+#define FP_REQUIRE_FLASH_ENCRYPTION 0
+#endif
+
 /* Policy. */
 #ifndef FP_VERIFY_TIMEOUT_MS
 #define FP_VERIFY_TIMEOUT_MS  15000  /* time the user has to place a finger for a passkey request */

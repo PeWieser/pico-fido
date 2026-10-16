@@ -92,3 +92,41 @@ Die UART-Parameter sind 57600 Baud, 8N2, nach dem Datenblatt des R558-S (Handbuc
 Die `platformio.ini`, die Komponente unter `src/` und diese Anleitung wurden in einer Sandbox ohne Zugriff auf das
 PlatformIO-Registry geschrieben. Dort konnte der Build nicht durchlaufen. Die Konfiguration wurde nur über
 `pio project config` geprüft. Der erste echte `pio run` steht also noch aus. Bitte melde dich, wenn er fehlschlägt.
+
+## 9. Secure Boot und Flash-Verschlüsselung (R1)
+
+**Achtung: unumkehrbar.** Diese Schritte brennen eFuses am Chip. Danach lässt sich weder Flash-Verschlüsselung
+noch Secure Boot abschalten. Teste das Profil zuerst auf einem Ersatzboard, nie auf dem Gerät mit deinen Schlüsseln.
+Der Ablauf ist nicht am Gerät getestet.
+
+1. **Signaturschlüssel erzeugen** (außerhalb des Repos, nie committen):
+   ```bash
+   espsecure.py generate_signing_key --version 2 --scheme rsa3072 secure_boot_signing_key.pem
+   ```
+   `espsecure.py` kommt mit ESP-IDF. Die Datei bewahrst du sicher auf. Verloren heißt: keine Updates mehr.
+   `.gitignore` schließt `*.pem` und `secure_boot_signing_key*` aus.
+
+2. **Bauen mit dem Secure-Profil:**
+   ```bash
+   pio run -e esp32s3_secure
+   ```
+   Das Profil `config/esp32/sdkconfig.secure.defaults` setzt Secure Boot v2, Flash-Verschlüsselung im
+   Development-Modus und die Partitionstabelle `config/esp32/partitions_secure.csv`. In dieser Tabelle hat
+   `part0` (Schlüsselspeicher) das Flag `encrypted`.
+
+3. **Erster Start:** Das Gerät verschlüsselt den Flash und brennt die Secure-Boot-Eintragung beim ersten Start selbst.
+   Dafür muss das erste Image unverschlüsselt und unsigniert vorliegen. Prüfe danach mit der seriellen Ausgabe, dass
+   die Flash-Verschlüsselung aktiv ist. `flash_encrypted = true` in `status` zeigt das ebenfalls.
+
+4. **Updates danach:** Ein normales `pio run -t upload` schreibt Klartext und macht das Gerät unbrauchbar, wenn die
+   Verschlüsselung aktiv ist. Verwende für Updates das verschlüsselte Schreiben von `esptool` (Option `--encrypt`) und
+   das signierte Image. Die genaue Befehlszeile ist in der ESP-IDF-Doku zu „Flash Encryption“ und „Secure Boot“ beschrieben.
+   Dieser Teil ist nicht getestet.
+
+5. **Pairing:** Mit aktiver Verschlüsselung erlaubt die Firmware Pairing und Restore (Option
+   `PICO_FIDO_R558_REQUIRE_FLASH_ENCRYPTION`). Ohne aktive Verschlüsselung lehnt sie beides mit `NOT_ALLOWED` ab.
+   Ein bereits gekoppelter Sensor bleibt gekoppelt. Wenn du vorher ohne Verschlüsselung gekoppelt hast, koppele nach
+   dem Aktivieren neu.
+
+**Release-Modus** (`CONFIG_SECURE_FLASH_ENCRYPTION_MODE_RELEASE`) schaltet das serielle Schreiben komplett ab.
+Verwende ihn erst, wenn der Development-Modus stabil läuft und du ein Backup-Image hast.

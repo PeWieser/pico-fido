@@ -312,3 +312,22 @@ fp_sensor_status_t fp_sensor_delete_chars(const fp_transport_t *t, const fp_sess
 fp_sensor_status_t fp_sensor_empty(const fp_transport_t *t, const fp_session_t *s, uint8_t *code) {
     return simple_cmd(t, s, FP_INS_EMPTY, NULL, 0, 3000, code);
 }
+
+/* TemplateNum: ack carries the confirmation code and the number of valid templates (2 bytes, BE). */
+fp_sensor_status_t fp_sensor_template_num(const fp_transport_t *t, const fp_session_t *s, uint16_t *count, uint8_t *code) {
+    uint8_t buf[3];   /* confirmation code, then the count (same layout as ReadSysPara) */
+    uint16_t len = 0;
+    uint8_t c = 0xFF;
+    fp_sensor_status_t st = fp_sensor_txn(t, s->address, FP_INS_TEMPLATE_NUM, NULL, 0, buf, sizeof(buf), &len, &c, 1000, true);
+    if (code != NULL) {
+        *code = c;
+    }
+    if (st != FP_SENSOR_OK || c != FP_CONF_OK) {
+        return st;
+    }
+    if (len < 3 || count == NULL) {
+        return FP_SENSOR_BAD_FRAME;
+    }
+    *count = get_u16_be(buf + 1);
+    return FP_SENSOR_OK;
+}

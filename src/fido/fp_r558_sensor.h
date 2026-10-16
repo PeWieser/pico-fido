@@ -51,6 +51,7 @@
 #define FP_INS_STORE            0x06
 #define FP_INS_DELET_CHAR       0x0C
 #define FP_INS_EMPTY            0x0D
+#define FP_INS_TEMPLATE_NUM     0x1D
 #define FP_INS_READ_SYS_PARA    0x0F
 #define FP_INS_SET_PWD          0x12
 #define FP_INS_VFY_PWD          0x13
@@ -140,5 +141,6 @@ fp_sensor_status_t fp_sensor_reg_model(const fp_transport_t *t, const fp_session
 fp_sensor_status_t fp_sensor_store(const fp_transport_t *t, const fp_session_t *s, uint8_t buffer, uint16_t page_id, uint8_t *code);
 fp_sensor_status_t fp_sensor_delete_chars(const fp_transport_t *t, const fp_session_t *s, uint16_t page_id, uint16_t count, uint8_t *code);
 fp_sensor_status_t fp_sensor_empty(const fp_transport_t *t, const fp_session_t *s, uint8_t *code);
+fp_sensor_status_t fp_sensor_template_num(const fp_transport_t *t, const fp_session_t *s, uint16_t *count, uint8_t *code);
 
 #endif /* FP_R558_SENSOR_H_ */

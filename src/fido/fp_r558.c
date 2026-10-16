@@ -33,6 +33,10 @@
 #include <string.h>
 
 #if defined(ESP_PLATFORM)
+#include "esp_flash_encrypt.h"
+#endif
+
+#if defined(ESP_PLATFORM)
 #include "compat/esp_compat.h"
 #else
 #include "compat/board.h"
@@ -64,6 +68,19 @@ typedef struct {
     uint16_t capacity;
     uint8_t slots[FP_CONF_BITMAP];
 } fp_conf_t;
+
+/* R1: secrets (sensor password and address) may only be created or restored while flash encryption is active. */
+static bool flash_encryption_active(void) {
+#if defined(ESP_PLATFORM)
+    return esp_flash_encryption_enabled();
+#else
+    return false;
+#endif
+}
+
+static bool flash_requirement_met(void) {
+    return FP_REQUIRE_FLASH_ENCRYPTION == 0 || flash_encryption_active();
+}
 
 static void conf_clear(fp_conf_t *c) {
     mbedtls_platform_zeroize(c, sizeof(*c));
@@ -284,7 +301,11 @@ int fp_result_to_ctap(fp_result_t res) {
         case FP_ERR_NOT_FACTORY:
             return CTAP2_ERR_NOT_ALLOWED;
         case FP_ERR_BAD_PARAM:
+        case FP_ERR_BACKUP_FORMAT:
             return CTAP1_ERR_INVALID_PARAMETER;
+        case FP_ERR_NOT_SECURE:
+        case FP_ERR_BACKUP_MISMATCH:
+            return CTAP2_ERR_NOT_ALLOWED;
         case FP_ERR_SENSOR:
         case FP_ERR_STORAGE:
         default:
@@ -325,6 +346,7 @@ bool fp_uv_available(void) {
 void fp_get_status(fp_status_t *st) {
     memset(st, 0, sizeof(*st));
     st->supported = FP_FEATURE_ON;
+    st->flash_encrypted = flash_encryption_active();
     if (!FP_FEATURE_ON) {
         return;
     }
@@ -406,6 +428,9 @@ fp_result_t fp_verify(uint32_t timeout_ms) {
 }
 
 fp_result_t fp_pair(uint16_t *capacity_out) {
+    if (!flash_requirement_met()) {
+        return FP_ERR_NOT_SECURE;
+    }
     fp_conf_t c;
     conf_load(&c);
     const fp_transport_t *t = fp_uart_transport();
@@ -672,4 +697,109 @@ fp_result_t fp_unlock(void) {
     }
     conf_clear(&c);
     return res;
+}
+
+/* ---- R3: backup and restore of the trusted sensor configuration ---- */
+
+#define FP_BACKUP_VERSION 1
+_Static_assert(FP_BACKUP_BYTES == FP_BACKUP_HEADER + FP_CONF_BITMAP, "backup size matches the slot bitmap");
+
+fp_result_t fp_backup(uint8_t out[FP_BACKUP_BYTES]) {
+    if (!FP_FEATURE_ON) {
+        return FP_ERR_NOT_PAIRED;
+    }
+    fp_conf_t c;
+    conf_load(&c);
+    if ((c.flags & FP_FLAG_PAIRED) == 0) {
+        conf_clear(&c);
+        return FP_ERR_NOT_PAIRED;
+    }
+    out[0] = FP_BACKUP_VERSION;
+    memcpy(out + 1, c.password, 4);
+    out[5] = (uint8_t)(c.address >> 24);
+    out[6] = (uint8_t)(c.address >> 16);
+    out[7] = (uint8_t)(c.address >> 8);
+    out[8] = (uint8_t)(c.address);
+    out[9] = (uint8_t)(c.capacity >> 8);
+    out[10] = (uint8_t)(c.capacity);
+    memcpy(out + FP_BACKUP_HEADER, c.slots, FP_CONF_BITMAP);
+    conf_clear(&c);
+    return FP_OK;
+}
+
+fp_result_t fp_restore(const uint8_t *blob, size_t len) {
+    if (!FP_FEATURE_ON) {
+        return FP_ERR_NOT_PAIRED;
+    }
+    if (!flash_requirement_met()) {
+        return FP_ERR_NOT_SECURE;
+    }
+    if (blob == NULL || len != FP_BACKUP_BYTES || blob[0] != FP_BACKUP_VERSION) {
+        return FP_ERR_BACKUP_FORMAT;
+    }
+
+    fp_conf_t n;
+    conf_clear(&n);
+    memcpy(n.password, blob + 1, 4);
+    n.address = ((uint32_t)blob[5] << 24) | ((uint32_t)blob[6] << 16) | ((uint32_t)blob[7] << 8) | blob[8];
+    n.capacity = (uint16_t)((blob[9] << 8) | blob[10]);
+    memcpy(n.slots, blob + FP_BACKUP_HEADER, FP_CONF_BITMAP);
+
+    /* Format checks: no all-zero password, no factory address, capacity in range, no slot beyond capacity. */
+    bool pwd_zero = n.password[0] == 0 && n.password[1] == 0 && n.password[2] == 0 && n.password[3] == 0;
+    uint16_t used = 0;
+    bool slots_ok = true;
+    for (uint16_t i = 0; i < FP_TEMPLATE_MAX; i++) {
+        if (slot_used(&n, i)) {
+            used++;
+        }
+    }
+    for (uint16_t i = n.capacity; i < FP_TEMPLATE_MAX; i++) {
+        if ((n.slots[i / 8] & (1u << (i % 8))) != 0) {
+            slots_ok = false;
+        }
+    }
+    if (pwd_zero || n.address == FP_FACTORY_ADDRESS || n.capacity == 0 || n.capacity > FP_TEMPLATE_MAX || !slots_ok || used > n.capacity) {
+        conf_clear(&n);
+        return FP_ERR_BACKUP_FORMAT;
+    }
+
+    fp_conf_t cur;
+    conf_load(&cur);
+    if (cur.flags & FP_FLAG_PAIRED) {
+        /* Already paired: the same sensor is a no-op, another sensor is refused (replacement needs pairing rules). */
+        bool same = memcmp(cur.password, n.password, 4) == 0 && cur.address == n.address;
+        conf_clear(&cur);
+        conf_clear(&n);
+        return same ? FP_OK : FP_ERR_ALREADY_PAIRED;
+    }
+    conf_clear(&cur);
+
+    /* The backup is only trusted if the connected sensor accepts its password and address. */
+    fp_result_t res = authenticate_sensor(&n);
+    if (res == FP_ERR_SENSOR_AUTH) {
+        res = FP_ERR_BACKUP_MISMATCH;
+    }
+    if (res != FP_OK) {
+        conf_clear(&n);
+        return res;
+    }
+    uint16_t sensor_count = 0;
+    uint8_t code = 0xFF;
+    fp_session_t s = session_of(&n);
+    if (fp_sensor_template_num(fp_uart_transport(), &s, &sensor_count, &code) != FP_SENSOR_OK || code != FP_CONF_OK) {
+        conf_clear(&n);
+        return FP_ERR_SENSOR;
+    }
+    if (sensor_count != used) {
+        conf_clear(&n);
+        return FP_ERR_BACKUP_MISMATCH;
+    }
+
+    /* Restored state: paired, not locked, no failures. Lock state is not restored from the blob. */
+    n.flags = FP_FLAG_PAIRED;
+    n.fail_count = 0;
+    bool saved = conf_save(&n);
+    conf_clear(&n);
+    return saved ? FP_OK : FP_ERR_STORAGE;
 }

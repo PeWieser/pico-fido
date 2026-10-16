@@ -45,11 +45,13 @@ Das Gerät akzeptiert Fingerabdrücke **nur** über den unten beschriebenen Vend
 
 | Code | Name | Auth | Parameter | Antwort (Map) |
 |---|---|---|---|---|
-| `0x01` | status | keine | – | `{1: bool paired, 2: bool locked, 3: uint capacity, 4: [uint slots], 5: uint failedAttempts, 6: bool supported}` |
+| `0x01` | status | keine | – | `{1: bool paired, 2: bool locked, 3: uint capacity, 4: [uint slots], 5: uint failedAttempts, 6: bool supported, 7: bool flashEncrypted}` |
 | `0x02` | pair | PIN-Token, Berechtigung ACFG | – | `{1: uint capacity}` |
 | `0x03` | enroll | PIN-Token, Berechtigung ACFG | – | `{1: uint slot}` |
 | `0x04` | delete | PIN-Token, Berechtigung ACFG | Schlüssel 2 optional: `{1: bytes(2)}` = Slot als 2 Byte Big-Endian, `0xFFFF` = alle. Ohne Schlüssel 2 werden **alle** gelöscht. | `{}` |
 | `0x05` | unlock | PIN-Token, Berechtigung ACFG | – | `{}` |
+| `0x06` | backup | PIN-Token, Berechtigung ACFG | – | `{1: bytes(43) Backup-Blob}`. Der Blob ist **unverschlüsselt**, die Webapp verschlüsselt ihn (siehe „Backup“). |
+| `0x07` | restore | PIN-Token, Berechtigung ACFG | Schlüssel 2: `{1: bytes(43) Backup-Blob}` | `{}` |
 
 ### Berechnung von `pinUvAuthParam` (Auth)
 
@@ -105,6 +107,55 @@ Die PIN selbst: nur für den Token-Schritt verwenden, nicht speichern, nicht in 
 5. **Liste der Slots.** Aus `status` (Schlüssel 4). Pro Slot „Löschen“ (PIN, Bestätigungsdialog).
    „Alle löschen“ mit doppelter Bestätigung (PIN, Bestätigungsdialog mit dem Wort „LÖSCHEN“).
 6. Nach jedem schreibenden Befehl `status` neu abfragen.
+7. **Flash-Verschlüsselung.** Ist `7: flashEncrypted = false`, zeigt die App einen Warnhinweis: „Die Flash-Verschlüsselung
+   ist am Gerät nicht aktiv. Koppeln und Wiederherstellen sind gesperrt, bis sie aktiv ist.“ Pairing und Restore
+   sind dann ausgeschaltet. Die App versucht es nicht erst, sondern deaktiviert die Schaltflächen.
+8. **Backup (R3).** Im Fingerabdruck-Bereich ein Button „Backup erstellen“ (nur bei `paired = true`).
+   Ablauf:
+   - PIN → Token → `backup` (0x06) → 43-Byte-Blob.
+   - Passphrase abfragen. Mindestens 12 Zeichen. Zweimal eingeben, damit kein Tippfehler die Datei unbrauchbar macht.
+   - Blob mit der Passphrase verschlüsseln (Abschnitt „Backup-Verschlüsselung“), Datei herunterladen.
+   - Blob-Puffer und Schlüssel nach Gebrauch nullen.
+   - Hinweis: „Die Datei enthält das Sensor-Passwort. Bewahre sie sicher auf.“
+9. **Restore (R3, nach einem FIDO-Reset).** Ist `paired = false` und die App hat eine Backup-Datei, Button „Backup
+   wiederherstellen“:
+   - Zuerst eine neue PIN setzen lassen (nach dem Reset gibt es keine PIN). Die App führt den Nutzer dorthin.
+   - Datei wählen, Passphrase eingeben, entschlüsseln. Falsche Passphrase → Meldung „Passphrase falsch oder Datei
+     beschädigt“, ohne weitere Details.
+   - PIN → Token → `restore` (0x07) mit dem Blob in Schlüssel 2 → danach `status`.
+   - Erwartet: `paired = true`, `locked = false`, Slots wie im Backup. Bei `NOT_ALLOWED` Hinweis: „Der Sensor passt nicht
+     zum Backup, oder die Anzahl der Fingerabdrücke stimmt nicht.“ Die App zeigt nicht, welcher Fall es ist.
+
+## PIN-Regeln
+
+Die PIN ist die FIDO2-PIN des Geräts. Sie wird nur für die Token-Anforderung benutzt (siehe oben). Vollständige
+Erklärung für Nutzer: `docs/fingerprint/PIN_UND_BACKUP.md`.
+
+- **Neue PIN setzen oder ändern: genau 6 Ziffern (0–9).** Die App lehnt andere Eingaben vor dem Senden ab.
+- **Mit bestehender PIN anmelden** (für Pairing, Anlernen, Löschen, Entsperren, Backup, Restore): die App nimmt
+  die PIN so an, wie sie gesetzt wurde, mindestens 4 Zeichen. Bestehende 4-stellige PINs bleiben gültig, bis der
+  Nutzer sie ändert. Ein Hinweis erklärt, dass neue PINs 6 Ziffern haben.
+- **Eingabe:** eigenes Dialogfeld mit Ziffernfeld, `autocomplete="off"`, kein Speichern im Formular.
+- **Wo:** Die PIN wird im Fingerabdruck-Bereich vor jeder schreibenden Aktion abgefragt. Der Sensor hat keine
+  Eingabe, das Gerät hat keinen Bildschirm.
+- Ein Restore setzt eine **neue** PIN voraus. Ohne PIN antwortet das Gerät mit `0x35` (PIN_NOT_SET).
+
+## Backup-Verschlüsselung (WebCrypto)
+
+- Schlüsselableitung: **PBKDF2-HMAC-SHA-256**, mindestens 600 000 Iterationen, 16 Byte Salt (zufällig pro Datei).
+- Verschlüsselung: **AES-256-GCM**, 12 Byte IV (zufällig pro Datei), 16 Byte Tag (Teil von WebCrypto).
+- Datei (JSON, UTF-8):
+  ```json
+  {"format":"pico-fido-r558-backup","version":1,
+   "kdf":{"name":"PBKDF2","hash":"SHA-256","iterations":600000,"salt":"<base64>"},
+   "cipher":{"name":"AES-GCM","iv":"<base64>"},
+   "data":"<base64 of ciphertext+tag>"}
+  ```
+- Die Metadaten sind nicht geheim, aber als AES-GCM-Additional-Data gebunden: `additionalData` = die UTF-8-Bytes des
+  Strings `pico-fido-r558-backup/v1`. Eine geänderte Datei schlägt dann beim Entschlüsseln fehl.
+- Entschlüsseln: Format und Version prüfen, Schlüssel ableiten, `decrypt`. Schlägt es fehl, nur die allgemeine
+  Meldung zeigen.
+- Der Klartext-Blob muss 43 Byte lang sein und mit Version `0x01` beginnen. Sonst abbrechen.
 
 ## Fehlercodes (CTAP-Statusbyte) → Meldung
 
@@ -113,7 +164,7 @@ Die PIN selbst: nur für den Token-Schritt verwenden, nicht speichern, nicht in 
 | `0x2F` | USER_ACTION_TIMEOUT | Zeit abgelaufen. Bitte erneut versuchen. |
 | `0x3F` | UV_INVALID | Finger nicht erkannt bzw. die beiden Scans passen nicht zusammen. Erneut versuchen. |
 | `0x3C` | UV_BLOCKED | Fingerabdruck ist gesperrt. Mit PIN entsperren. |
-| `0x30` | NOT_ALLOWED | Nicht gekoppelt, oder die Aktion ist nicht erlaubt: Sensor schon gekoppelt, oder der neue Sensor ist nicht im Werkszustand (ggf. am Sensor zurücksetzen). |
+| `0x30` | NOT_ALLOWED | Nicht gekoppelt, oder die Aktion ist nicht erlaubt: Sensor schon gekoppelt, der neue Sensor ist nicht im Werkszustand (ggf. am Sensor zurücksetzen), Flash-Verschlüsselung nicht aktiv (`flashEncrypted = false`), oder ein Restore passt nicht zum Sensor. |
 | `0x2C` | INVALID_OPTION | Es ist kein Fingerabdruck angelernt (z. B. beim Löschen eines leeren Slots). |
 | `0x21` | PROCESSING | Sensorfehler. Verkabelung und Stromversorgung prüfen. |
 | `0x28` | KEY_STORE_FULL | Sensor ist voll. Ein Fingerabdruck muss zuerst gelöscht werden. |
@@ -122,7 +173,7 @@ Die PIN selbst: nur für den Token-Schritt verwenden, nicht speichern, nicht in 
 | `0x35` | PIN_NOT_SET | Zuerst eine PIN am Gerät setzen. |
 | `0x36` | PUAT_REQUIRED | Kein gültiges Token. Neu anmelden. |
 | `0x3E` | INVALID_SUBCOMMAND | Gerätefirmware zu alt für diese Funktion. |
-| `0x02` | INVALID_PARAMETER | Ungültige Eingabe (z. B. Slot außerhalb des Bereichs). |
+| `0x02` | INVALID_PARAMETER | Ungültige Eingabe (z. B. Slot außerhalb des Bereichs, oder ein beschädigter Backup-Blob). |
 
 Eine PIN-Eingabe, die falsch ist, zählt auf dem Gerät als Fehlversuch der PIN-Retries. Die Webapp muss den Zähler
 nicht selbst führen, soll aber bei `0x33` deutlich auf die Restversuche hinweisen, wenn das Gerät sie liefert.
@@ -142,7 +193,8 @@ nicht selbst führen, soll aber bei `0x33` deutlich auf die Restversuche hinweis
 1. Ein Modul `fingerprintClient` (oder passend zum Projekt benannt) mit den Funktionen
    `status()`, `pair(token)`, `enroll(token)`, `remove(token, slot | 'all')`, `unlock(token)` und `getPinToken(pin)`.
    Alle Funktionen liefern typisierte Ergebnisse oder werfen einen Fehler mit CTAP-Code.
-2. Die UI-Komponente mit den Zuständen aus dem Ablauf oben.
+2. Die UI-Komponente mit den Zuständen aus dem Ablauf oben, einschließlich Backup und Restore.
+   Die Backup-Verschlüsselung als eigenes Modul `backupCodec` (encrypt/decrypt mit Passphrase).
 3. Tests mit gemockter HID-Verbindung:
    - Anfrage-Kodierung (Schlüsselreihenfolge, Auth-Payload als Bytevergleich mit einem Testvektor),
    - Token-Ableitung (HKDF-Parameter laut Abschnitt oben),
@@ -157,4 +209,9 @@ nicht selbst führen, soll aber bei `0x33` deutlich auf die Restversuche hinweis
 - Ein gelöschter Slot verschwindet aus `status`.
 - Bei gesperrtem Zustand ist Enrollment nicht möglich, Entsperren schon.
 - Die Anfrage-Kodierung entspricht exakt den Tabellen oben (Tests grün).
+- Backup: Verschlüsseln und Entschlüsseln rund um (gleiche Passphrase → gleicher Blob). Falsche Passphrase → Fehler.
+  Geänderte Datei → Fehler. Blob mit falscher Länge oder Version → Fehler, nichts wird gesendet.
+- Restore: Ohne PIN-Token kein `0x07`. Nach erfolgreichem Restore zeigt `status` die Slots aus dem Backup.
+- Ist `flashEncrypted = false`, sind Pairing und Restore deaktiviert, und die App sendet dafür keinen Befehl.
+- Neue PIN mit 5 Ziffern oder Buchstaben wird vor dem Senden abgelehnt. Anmeldung mit einer 4-stelligen Altpin geht.
 - Ist `supported = false`, zeigt die App keinen Fingerabdruck-Bereich und sendet keine Befehle außer `status`.

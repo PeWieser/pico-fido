@@ -136,6 +136,12 @@ UV-Zugriff.** Dafür braucht man die PIN.
 
 ### 4.3 Restrisiken (ehrlich)
 
+- **R1-Status (umgesetzt):** Pairing und Restore sind nur erlaubt, wenn die ESP32-Flash-Verschlüsselung aktiv
+  ist (`PICO_FIDO_R558_REQUIRE_FLASH_ENCRYPTION`, Standard an). Der Status `flash_encrypted` (Schlüssel 7) zeigt den
+  Zustand. Die Partition `part0` ist im Secure-Profil als `encrypted` markiert (`config/esp32/partitions_secure.csv`).
+  Secure Boot v2 und Flash-Verschlüsselung sind im Profil `config/esp32/sdkconfig.secure.defaults` gesetzt
+  (PlatformIO: `pio run -e esp32s3_secure`). Die Anleitung steht in `docs/platformio/README.md`, Abschnitt 9.
+  **Nicht getestet** am Gerät.
 - **R1 – Mitlesen auf der UART-Leitung.** Passwort und Adresse laufen im Klartext über die Leitung. Wer während
   des Betriebs die Leitung abhört, kann ein Passwort und eine Adresse auslesen und einen **Fake-Sensor** bauen,
   der jedes Finger-Match bestätigt. Gegenmaßnahmen: Sensor im Gehäuse, kurze Leitungen, keine frei zugänglichen
@@ -145,7 +151,10 @@ UV-Zugriff.** Dafür braucht man die PIN.
   Das Repo aktiviert beides derzeit nicht (siehe `config/esp32/sdkconfig.defaults` im SDK).
 - **R2 – Der Sensor ist nicht authentisch.** Der R558 hat keine Kryptografie für Gerätezertifikate. Ob ein Modul
   „echt“ ist, lässt sich nicht prüfen. Die Sicherheit beruht allein auf dem geheimen Passwort und der Adresse (R1).
-- **R3 – FIDO-Reset.** Ein Reset des Authenticators löscht `EF_FP_CONF`. Der Sensor behält aber das alte Passwort
+- **R3-Status (umgesetzt):** Die Webapp kann die Sensor-Konfiguration sichern (Vendor-Befehl `0x06`, 43-Byte-Blob)
+  und nach einem FIDO-Reset wiederherstellen (`0x07`). Der Restore prüft, dass der Sensor Passwort und Adresse
+  akzeptiert und die Template-Anzahl stimmt. Details: `docs/fingerprint/PIN_UND_BACKUP.md`.
+- **R3 – FIDO-Reset (Ausgangslage).** Ein Reset des Authenticators löscht `EF_FP_CONF`. Der Sensor behält aber das alte Passwort
   und die Adresse. Ein Wiederverwenden desselben Sensors erfordert dann ein Zurücksetzen des Sensors auf Werks-
   einstellung (Flash löschen, Befehl `RestSetting 0x3B` laut Datenblatt; ob er ohne Passwort funktioniert, ist noch zu prüfen). Ein neuer Sensor geht
   sofort.
@@ -156,6 +165,8 @@ UV-Zugriff.** Dafür braucht man die PIN.
   nach erfolgreichem `Store` belegt). Ein Template könnte aber im Sensor liegen, wenn der Stromausfall genau
   zwischen `Store` und dem Flash-Commit passiert. Dieses Template liegt dann in einem freien Slot und wird beim
   nächsten Pairing gelöscht oder beim nächsten Enrollment überschrieben.
+- **PIN:** Mindestens 6 Zeichen für neue Geräte (`FIDO_MIN_PIN_LENGTH_DEFAULT`). Bestehende 4-stellige PINs bleiben
+  bis zur Änderung gültig. Details: `docs/fingerprint/PIN_UND_BACKUP.md`.
 - **R6 – Biometrie bleibt im Sensor.** Templates verlassen den Sensor nicht. Die Firmware kennt nur Slot-Nummern.
 
 ---

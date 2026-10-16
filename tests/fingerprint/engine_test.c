@@ -170,6 +170,12 @@ static void module_command(module_t *m, const uint8_t *cmd, size_t n) {
         case FP_INS_EMPTY:
             memset(m->used, 0, sizeof(m->used));
             reply(m, addr, 0x00, NULL, 0, out, &ol); break;
+        case FP_INS_TEMPLATE_NUM: {
+            uint16_t n = 0;
+            for (int i = 0; i < 256; i++) { if (m->used[i]) { n++; } }
+            uint8_t d2[2] = { (uint8_t)(n >> 8), (uint8_t)n };
+            reply(m, addr, 0x00, d2, 2, out, &ol); break;
+        }
         default:
             reply(m, addr, 0x01, NULL, 0, out, &ol); break;
     }
@@ -332,6 +338,73 @@ int main(void) {
     CHECK(fp_delete(0) == FP_OK && !fp_is_slot_used(0), "single slot deleted");
     CHECK(fp_delete(0) == FP_ERR_NO_TEMPLATE, "deleting an empty slot reports no template");
     CHECK(fp_delete(300) == FP_ERR_BAD_PARAM, "slot outside capacity is refused");
+
+    /* 13. R3 backup and restore after an authenticator reset. */
+    reset_all();
+    CHECK(fp_pair(&cap) == FP_OK, "backup test: pair");
+    sched_set(3, 7, -1, 7);
+    CHECK(fp_enroll(&slot) == FP_OK, "backup test: enroll one finger");
+    uint8_t blob[FP_BACKUP_BYTES];
+    CHECK(fp_backup(blob) == FP_OK && blob[0] == 1, "backup of a paired device succeeds");
+    CHECK(memcmp(blob + 1, mod_a.password, 4) == 0, "backup holds the sensor password");
+    CHECK(((uint32_t)blob[5] << 24 | (uint32_t)blob[6] << 16 | blob[7] << 8 | blob[8]) == mod_a.address, "backup holds the sensor address");
+    uint8_t blob_saved[FP_BACKUP_BYTES];
+    memcpy(blob_saved, blob, sizeof(blob));
+
+    ef_len = 0;                                      /* authenticator reset: EF_FP_CONF is gone */
+    fp_get_status(&st);
+    CHECK(!st.paired, "after reset: not paired");
+    CHECK(fp_restore(blob_saved, sizeof(blob_saved)) == FP_OK, "restore after reset with the same sensor succeeds");
+    fp_get_status(&st);
+    CHECK(st.paired && !st.locked && st.enrolled == 1, "restored: paired, not locked, one template");
+    CHECK(fp_restore(blob_saved, sizeof(blob_saved)) == FP_OK, "restore of the same sensor again is a no-op");
+
+    /* Wrong password in the blob: sensor refuses, nothing is trusted. */
+    ef_len = 0;
+    uint8_t bad[FP_BACKUP_BYTES];
+    memcpy(bad, blob_saved, sizeof(bad));
+    bad[1] ^= 0x01;
+    CHECK(fp_restore(bad, sizeof(bad)) == FP_ERR_BACKUP_MISMATCH, "wrong password in backup is a mismatch");
+    CHECK(ef_len == 0, "mismatched backup writes nothing");
+
+    /* Backup says a template exists that the sensor does not have. */
+    memcpy(bad, blob_saved, sizeof(bad));
+    bad[FP_BACKUP_HEADER + 5] |= 0x01;               /* extra slot 40 */
+    CHECK(fp_restore(bad, sizeof(bad)) == FP_ERR_BACKUP_MISMATCH, "slot count mismatch is refused");
+    CHECK(ef_len == 0, "slot mismatch writes nothing");
+
+    /* Sensor not answering: restore fails without writing. */
+    mod_a.present = 0;
+    CHECK(fp_restore(blob_saved, sizeof(blob_saved)) == FP_ERR_SENSOR, "absent sensor: restore fails");
+    CHECK(ef_len == 0, "absent sensor writes nothing");
+    mod_a.present = 1;
+
+    /* Malformed blobs. */
+    uint8_t mal[FP_BACKUP_BYTES];
+    memcpy(mal, blob_saved, sizeof(mal)); mal[0] = 2;
+    CHECK(fp_restore(mal, sizeof(mal)) == FP_ERR_BACKUP_FORMAT, "unknown backup version is refused");
+    CHECK(fp_restore(blob_saved, FP_BACKUP_BYTES - 1) == FP_ERR_BACKUP_FORMAT, "short backup is refused");
+    memcpy(mal, blob_saved, sizeof(mal)); memset(mal + 1, 0, 4);
+    CHECK(fp_restore(mal, sizeof(mal)) == FP_ERR_BACKUP_FORMAT, "all-zero password is refused");
+    memcpy(mal, blob_saved, sizeof(mal)); mal[5] = mal[6] = mal[7] = mal[8] = 0xFF;
+    CHECK(fp_restore(mal, sizeof(mal)) == FP_ERR_BACKUP_FORMAT, "factory address is refused");
+    memcpy(mal, blob_saved, sizeof(mal)); mal[FP_BACKUP_HEADER] |= 0x20;   /* slot 5 set, capacity lowered to 3 */
+    mal[9] = 0; mal[10] = 3;
+    CHECK(fp_restore(mal, sizeof(mal)) == FP_ERR_BACKUP_FORMAT, "slot beyond capacity is refused");
+    CHECK(fp_restore(NULL, 0) == FP_ERR_BACKUP_FORMAT, "null blob is refused");
+
+    /* Already paired: same sensor is a no-op, another sensor is refused. */
+    fp_restore(blob_saved, sizeof(blob_saved));
+    memcpy(bad, blob_saved, sizeof(bad)); bad[1] ^= 0x10; bad[8] ^= 0x01;
+    CHECK(fp_restore(bad, sizeof(bad)) == FP_ERR_ALREADY_PAIRED, "restore over a different trusted sensor is refused");
+
+    /* Backup needs a pairing. */
+    ef_len = 0;
+    CHECK(fp_backup(blob) == FP_ERR_NOT_PAIRED, "backup without a pairing is refused");
+
+    /* Status reports flash encryption. Host builds have none. */
+    fp_get_status(&st);
+    CHECK(!st.flash_encrypted, "host build: flash encryption not active");
 
     if (failures) {
         printf("%d FAILURE(S)\n", failures);

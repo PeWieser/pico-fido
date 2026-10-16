@@ -51,7 +51,14 @@ typedef enum {
     FP_ERR_NOT_FACTORY,    /* new sensor is not in factory state, reset it first */
     FP_ERR_BAD_PARAM,
     FP_ERR_STORAGE,
+    FP_ERR_NOT_SECURE,       /* flash encryption required but not active (R1) */
+    FP_ERR_BACKUP_FORMAT,    /* malformed backup blob */
+    FP_ERR_BACKUP_MISMATCH,  /* backup does not match the connected sensor */
 } fp_result_t;
+
+/* Backup blob (R3): 1 version | 4 password | 4 address (BE) | 2 capacity (BE) | 32 slot bitmap. */
+#define FP_BACKUP_HEADER 11u
+#define FP_BACKUP_BYTES  43u
 
 typedef struct {
     bool paired;
@@ -59,7 +66,8 @@ typedef struct {
     uint16_t capacity;
     uint16_t enrolled;
     uint8_t failed_attempts;
-    bool supported;   /* firmware built with the R558 feature */
+    bool supported;       /* firmware built with the R558 feature */
+    bool flash_encrypted; /* ESP32 flash encryption active (R1) */
 } fp_status_t;
 
 /* Call once at boot (after the file system is scanned). Initialises UART and loads configuration. */
@@ -84,6 +92,11 @@ fp_result_t fp_delete(uint16_t slot);
 fp_result_t fp_unlock(void);
 
 void fp_get_status(fp_status_t *st);
+
+/* Backup of the trusted sensor configuration (password, address, slots). Needs a PIN token in the vendor layer. */
+fp_result_t fp_backup(uint8_t out[FP_BACKUP_BYTES]);
+/* Restores a backup after an authenticator reset. Checks the sensor before it is trusted. */
+fp_result_t fp_restore(const uint8_t *blob, size_t len);
 bool fp_is_slot_used(uint16_t slot);
 
 /* Maps an engine result to a CTAP status code (0 = CTAP2_OK). */

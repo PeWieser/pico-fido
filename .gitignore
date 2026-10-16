@@ -8,3 +8,7 @@ legacy/
 .pio/
 /sdkconfig
 /sdkconfig.old
+
+# Secure boot signing keys must never be committed
+secure_boot_signing_key*
+*.pem
