@@ -38,8 +38,8 @@ int fp_uart_init(void) {
         .baud_rate = FP_UART_BAUD,
         .data_bits = UART_DATA_8_BITS,
         .parity = UART_PARITY_DISABLE,
-        /* The R558 datasheet lists 2 stop bits. A 1-stop receiver resynchronises on the next start bit, so 1 is used here. */
-        .stop_bits = UART_STOP_BITS_1,
+        /* R558-S manual, section IV: 8N2 (8 data bits, no parity, 2 stop bits). */
+        .stop_bits = UART_STOP_BITS_2,
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
         .source_clk = UART_SCLK_DEFAULT,
     };

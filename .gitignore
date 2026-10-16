@@ -3,3 +3,8 @@ build*/
 legacy/
 .DS_Store
 
+
+# PlatformIO build output and generated ESP-IDF config
+.pio/
+/sdkconfig
+/sdkconfig.old

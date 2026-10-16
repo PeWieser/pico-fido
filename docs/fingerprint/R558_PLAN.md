@@ -47,18 +47,20 @@ Siehe Abschnitt 9.
 
 ### 2.2 Protokoll des Sensors
 
-- UART 57600 Baud, 8 Datenbits, keine Parität. Das Datenblatt nennt 2 Stoppbits. Die Firmware nutzt 1 Stoppbit,
-  weil ein Empfänger mit 1 Stoppbit den nächsten Startbit sauber erkennt. Bei Problemen auf 2 umstellen
-  (`fp_r558_uart.c`).
+- UART 57600 Baud, 8 Datenbits, keine Parität, **2 Stoppbits** (8N2, Handbuch Abschnitt IV). Die Firmware nutzt
+  8N2 in `fp_r558_uart.c`. Das Power-on-Byte `0x55` des Moduls wird vom Paket-Parser übersprungen (Header-Suche).
 - Paketformat: `EF 01 | Adresse(4) | PID(1) | Länge(2) | Payload | Prüfsumme(2)`. Prüfsumme = Summe über PID, Länge und
   Payload (Modulo 65536).
 - Bestätigt aus dem R558-S-Handbuch (V1.1): Standardpasswort `0x00000000`, Standardadresse `0xFFFFFFFF`,
   Passwort wird nach Änderung im Flash gespeichert und kann nicht ausgelesen werden, nach Einschalten muss zuerst
   `VfyPwd` gesendet werden, und die Adresse ist per `SetChipAddr` fest, nur ein Flash-Löschen setzt sie zurück.
-- Aus der ZFM-Familie übernommen und **noch zu verifizieren** gegen das Handbuch des konkreten Moduls:
-  `GenImg 0x01`, `Img2Tz 0x02`, `Search 0x04`, `RegModel 0x05`, `Store 0x06`, `DeletChar 0x0C`, `Empty 0x0D`,
-  `ReadSysPara 0x0F` (Antwort mit Kapazität und Adresse, 16 Byte), Bestätigungscodes `0x00`, `0x02`, `0x06`,
-  `0x07`, `0x08`, `0x09`, `0x0A`, `0x13`, `0x15`.
+- Gegen das R558-S-Handbuch (V1.1, Datei `r558-s-fingerprint-module-user-manual-v1-1-1-2-1_compress.pdf`)
+  geprüft: Befehlscodes `GenImg 0x01`, `Img2Tz (Genchar) 0x02`, `Search 0x04`, `RegModel 0x05`, `Store 0x06`,
+  `LoadChar 0x07`, `DeletChar 0x0C`, `Empty 0x0D`, `ReadSysPara 0x0F`, `SetPwd 0x12`, `VfyPwd 0x13`,
+  `SetChipAddr 0x15`. Bestätigungscodes `0x00`, `0x02`, `0x03`, `0x06`–`0x0A`, `0x13`, `0x15`, `0x18` stimmen.
+  Parameterlayouts (Search, DeletChar, SetPwd/VfyPwd, SetChipAddr) stimmen.
+- Noch nicht am echten Modul getestet. Die Antwortlängen von `ReadSysPara` und die Antwortzeiten von `Search`
+  sind nur aus dem Handbuch übernommen.
 
 ---
 
@@ -217,7 +219,8 @@ Kopf von `run_r558_engine_test.sh`.
 
 1. ESP-IDF-Build durchlaufen lassen und die Warnungen prüfen (besonders `neopixel.h`-Aufrufe in `fp_led.c`
    und `uart_*`-Aufrufe in `fp_r558_uart.c`).
-2. Am echten Modul prüfen: Befehlscodes (Abschnitt 2.2), Bestätigungscodes, Stoppbits, Antwortzeiten von `Search`.
+2. Am echten Modul prüfen: Antworten gegen das Handbuch (Abschnitt 2.2 ist bereits mit dem Datenblatt abgeglichen),
+   Antwortzeiten von `Search` und Stoppbits (8N2 laut Datenblatt).
 3. Prüfen, ob die Browser mit der geänderten `uv`-Option in getInfo und den MC/GA-Optionen `uv: true`
    zurechtkommen (Chrome, Firefox, Safari). Diese Änderung folgt der CTAP-2.1-Idee des integrierten UV und wurde
    nicht gegen Konformitätstests geprüft.
