@@ -123,7 +123,9 @@ if(FIDO_ESP_IDF)
     list(APPEND EXTRA_COMPONENT_DIRS ${FIDO_PIO_EXTRA_COMPONENT_DIRS})
     # picokeys_sdk_import.cmake sets COMPONENTS without main. main/ holds the PlatformIO main component
     # (pio_entry.c); ESP-IDF needs it in COMPONENTS to find the main target.
-    list(PREPEND COMPONENTS main)
+    # PlatformIO's default component (__pio_env, generated for the generic sources) must be in COMPONENTS too,
+    # otherwise its build information is missing (see espidf.py: find_default_component).
+    list(PREPEND COMPONENTS main __pio_env)
 endif()
 SET_BUILD_NUMBER("${CMAKE_CURRENT_LIST_DIR}")
 
