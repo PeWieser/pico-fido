@@ -22,15 +22,19 @@ cmake_minimum_required(VERSION 3.13)
 if(NOT ESP_PLATFORM AND DEFINED ENV{IDF_PATH})
     set(ESP_PLATFORM 1)
 endif()
+# Own flag for the branches below: ESP-IDF's project.cmake does not keep ESP_PLATFORM reliable under PlatformIO.
+if(ESP_PLATFORM)
+    set(FIDO_ESP_IDF 1)
+else()
+    set(FIDO_ESP_IDF 0)
+endif()
 
 set(USB_VID 0x2E8A)
 set(USB_PID 0x10FE)
 
-if(ESP_PLATFORM)
+if(FIDO_ESP_IDF)
     set(PICOKEYS_COMPONENTS fido)
     include($ENV{IDF_PATH}/tools/cmake/project.cmake)
-    # project.cmake can clear ESP_PLATFORM in this scope under PlatformIO; the checks below need it.
-    set(ESP_PLATFORM 1)
 else()
     if(NOT ENABLE_EMULATION)
         set(PICO_USE_FASTEST_SUPPORTED_CLOCK 1)
@@ -72,7 +76,7 @@ configure_bool_option(
 )
 
 # The R558 sensor is wired to the ESP32-S3 board only, so it is on by default there and off everywhere else.
-if(ESP_PLATFORM)
+if(FIDO_ESP_IDF)
     set(_R558_DEFAULT ON)
 else()
     set(_R558_DEFAULT OFF)
@@ -112,7 +116,7 @@ set(USB_ITF_HID 1)
 include(pico-keys-sdk/picokeys_sdk_import.cmake)
 SET_BUILD_NUMBER("${CMAKE_CURRENT_LIST_DIR}")
 
-if(NOT ESP_PLATFORM)
+if(NOT FIDO_ESP_IDF)
     set(SOURCES ${PICOKEYS_SOURCES})
 endif()
 
@@ -164,7 +168,7 @@ if(ENABLE_OTP_APP)
 endif()
 
 SET_VERSION(ver_major ver_minor "${CMAKE_CURRENT_LIST_DIR}/src/fido/version.h")
-if(ESP_PLATFORM)
+if(FIDO_ESP_IDF)
     project(pico_fido)
 endif()
 
@@ -172,7 +176,7 @@ set(INCLUDES ${INCLUDES}
     ${CMAKE_CURRENT_LIST_DIR}/src/fido
 )
 
-if(NOT ESP_PLATFORM)
+if(NOT FIDO_ESP_IDF)
     target_sources(pico_fido PUBLIC ${SOURCES})
     target_include_directories(pico_fido PUBLIC ${INCLUDES})
 
