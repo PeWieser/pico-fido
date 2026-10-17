@@ -87,9 +87,14 @@ Die UART-Parameter sind 57600 Baud, 8N2, nach dem Datenblatt des R558-S (Handbuc
 
 ## Hinweis zum Stand dieses Branches
 
-Die `platformio.ini`, die Komponente unter `src/` und diese Anleitung wurden in einer Sandbox ohne Zugriff auf das
-PlatformIO-Registry geschrieben. Dort konnte der Build nicht durchlaufen. Die Konfiguration wurde nur über
-`pio project config` geprüft. Der erste echte `pio run` steht also noch aus. Bitte melde dich, wenn er fehlschlägt.
+Der GitHub-Workflow `.github/workflows/platformio.yml` baut die Umgebungen `esp32s3` und `esp32s3_dev` bei jedem Push.
+Das Ergebnis steht als Kommentar am Commit (Erfolg oder Fehlerzeilen) und in der Job-Zusammenfassung.
+Der Build läuft dort erfolgreich durch. Ein Flash-Test auf echter Hardware steht noch aus.
+
+Der Quellordner ist `main/` (`src_dir = main`). Dort liegt die Hauptkomponente für PlatformIO
+(`main/pio_entry.c`). Der Firmware-Code liegt in `src/fido/`, `pico-keys-sdk/` und dem Submodul.
+Die Root-`CMakeLists.txt` erkennt ESP-IDF über `IDF_PATH` und behält die von PlatformIO gesetzten
+`EXTRA_COMPONENT_DIRS` bei. Das ist nötig, weil `picokeys_sdk_import.cmake` diese Variable überschreibt.
 
 ## 9. Secure Boot und Flash-Verschlüsselung (R1)
 
