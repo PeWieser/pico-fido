@@ -29,6 +29,8 @@ set(USB_PID 0x10FE)
 if(ESP_PLATFORM)
     set(PICOKEYS_COMPONENTS fido)
     include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+    # project.cmake can clear ESP_PLATFORM in this scope under PlatformIO; the checks below need it.
+    set(ESP_PLATFORM 1)
 else()
     if(NOT ENABLE_EMULATION)
         set(PICO_USE_FASTEST_SUPPORTED_CLOCK 1)
