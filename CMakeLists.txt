@@ -114,6 +114,11 @@ endif()
 
 set(USB_ITF_HID 1)
 include(pico-keys-sdk/picokeys_sdk_import.cmake)
+if(FIDO_ESP_IDF)
+    # picokeys_sdk_import.cmake sets COMPONENTS without main. main/ holds the PlatformIO main component
+    # (pio_entry.c); ESP-IDF needs it in COMPONENTS to find the main target.
+    list(PREPEND COMPONENTS main)
+endif()
 SET_BUILD_NUMBER("${CMAKE_CURRENT_LIST_DIR}")
 
 if(NOT FIDO_ESP_IDF)
