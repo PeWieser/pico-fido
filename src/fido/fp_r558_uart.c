@@ -77,7 +77,7 @@ static int uart_read(void *ctx, uint8_t *data, size_t len, uint32_t timeout_ms) 
     return r < 0 ? -1 : r;
 }
 
-static void uart_flush(void *ctx) {
+static void fp_uart_transport_flush(void *ctx) {
     (void)ctx;
     if (uart_ready) {
         uart_flush_input(FP_UART_NUM);
@@ -88,7 +88,7 @@ static const fp_transport_t uart_transport = {
     .ctx = NULL,
     .write = uart_write,
     .read = uart_read,
-    .flush = uart_flush,
+    .flush = fp_uart_transport_flush,
 };
 
 const fp_transport_t *fp_uart_transport(void) {
