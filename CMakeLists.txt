@@ -17,12 +17,16 @@
 
 cmake_minimum_required(VERSION 3.13)
 
+# ESP_PLATFORM is normally set by the ESP-IDF toolchain file, which is loaded too late for the checks
+# below. PlatformIO exports IDF_PATH for espidf builds, so set ESP_PLATFORM from it here.
+if(NOT ESP_PLATFORM AND DEFINED ENV{IDF_PATH})
+    set(ESP_PLATFORM 1)
+endif()
+
 set(USB_VID 0x2E8A)
 set(USB_PID 0x10FE)
 
-# ESP_PLATFORM is only set by the ESP-IDF toolchain file, which is loaded too late for this check
-# under PlatformIO. PlatformIO exports IDF_PATH for espidf builds, so use it as a fallback.
-if(ESP_PLATFORM OR DEFINED ENV{IDF_PATH})
+if(ESP_PLATFORM)
     set(PICOKEYS_COMPONENTS fido)
     include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 else()
