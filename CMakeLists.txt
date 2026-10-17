@@ -113,8 +113,14 @@ else()
 endif()
 
 set(USB_ITF_HID 1)
+if(FIDO_ESP_IDF)
+    # PlatformIO passes its own EXTRA_COMPONENT_DIRS (the project's main component). picokeys_sdk_import.cmake
+    # overwrites that variable, so keep the original value and add it back after the include.
+    set(FIDO_PIO_EXTRA_COMPONENT_DIRS ${EXTRA_COMPONENT_DIRS})
+endif()
 include(pico-keys-sdk/picokeys_sdk_import.cmake)
 if(FIDO_ESP_IDF)
+    list(APPEND EXTRA_COMPONENT_DIRS ${FIDO_PIO_EXTRA_COMPONENT_DIRS})
     # picokeys_sdk_import.cmake sets COMPONENTS without main. main/ holds the PlatformIO main component
     # (pio_entry.c); ESP-IDF needs it in COMPONENTS to find the main target.
     list(PREPEND COMPONENTS main)
