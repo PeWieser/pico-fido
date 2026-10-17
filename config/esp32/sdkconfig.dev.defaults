@@ -1,0 +1,6 @@
+# Development profile (no secure boot, no flash encryption).
+# Lets R558 pairing and restore run on boards without flash encryption, for example on a bench board.
+#
+# WARNING: in this profile the R558 sensor password and address are stored in plaintext flash.
+# Do not use this profile on a device that holds real credentials. Use the esp32s3_secure environment instead.
+# CONFIG_PICO_FIDO_R558_REQUIRE_FLASH_ENCRYPTION is not set
