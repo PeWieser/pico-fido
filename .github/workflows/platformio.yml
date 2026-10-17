@@ -58,7 +58,7 @@ jobs:
         shell: bash
         run: |
           set +e
-          pio project config -e "${{ matrix.env }}" > config.log 2>&1
+          pio project config > config.log 2>&1
           rc=$?
           echo "rc=$rc" >> "$GITHUB_OUTPUT"
           cat config.log

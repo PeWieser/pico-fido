@@ -34,12 +34,10 @@ Die Versionen sind in `platformio.ini` festgelegt:
 | Eintrag | Wert | Grund |
 |---|---|---|
 | `platform` | `espressif32@6.12.0` | liefert ESP-IDF 5.5.x |
-| `framework-espidf` | `~3.50501.0` | ESP-IDF 5.5.1, wie in der CI |
+| `framework-espidf` | (von der Plattform) `~3.50500.0` | ESP-IDF 5.5.0; kein eigener Pin, da `~3.50501.0` in der Registry fehlt |
 | `board` | `esp32-s3-devkitc-1` | generischer ESP32-S3 |
 | `board_upload.flash_size` | `4MB` | passend zu `sdkconfig.defaults` und `partitions.csv` |
 
-Wenn PlatformIO das Paket `framework-espidf@~3.50501.0` nicht findet, entferne die Zeile `platform_packages`
-in `platformio.ini`. PlatformIO nimmt dann die von der Plattform vorgesehene ESP-IDF-Version.
 
 ## 4. In den Bootloader wechseln
 
