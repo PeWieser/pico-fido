@@ -85,6 +85,7 @@ jobs:
           BUILD_RC: ${{ steps.build.outputs.rc }}
           PIO_INSTALL_RC: ${{ steps.install.outputs.rc }}
         run: |
+          set +e
           {
             echo "# PlatformIO build \`${ENV_NAME}\`"
             echo ""
@@ -107,13 +108,17 @@ jobs:
             done
             echo '```'
             echo ""
-            echo "## Log tail (config.log, build.log)"
+            echo "## Full configuration output (config.log, first 150 lines)"
             echo '```'
-            [ -f config.log ] && tail -n 25 config.log
-            echo "--- build ---"
-            [ -f build.log ] && tail -n 60 build.log
+            [ -f config.log ] && head -n 150 config.log
             echo '```'
-          } > report.md
+            echo ""
+            echo "## Build output (build.log, last 80 lines)"
+            echo '```'
+            [ -f build.log ] && tail -n 80 build.log
+            echo '```'
+          } > report.md 2>/dev/null
+          wc -l report.md
           cat report.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Post commit comment with the result
