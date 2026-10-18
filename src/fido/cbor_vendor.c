@@ -20,6 +20,8 @@
 #include "ctap2_cbor.h"
 #include "fido.h"
 #include "ctap.h"
+#include "fp_r558.h"
+#include "fp_led.h"
 #include "hid/ctap_hid.h"
 #include "files.h"
 #include "credential.h"
@@ -70,6 +72,41 @@ int mse_decrypt_ct(uint8_t *data, size_t len) {
     return ret;
 }
 
+/*
+ * Authorises a CTAP_VENDOR_FP subcommand with the PIN token (authenticatorConfig permission).
+ * Payload: 32 x 0xFF || 0x0D || subcommand || raw parameter bytes, same construction as the vault commands.
+ */
+static int fp_pin_auth(uint64_t protocol, const CborByteString *auth, const uint8_t *raw_params, size_t raw_params_len, uint64_t subcommand) {
+    if (auth->present == false || auth->data == NULL) {
+        return CTAP2_ERR_PUAT_REQUIRED;
+    }
+    if ((protocol != 1 && protocol != 2) || auth->len != (protocol == 1 ? 16u : 32u)) {
+        return CTAP2_ERR_PIN_AUTH_INVALID;
+    }
+    if (!file_has_data(ef_pin)) {
+        return CTAP2_ERR_PIN_NOT_SET;
+    }
+    if (raw_params_len > CTAP_MAX_CBOR_PAYLOAD - 34u) {
+        return CTAP2_ERR_LIMIT_EXCEEDED;
+    }
+    uint8_t *payload = calloc(1, 34u + raw_params_len);
+    if (!payload) {
+        return CTAP2_ERR_PROCESSING;
+    }
+    memset(payload, 0xff, 32);
+    payload[32] = 0x0d;
+    payload[33] = (uint8_t)subcommand;
+    if (raw_params_len) {
+        memcpy(payload + 34, raw_params, raw_params_len);
+    }
+    int ret = verify((uint8_t)protocol, paut.data, payload, (uint16_t)(34u + raw_params_len), auth->data);
+    free(payload);
+    if (ret != 0 || !(paut.permissions & CTAP_PERMISSION_ACFG)) {
+        return CTAP2_ERR_PIN_AUTH_INVALID;
+    }
+    return 0;
+}
+
 static int cbor_vendor_generic(uint8_t cmd, const uint8_t *data, size_t len) {
     CborParser parser;
     CborValue map;
@@ -80,7 +117,7 @@ static int cbor_vendor_generic(uint8_t cmd, const uint8_t *data, size_t len) {
     uint64_t vault_algorithm = 0;
     bool vault_algorithm_present = false;
     int64_t kty = 0, alg = 0, crv = 0;
-    CborEncoder encoder, mapEncoder, mapEncoder2;
+    CborEncoder encoder, mapEncoder, mapEncoder2, arrEncoder;
     uint8_t *raw_vendor_params = NULL;
     size_t raw_vendor_params_len = 0;
     bool vault_response_handled = false;
@@ -300,6 +337,117 @@ static int cbor_vendor_generic(uint8_t cmd, const uint8_t *data, size_t len) {
         if (vault_error != CborNoError) {
             error = vault_error;
             goto err;
+        }
+    }
+    else if (cmd == CTAP_VENDOR_FP) {
+        /*
+         * Subcommands (key 1). 0x01 is read-only. The others need a PIN token with the
+         * authenticatorConfig permission and a user presence check.
+         *   0x01 status            -> {1: paired, 2: locked, 3: capacity, 4: [enrolled slots], 5: failed attempts,
+         *                              6: supported (R558 feature built in), 7: flash encrypted}
+         *   0x02 pair              -> {1: capacity}          (PIN token, needs flash encryption, R1)
+         *   0x03 enroll            -> {1: slot}
+         *   0x04 delete            -> key 2 param {1: slot as 2 bytes BE, 0xFFFF = all}, or no param = all
+         *   0x05 unlock            -> {}
+         *   0x06 backup            -> {1: bytes(43) backup blob}   (R3, plaintext: the caller must encrypt it)
+         *   0x07 restore           -> key 2 param {1: bytes(43)}, {}  (R3, checks the sensor before trusting it)
+         * Subcommands 0x02-0x07 need a PIN token (ACFG). No button: the sensor is the only interaction.
+         */
+        if (vendorCmd == 0x01) {
+            fp_status_t st;
+            fp_get_status(&st);
+            CBOR_CHECK(cbor_encoder_create_map(&encoder, &mapEncoder, 7));
+            CBOR_CHECK(cbor_encode_uint(&mapEncoder, 0x01));
+            CBOR_CHECK(cbor_encode_boolean(&mapEncoder, st.paired));
+            CBOR_CHECK(cbor_encode_uint(&mapEncoder, 0x02));
+            CBOR_CHECK(cbor_encode_boolean(&mapEncoder, st.locked));
+            CBOR_CHECK(cbor_encode_uint(&mapEncoder, 0x03));
+            CBOR_CHECK(cbor_encode_uint(&mapEncoder, st.capacity));
+            CBOR_CHECK(cbor_encode_uint(&mapEncoder, 0x04));
+            CBOR_CHECK(cbor_encoder_create_array(&mapEncoder, &arrEncoder, st.enrolled));
+            for (uint16_t i = 0; i < st.capacity; i++) {
+                if (fp_is_slot_used(i)) {
+                    CBOR_CHECK(cbor_encode_uint(&arrEncoder, i));
+                }
+            }
+            CBOR_CHECK(cbor_encoder_close_container(&mapEncoder, &arrEncoder));
+            CBOR_CHECK(cbor_encode_uint(&mapEncoder, 0x05));
+            CBOR_CHECK(cbor_encode_uint(&mapEncoder, st.failed_attempts));
+            CBOR_CHECK(cbor_encode_uint(&mapEncoder, 0x06));
+            CBOR_CHECK(cbor_encode_boolean(&mapEncoder, st.supported));
+            CBOR_CHECK(cbor_encode_uint(&mapEncoder, 0x07));
+            CBOR_CHECK(cbor_encode_boolean(&mapEncoder, st.flash_encrypted));
+        }
+        else if (vendorCmd >= 0x02 && vendorCmd <= 0x07) {
+            int auth_ret = fp_pin_auth((uint8_t)pinUvAuthProtocol, &pinUvAuthParam, raw_vendor_params, raw_vendor_params_len, vendorCmd);
+            if (auth_ret != 0) {
+                CBOR_ERROR(auth_ret);
+            }
+            /* No button: the PIN token is the authorisation, the fingerprint sensor is the only user interaction. */
+            fp_result_t fres = FP_OK;
+            uint16_t value = 0;
+            uint8_t fp_blob[FP_BACKUP_BYTES];
+            if (vendorCmd == 0x02) {
+                fp_led_op_begin();
+                fres = fp_pair(&value);
+                fp_led_op_end(fres == FP_OK);
+            }
+            else if (vendorCmd == 0x03) {
+                fp_led_op_begin();
+                fp_led_enrolling(true);
+                fres = fp_enroll(&value);
+                fp_led_enrolling(false);
+                fp_led_op_end(fres == FP_OK);
+            }
+            else if (vendorCmd == 0x04) {
+                uint16_t slot = FP_ALL_SLOTS;
+                if (vendorParam.present == true) {
+                    if (vendorParam.len != 2) {
+                        CBOR_ERROR(CTAP1_ERR_INVALID_LEN);
+                    }
+                    slot = (uint16_t)((vendorParam.data[0] << 8) | vendorParam.data[1]);
+                }
+                fres = fp_delete(slot);
+            }
+            else if (vendorCmd == 0x05) {
+                fres = fp_unlock();
+            }
+            else if (vendorCmd == 0x06) {
+                fres = fp_backup(fp_blob);
+            }
+            else {
+                /* 0x07 restore: the blob is the vendor parameter (key 2, sub key 1). */
+                if (vendorParam.present == false) {
+                    CBOR_ERROR(CTAP1_ERR_INVALID_PARAMETER);
+                }
+                fres = fp_restore(vendorParam.data, vendorParam.len);
+            }
+            if (fres != FP_OK) {
+                mbedtls_platform_zeroize(fp_blob, sizeof(fp_blob));
+                CBOR_ERROR(fp_result_to_ctap(fres));
+            }
+            if (vendorCmd == 0x02) {
+                CBOR_CHECK(cbor_encoder_create_map(&encoder, &mapEncoder, 1));
+                CBOR_CHECK(cbor_encode_uint(&mapEncoder, 0x01));
+                CBOR_CHECK(cbor_encode_uint(&mapEncoder, value));
+            }
+            else if (vendorCmd == 0x03) {
+                CBOR_CHECK(cbor_encoder_create_map(&encoder, &mapEncoder, 1));
+                CBOR_CHECK(cbor_encode_uint(&mapEncoder, 0x01));
+                CBOR_CHECK(cbor_encode_uint(&mapEncoder, value));
+            }
+            else if (vendorCmd == 0x06) {
+                CBOR_CHECK(cbor_encoder_create_map(&encoder, &mapEncoder, 1));
+                CBOR_CHECK(cbor_encode_uint(&mapEncoder, 0x01));
+                CBOR_CHECK(cbor_encode_byte_string(&mapEncoder, fp_blob, sizeof(fp_blob)));
+                mbedtls_platform_zeroize(fp_blob, sizeof(fp_blob));
+            }
+            else {
+                CBOR_CHECK(cbor_encoder_create_map(&encoder, &mapEncoder, 0));
+            }
+        }
+        else {
+            CBOR_ERROR(CTAP2_ERR_INVALID_SUBCOMMAND);
         }
     }
     else {

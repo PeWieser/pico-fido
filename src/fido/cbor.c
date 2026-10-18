@@ -27,6 +27,7 @@
 #include "management.h"
 #include "ctap2_cbor.h"
 #include "version.h"
+#include "fp_led.h"
 
 const bool _btrue = true, _bfalse = false;
 
@@ -54,7 +55,10 @@ int cbor_parse(uint8_t cmd, const uint8_t *data, size_t len) {
                 reset_gna_state();
             }
             if (data[0] == CTAP_MAKE_CREDENTIAL) {
-                return cbor_make_credential(data + 1, len - 1);
+                fp_led_op_begin();
+                int ret = cbor_make_credential(data + 1, len - 1);
+                fp_led_op_end(ret == 0);
+                return ret;
             }
             if (data[0] == CTAP_GET_INFO) {
                 return cbor_get_info();
@@ -66,7 +70,10 @@ int cbor_parse(uint8_t cmd, const uint8_t *data, size_t len) {
                 return cbor_client_pin(data + 1, len - 1);
             }
             else if (data[0] == CTAP_GET_ASSERTION) {
-                return cbor_get_assertion(data + 1, len - 1, false);
+                fp_led_op_begin();
+                int ret = cbor_get_assertion(data + 1, len - 1, false);
+                fp_led_op_end(ret == 0);
+                return ret;
             }
             else if (data[0] == CTAP_GET_NEXT_ASSERTION) {
                 return cbor_get_next_assertion(data + 1, len - 1);

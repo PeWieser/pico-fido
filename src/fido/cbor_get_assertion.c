@@ -18,6 +18,7 @@
 #include "picokeys.h"
 #include "cbor.h"
 #include "ctap.h"
+#include "fp_r558.h"
 #if defined(PICO_PLATFORM)
 #include "bsp/board.h"
 #endif
@@ -305,7 +306,10 @@ int cbor_get_assertion(const uint8_t *data, size_t len, bool next) {
         }
         if (options.present) {
             if (options.uv == ptrue) { //4.3
-                CBOR_ERROR(CTAP2_ERR_INVALID_OPTION);
+                /* Built-in UV (fingerprint) is only accepted when a sensor is paired and enrolled, and never together with a PIN token. */
+                if (pinUvAuthParam.present == true || !fp_uv_available()) {
+                    CBOR_ERROR(CTAP2_ERR_INVALID_OPTION);
+                }
             }
             if (options.uv == NULL || pinUvAuthParam.present == true) {
                 uv = false;
@@ -361,6 +365,18 @@ int cbor_get_assertion(const uint8_t *data, size_t len, bool next) {
             if ((salt_enc.len != 32 && salt_enc.len != 48 && salt_enc.len != 64 && salt_enc.len != 80) ||
                 (salt_auth.len != 16 && salt_auth.len != 32)) {
                 CBOR_ERROR(CTAP1_ERR_INVALID_LEN);
+            }
+        }
+
+        if (uv && pinUvAuthParam.present == false) { // built-in UV: the fingerprint also counts as user presence
+            int fp_ret = fp_uv_ctap_status();
+            if (fp_ret != 0) {
+                CBOR_ERROR(fp_ret);
+            }
+            flags |= FIDO2_AUT_FLAG_UV;
+            if (options.up != pfalse) {
+                up = true;
+                flags |= FIDO2_AUT_FLAG_UP;
             }
         }
 

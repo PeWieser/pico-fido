@@ -1,0 +1,9 @@
+# Name,   Type, SubType, Offset,  Size, Flags
+# Same layout as pico-keys-sdk/config/esp32/partitions.csv, plus the "encrypted" flag on the
+# key storage partition (part0). With flash encryption enabled, the key storage is then encrypted
+# in hardware (R1). Use this table only with config/esp32/sdkconfig.secure.defaults.
+
+nvs,      data, nvs,      0x11000, 0x6000
+phy_init, data, phy,      0x17000, 0x1000
+factory,  app,  factory,  0x20000, 1M
+part0,    0x40, 0x1,      0x200000, 1M, encrypted

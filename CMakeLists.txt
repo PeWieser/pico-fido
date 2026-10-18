@@ -17,10 +17,22 @@
 
 cmake_minimum_required(VERSION 3.13)
 
+# ESP_PLATFORM is normally set by the ESP-IDF toolchain file, which is loaded too late for the checks
+# below. PlatformIO exports IDF_PATH for espidf builds, so set ESP_PLATFORM from it here.
+if(NOT ESP_PLATFORM AND DEFINED ENV{IDF_PATH})
+    set(ESP_PLATFORM 1)
+endif()
+# Own flag for the branches below: ESP-IDF's project.cmake does not keep ESP_PLATFORM reliable under PlatformIO.
+if(ESP_PLATFORM)
+    set(FIDO_ESP_IDF 1)
+else()
+    set(FIDO_ESP_IDF 0)
+endif()
+
 set(USB_VID 0x2E8A)
 set(USB_PID 0x10FE)
 
-if(ESP_PLATFORM)
+if(FIDO_ESP_IDF)
     set(PICOKEYS_COMPONENTS fido)
     include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 else()
@@ -63,6 +75,20 @@ configure_bool_option(
     "OTP Application: \t\t disabled"
 )
 
+# The R558 sensor is wired to the ESP32-S3 board only, so it is on by default there and off everywhere else.
+if(FIDO_ESP_IDF)
+    set(_R558_DEFAULT ON)
+else()
+    set(_R558_DEFAULT OFF)
+endif()
+option(ENABLE_R558_FINGERPRINT "Enable/disable R558 fingerprint sensor (UV via fingerprint, ESP32 only for hardware)" ${_R558_DEFAULT})
+configure_bool_option(
+    ENABLE_R558_FINGERPRINT
+    ENABLE_R558_FINGERPRINT
+    "R558 fingerprint sensor: \t enabled"
+    "R558 fingerprint sensor: \t disabled"
+)
+
 if(FORBID_DISABLE_AUV)
     add_compile_definitions(FORBID_DISABLE_AUV=1)
 endif()
@@ -87,10 +113,23 @@ else()
 endif()
 
 set(USB_ITF_HID 1)
+if(FIDO_ESP_IDF)
+    # PlatformIO passes its own EXTRA_COMPONENT_DIRS (the project's main component). picokeys_sdk_import.cmake
+    # overwrites that variable, so keep the original value and add it back after the include.
+    set(FIDO_PIO_EXTRA_COMPONENT_DIRS ${EXTRA_COMPONENT_DIRS})
+endif()
 include(pico-keys-sdk/picokeys_sdk_import.cmake)
+if(FIDO_ESP_IDF)
+    list(APPEND EXTRA_COMPONENT_DIRS ${FIDO_PIO_EXTRA_COMPONENT_DIRS})
+    # picokeys_sdk_import.cmake sets COMPONENTS without main. main/ holds the PlatformIO main component
+    # (pio_entry.c); ESP-IDF needs it in COMPONENTS to find the main target.
+    # PlatformIO's default component (__pio_env, generated for the generic sources) must be in COMPONENTS too,
+    # otherwise its build information is missing (see espidf.py: find_default_component).
+    list(PREPEND COMPONENTS main __pio_env)
+endif()
 SET_BUILD_NUMBER("${CMAKE_CURRENT_LIST_DIR}")
 
-if(NOT ESP_PLATFORM)
+if(NOT FIDO_ESP_IDF)
     set(SOURCES ${PICOKEYS_SOURCES})
 endif()
 
@@ -120,6 +159,11 @@ list(APPEND SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/src/fido/cbor_large_blobs.c
     ${CMAKE_CURRENT_LIST_DIR}/src/fido/management.c
     ${CMAKE_CURRENT_LIST_DIR}/src/fido/defs.c
+    ${CMAKE_CURRENT_LIST_DIR}/src/fido/fp_r558_sensor.c
+    ${CMAKE_CURRENT_LIST_DIR}/src/fido/fp_r558_uart.c
+    ${CMAKE_CURRENT_LIST_DIR}/src/fido/fp_r558.c
+    ${CMAKE_CURRENT_LIST_DIR}/src/fido/fp_led.c
+    ${CMAKE_CURRENT_LIST_DIR}/src/fido/fp_init.c
 )
 
 if(ENABLE_OATH_APP)
@@ -137,7 +181,7 @@ if(ENABLE_OTP_APP)
 endif()
 
 SET_VERSION(ver_major ver_minor "${CMAKE_CURRENT_LIST_DIR}/src/fido/version.h")
-if(ESP_PLATFORM)
+if(FIDO_ESP_IDF)
     project(pico_fido)
 endif()
 
@@ -145,7 +189,7 @@ set(INCLUDES ${INCLUDES}
     ${CMAKE_CURRENT_LIST_DIR}/src/fido
 )
 
-if(NOT ESP_PLATFORM)
+if(NOT FIDO_ESP_IDF)
     target_sources(pico_fido PUBLIC ${SOURCES})
     target_include_directories(pico_fido PUBLIC ${INCLUDES})
 

@@ -3,3 +3,12 @@ build*/
 legacy/
 .DS_Store
 
+
+# PlatformIO build output and generated ESP-IDF config
+.pio/
+/sdkconfig
+/sdkconfig.old
+
+# Secure boot signing keys must never be committed
+secure_boot_signing_key*
+*.pem

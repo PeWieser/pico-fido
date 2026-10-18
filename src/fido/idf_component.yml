@@ -1,0 +1,3 @@
+## IDF Component Manager Manifest File
+dependencies:
+  zorxx/neopixel: "1.0.10"

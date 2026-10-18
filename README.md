@@ -72,6 +72,10 @@ You can use whatever VID/PID for internal purposes, but remember that you are no
 
 Note that the [PicoKey App](https://www.picokeys.com/picokeyapp/ "PicoKey App") is the most recommended.
 
+## Build for ESP32-S3 with PlatformIO
+The ESP32-S3 build can also be compiled and flashed with PlatformIO (`pio run`, `pio run -t upload`).
+See [docs/platformio/README.md](docs/platformio/README.md). Run `git submodule update --init --recursive` first.
+
 ## Build for Raspberry Pico
 Before building, ensure you have installed the toolchain for the Pico and that the Pico SDK is properly located on your drive.
 

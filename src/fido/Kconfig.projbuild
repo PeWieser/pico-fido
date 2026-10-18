@@ -1,0 +1,12 @@
+menu "Pico FIDO - R558 fingerprint sensor"
+
+config PICO_FIDO_R558_REQUIRE_FLASH_ENCRYPTION
+    bool "Require ESP32 flash encryption before pairing or restoring the R558 sensor"
+    default y
+    help
+        The R558 password and address are stored in flash. Without flash encryption, anyone who can
+        read the flash can copy them and build a fake sensor (see docs/fingerprint/R558_PLAN.md, R1).
+        With this option on, pairing and restoring are refused until flash encryption is active.
+        Turn it off only for development boards that must not use flash encryption.
+
+endmenu

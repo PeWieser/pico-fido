@@ -1,0 +1,260 @@
+# PlatformIO build for the ESP32-S3 firmware (see platformio.ini and docs/platformio/README.md).
+# Builds the environments esp32s3 (production) and esp32s3_dev (development). The secure environment needs a
+# signing key and burns eFuses, so it is not built here.
+#
+# Results are reported in three places:
+#   - the job summary on the Actions run page,
+#   - a commit comment on the tested commit (status, first error lines, log tail), readable via the API,
+#   - on pushes to main: a GitHub release with the two firmware images (see docs/release/WEBAPP_FIRMWARE_PROMPT.md).
+# Full logs are uploaded as artifacts "platformio-log-<env>".
+name: "PlatformIO build (ESP32-S3)"
+
+on:
+  push:
+    branches: [ "arena/**", "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write          # commit comment with the result
+    strategy:
+      fail-fast: false
+      matrix:
+        env: [ esp32s3, esp32s3_dev ]
+
+    steps:
+      - name: Checkout repository and submodules
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install PlatformIO Core and esptool
+        id: install
+        shell: bash
+        run: |
+          set +e
+          pip install -U platformio "esptool>=4.7,<5" > install.log 2>&1
+          rc=$?
+          pio --version >> install.log 2>&1
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          cat install.log
+          exit 0
+
+      - name: Resolve configuration
+        id: config
+        shell: bash
+        run: |
+          set +e
+          pio project config > config.log 2>&1
+          rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          cat config.log
+          exit 0
+
+      - name: Build
+        id: build
+        shell: bash
+        run: |
+          set +e
+          pio run -e "${{ matrix.env }}" > build.log 2>&1
+          rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          tail -n 200 build.log
+          exit 0
+
+      - name: Merge into one flashable image
+        id: merge
+        if: steps.build.outputs.rc == '0'
+        shell: bash
+        run: |
+          set +e
+          BUILD_DIR=".pio/build/${{ matrix.env }}"
+          OUT_DIR="release"
+          mkdir -p "$OUT_DIR"
+          {
+            echo "build dir (top level):"; ls -la "$BUILD_DIR" | grep -E "\.bin|flash_args|\.elf$"
+            echo "flash_args:"; cat "$BUILD_DIR/flash_args"
+          } > merge.log 2>&1
+          # Offsets come from ESP-IDF's flash_args; see .github/scripts/merge_image.py for the file mapping.
+          python3 .github/scripts/merge_image.py "$BUILD_DIR" >> merge.log 2>&1
+          rc_map=$?
+          if [ "$rc_map" = "0" ]; then
+            ( cd "$BUILD_DIR" && python -m esptool --chip esp32s3 merge_bin -o "$GITHUB_WORKSPACE/$OUT_DIR/${{ matrix.env }}.bin" $(cat merge_args.txt) ) >> merge.log 2>&1
+            rc=$?
+          else
+            rc=$rc_map
+          fi
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          tail -n 40 merge.log
+          exit 0
+
+      - name: Job summary and report
+        id: report
+        if: always()
+        shell: bash
+        env:
+          ENV_NAME: ${{ matrix.env }}
+          CFG_RC: ${{ steps.config.outputs.rc }}
+          BUILD_RC: ${{ steps.build.outputs.rc }}
+          MERGE_RC: ${{ steps.merge.outputs.rc }}
+          PIO_INSTALL_RC: ${{ steps.install.outputs.rc }}
+        run: |
+          set +e
+          {
+            echo "# PlatformIO build \`${ENV_NAME}\`"
+            echo ""
+            echo "| Step | Exit code |"
+            echo "|---|---|"
+            echo "| Install PlatformIO | ${PIO_INSTALL_RC:-not run} |"
+            echo "| Resolve configuration | ${CFG_RC:-not run} |"
+            echo "| Build | ${BUILD_RC:-not run} |"
+            echo "| Merge image | ${MERGE_RC:-not run} |"
+            echo ""
+            if [ "${BUILD_RC}" = "0" ] && [ "${CFG_RC}" = "0" ] && [ "${MERGE_RC}" = "0" ]; then
+              echo "**Result: success.**"
+            else
+              echo "**Result: failed.**"
+            fi
+            echo ""
+            echo "## Key lines (error, failed, undefined, not found)"
+            echo '```'
+            for f in install.log config.log build.log merge.log; do
+              [ -f "$f" ] && grep -n -E -i "error|failed|undefined reference|no such file|traceback|exception|could not|not found|httpclient|invalid|unknown" "$f" | head -30
+            done
+            echo '```'
+            echo ""
+            echo "## Full configuration output (config.log, first 150 lines)"
+            echo '```'
+            [ -f config.log ] && head -n 150 config.log
+            echo '```'
+            echo ""
+            echo "## Build output (build.log, last 80 lines)"
+            echo '```'
+            [ -f build.log ] && tail -n 80 build.log
+            echo '```'
+            echo ""
+            echo "## Merge output (merge.log, last 60 lines)"
+            echo '```'
+            [ -f merge.log ] && tail -n 60 merge.log
+            echo '```'
+          } > report.md 2>/dev/null
+          wc -l report.md
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Post commit comment with the result
+        if: always() && github.event_name == 'push'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          gh api --method POST "repos/${REPO}/commits/${SHA}/comments" -F body=@report.md > /dev/null \
+            && echo "comment posted" || echo "could not post comment"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: platformio-log-${{ matrix.env }}
+          path: |
+            install.log
+            config.log
+            build.log
+            merge.log
+          if-no-files-found: ignore
+
+      - name: Upload merged image
+        if: steps.merge.outputs.rc == '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ matrix.env }}
+          path: release/${{ matrix.env }}.bin
+          if-no-files-found: error
+
+  release:
+    # Only a successful push to main publishes a release. Pull requests and other branches only build.
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write          # create the release and upload the images
+
+    steps:
+      - name: Checkout (for the version number)
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Download both images
+        uses: actions/download-artifact@v4
+        with:
+          pattern: firmware-*
+          path: images
+          merge-multiple: true
+
+      - name: Name the release files
+        id: names
+        shell: bash
+        run: |
+          set -e
+          RAW=$(grep -oE 'PICO_FIDO_VERSION 0x[0-9a-fA-F]+' src/fido/version.h | awk '{print $2}')
+          VER="$(( (RAW >> 8) & 255 )).$(( RAW & 255 ))"
+          SHORT="${GITHUB_SHA:0:7}"
+          TAG="fw-${VER}-build${GITHUB_RUN_NUMBER}"
+          mkdir -p out
+          cp images/esp32s3.bin      "out/pico-fido-esp32s3-${VER}-${SHORT}.bin"
+          cp images/esp32s3_dev.bin  "out/pico-fido-esp32s3-dev-${VER}-${SHORT}.bin"
+          ( cd out && sha256sum *.bin > SHA256SUMS.txt )
+          {
+            echo "tag=${TAG}"
+            echo "ver=${VER}"
+            echo "short=${SHORT}"
+          } >> "$GITHUB_OUTPUT"
+          ls -la out
+
+      - name: Create release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.names.outputs.tag }}
+          VER: ${{ steps.names.outputs.ver }}
+          SHORT: ${{ steps.names.outputs.short }}
+        run: |
+          cat > notes.md <<EOF
+          Pico FIDO firmware ${VER} for ESP32-S3 (commit ${GITHUB_SHA}).
+
+          Two images, pick the one that matches your device:
+
+          - \`pico-fido-esp32s3-${VER}-${SHORT}.bin\`: **Produktiv.** Requires flash encryption on the chip.
+            Pairing and restore are refused without it. Flash it only on boards that have flash encryption active.
+          - \`pico-fido-esp32s3-dev-${VER}-${SHORT}.bin\`: **Entwicklung.** No flash encryption required. The R558
+            sensor password is stored in plaintext in flash. Only for bench boards.
+
+          Both are complete images (bootloader, partition table, app). Flash them at offset 0x0.
+          Verify with \`SHA256SUMS.txt\`.
+
+          See docs/release/WEBAPP_FIRMWARE_PROMPT.md for which image is for what and how the webapp handles it.
+          EOF
+          gh release create "$TAG" \
+            out/pico-fido-esp32s3-${VER}-${SHORT}.bin \
+            out/pico-fido-esp32s3-dev-${VER}-${SHORT}.bin \
+            out/SHA256SUMS.txt \
+            --target "$GITHUB_SHA" \
+            --title "Pico FIDO ${VER} (build ${GITHUB_RUN_NUMBER})" \
+            --notes-file notes.md

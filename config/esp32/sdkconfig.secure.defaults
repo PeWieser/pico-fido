@@ -1,0 +1,22 @@
+# Secure boot and flash encryption for the ESP32-S3 (R1). Apply on top of the base defaults.
+#
+# WARNING: these settings burn eFuses. Flash encryption and secure boot cannot be turned off again.
+# Enable them only on the final device, after reading docs/platformio/README.md (section "Secure Boot
+# und Flash-Verschlüsselung"). Keep the signing key outside the repository.
+#
+# Development mode keeps the serial download mode available (re-flashing stays possible).
+# Release mode disables it; choose it only after a successful development run.
+
+# Partition table with the encrypted key storage partition.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="config/esp32/partitions_secure.csv"
+CONFIG_PARTITION_TABLE_FILENAME="config/esp32/partitions_secure.csv"
+
+# Flash encryption (ESP32-S3, development mode).
+CONFIG_SECURE_FLASH_ENC_ENABLED=y
+CONFIG_SECURE_FLASH_ENCRYPTION_MODE_DEVELOPMENT=y
+
+# Secure boot v2. The signing key is generated locally (see docs) and is not part of the repository.
+CONFIG_SECURE_BOOT=y
+CONFIG_SECURE_BOOT_V2_ENABLED=y
+CONFIG_SECURE_BOOT_SIGNING_KEY="secure_boot_signing_key.pem"

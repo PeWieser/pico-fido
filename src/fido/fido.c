@@ -476,6 +476,7 @@ int scan_files_fido(void) {
     }
     ef_pin = file_search_by_fid(EF_PIN, NULL, SPECIFY_EF);
     ef_pin_admin = file_search_by_fid(EF_PIN_ADMIN, NULL, SPECIFY_EF);
+    ef_fp_conf = file_search_by_fid(EF_FP_CONF, NULL, SPECIFY_EF);
     ef_authtoken = file_search_by_fid(EF_AUTHTOKEN, NULL, SPECIFY_EF);
     if (ef_authtoken) {
         if (!file_has_data(ef_authtoken)) {

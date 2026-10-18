@@ -22,6 +22,8 @@
 #include "fido.h"
 #include "ctap.h"
 #include "files.h"
+#include "fp_r558.h"
+#include "fp_led.h"
 #include "apdu.h"
 #include "credential.h"
 #include "mbedtls/sha256.h"
@@ -76,6 +78,7 @@ int cbor_make_credential(const uint8_t *data, size_t len) {
     size_t resp_size = 0;
     int curve = -1, alg = 0;
     uint8_t flags = 0;
+    bool fp_uv_requested = false, fp_uv_done = false;
 #ifndef ENABLE_EMULATION
     bool button_pressed = false;
 #endif
@@ -412,7 +415,11 @@ int cbor_make_credential(const uint8_t *data, size_t len) {
 
     if (options.present) {
         if (options.uv == ptrue) { //5.3
-            CBOR_ERROR(CTAP2_ERR_INVALID_OPTION);
+            /* Built-in UV (fingerprint) is only accepted when a sensor is paired and enrolled, and never together with a PIN token. */
+            if (pinUvAuthParam.present == true || !fp_uv_available()) {
+                CBOR_ERROR(CTAP2_ERR_INVALID_OPTION);
+            }
+            fp_uv_requested = true;
         }
         if (options.rk != NULL) {
             if (get_opts() & FIDO2_OPT_NORK) { //5.4
@@ -532,6 +539,14 @@ int cbor_make_credential(const uint8_t *data, size_t len) {
         CBOR_ERROR(CTAP2_ERR_INVALID_OPTION);
     }
 
+    if (fp_uv_requested) {
+        int fp_ret = fp_uv_ctap_status();
+        if (fp_ret != 0) {
+            CBOR_ERROR(fp_ret);
+        }
+        fp_uv_done = true;
+    }
+
     if (options.up == ptrue || options.up == NULL) { //14.1
         if (pinUvAuthParam.present == true) {
             if (getUserPresentFlagValue() == false) {
@@ -564,7 +579,7 @@ int cbor_make_credential(const uint8_t *data, size_t len) {
         key_seed_len = sizeof(cred_idr);
     }
 
-    if (getUserVerifiedFlagValue()) {
+    if (getUserVerifiedFlagValue() || fp_uv_done) {
         flags |= FIDO2_AUT_FLAG_UV;
     }
     size_t ext_len = 0;
@@ -853,7 +868,10 @@ int cbor_make_credential(const uint8_t *data, size_t len) {
     resp_size = cbor_encoder_get_buffer_size(&encoder, ctap_resp->init.data + 1);
 
     if (options.rk == ptrue) {
-        if (credential_store(cred_id, cred_id_len, rp_id_hash, cbor_buf, rs) != 0) {
+        fp_led_saving(true);
+        int store_ret = credential_store(cred_id, cred_id_len, rp_id_hash, cbor_buf, rs);
+        fp_led_saving(false);
+        if (store_ret != 0) {
             CBOR_ERROR(CTAP2_ERR_KEY_STORE_FULL);
         }
         dev_state_update(DEV_STATE_CRED_STATE);
