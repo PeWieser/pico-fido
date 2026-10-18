@@ -85,17 +85,21 @@ jobs:
           BUILD_DIR=".pio/build/${{ matrix.env }}"
           OUT_DIR="release"
           mkdir -p "$OUT_DIR"
-          # flash_args holds the flash offsets of bootloader, partition table and app written by ESP-IDF.
-          # Paths in it are relative to the build directory.
           {
-            echo "build dir:"; ls -la "$BUILD_DIR"
+            echo "build dir (top level):"; ls -la "$BUILD_DIR" | grep -E "\.bin|flash_args|\.elf$"
             echo "flash_args:"; cat "$BUILD_DIR/flash_args"
-            echo "esptool:"; python -m esptool version
-            cd "$BUILD_DIR" && python -m esptool --chip esp32s3 merge_bin -o "$GITHUB_WORKSPACE/$OUT_DIR/${{ matrix.env }}.bin" @flash_args
           } > merge.log 2>&1
-          rc=$?
+          # Offsets come from ESP-IDF's flash_args; see .github/scripts/merge_image.py for the file mapping.
+          python3 .github/scripts/merge_image.py "$BUILD_DIR" >> merge.log 2>&1
+          rc_map=$?
+          if [ "$rc_map" = "0" ]; then
+            ( cd "$BUILD_DIR" && python -m esptool --chip esp32s3 merge_bin -o "$GITHUB_WORKSPACE/$OUT_DIR/${{ matrix.env }}.bin" $(cat merge_args.txt) ) >> merge.log 2>&1
+            rc=$?
+          else
+            rc=$rc_map
+          fi
           echo "rc=$rc" >> "$GITHUB_OUTPUT"
-          cat merge.log
+          tail -n 40 merge.log
           exit 0
 
       - name: Job summary and report
