@@ -28,7 +28,7 @@ jobs:
           sudo apt-get install -y cmake ninja-build python3-venv
           python3 -m venv /tmp/venv
           /tmp/venv/bin/pip install --upgrade pip
-          /tmp/venv/bin/pip install fido2==2.2.1 cbor2 cryptography pycvc pytest inputimeout
+          /tmp/venv/bin/pip install fido2==2.2.1 cryptography pycvc pytest inputimeout
       - name: Build Linux emulator with R558 support
         run: |
           cmake -S . -B /tmp/emu_build -DENABLE_EMULATION=1 -DENABLE_R558_FINGERPRINT=1
@@ -40,7 +40,7 @@ jobs:
           cp -R tests/docker/fido2/* "$SITE_PKGS/fido2/hid/"
           ./tests/fingerprint/run_r558_sensor_test.sh
           PICO_FIDO_EMU_BUILD=/tmp/emu_build ./tests/fingerprint/run_r558_engine_test.sh
-          /tmp/venv/bin/python3 ./tests/fingerprint/run_full_stack_ctap_test.py /tmp/emu_build/pico_fido
+          /tmp/venv/bin/python3 ./tests/fingerprint/verify_full_stack_ctap.py /tmp/emu_build/pico_fido
 
   build:
     name: Full Docker FIDO2 / CCID / OATH / OTP conformance

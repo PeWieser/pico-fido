@@ -31,7 +31,6 @@ import time
 
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives import hashes
-import cbor2
 from fido2 import cbor
 from fido2.ctap import CtapError
 from fido2.ctap2 import Ctap2, ClientPin, CredentialManagement
@@ -206,14 +205,14 @@ def send_vendor_fp(ctap: Ctap2, subcmd: int, pin_token: bytes | None = None, par
     raw_params = b""
     if param is not None:
         inner = {1: param}
-        raw_params = cbor2.dumps(inner)
+        raw_params = cbor.encode(inner)
         req[2] = inner
     if pin_token is not None:
         msg = b"\xff" * 32 + bytes([0x0D, subcmd]) + raw_params
         auth = hmac.new(pin_token, msg, hashlib.sha256).digest()
         req[3] = 2
         req[4] = auth
-    raw = ctap.device.call(0x41, bytes([0x09]) + cbor2.dumps(req))
+    raw = ctap.device.call(0x41, bytes([0x09]) + cbor.encode(req))
     if not raw:
         raise CtapError(0x01)
     if raw[0] != 0x00:

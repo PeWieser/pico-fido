@@ -130,7 +130,7 @@ static void fp_chain_set_color(uint8_t color, uint32_t led_brightness, float pro
 
     if (prev_led_driver != NULL && prev_led_driver->set_color != NULL) {
         if (override_active) {
-            prev_led_driver->set_color(ov_color, led_brightness > 0 ? led_brightness : MAX_LED_BRIGHTNESS, ov_progress);
+            prev_led_driver->set_color(ov_color, led_brightness > 0 ? led_brightness : MAX_BTNESS, ov_progress);
         }
         else {
             prev_led_driver->set_color(color, led_brightness, progress);

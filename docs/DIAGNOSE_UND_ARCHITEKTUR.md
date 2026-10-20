@@ -90,7 +90,7 @@ Dabei zeigten sich **zwei katastrophale Showstopper beim Booten/Linken** (die ex
 - **Fix:** `0x3B` (`RegModel` Merge-Fehler zweier unpassender Finger-Scans -> `UV_INVALID` statt generischem `PROCESSING`-Fehler), `0x15`/`0x33` (erneutes Abtasten im Timeout-Fenster), verzögertes Nachladen von `ef_fp_conf` via `file_search_by_fid()` nach dem Booten sowie sauberes CTAPHID-Keepalive (`STATUS_UPNEEDED`) und Abbruch per Browser-„Abbrechen“ (`CTAPHID_CANCEL` -> `cancel_button`) eingebaut.
 
 ### Ursache 12 (GitHub Actions Workflows & Linux-Emulations-Build)
-- **Fix:** `CMakeLists.txt` fällt ohne `libtss2` sauber auf `otp_emulation.c` zurück; `.github/workflows/platformio.yml` prüft bei jedem Push `firmware.elf`, `partitions.bin` **und bootet das fertige ESP32-S3-Image live in QEMU (`esp32s3`)**; `.github/workflows/test.yml` führt alle Docker-FIDO2-Tests **und** den kompletten R558-Kaltstart-Systemtest (`tests/fingerprint/run_full_stack_ctap_test.py`) aus; `.github/workflows/nightly.yml` schlägt ohne Signatur-Secret im Fork nicht mehr fehl.
+- **Fix:** `CMakeLists.txt` fällt ohne `libtss2` sauber auf `otp_emulation.c` zurück; `.github/workflows/platformio.yml` prüft bei jedem Push `firmware.elf`, `partitions.bin` **und bootet das fertige ESP32-S3-Image live in QEMU (`esp32s3`)**; `.github/workflows/test.yml` führt alle Docker-FIDO2-Tests **und** den kompletten R558-Kaltstart-Systemtest (`tests/fingerprint/verify_full_stack_ctap.py`) aus; `.github/workflows/nightly.yml` schlägt ohne Signatur-Secret im Fork nicht mehr fehl.
 
 ---
 

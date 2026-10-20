@@ -1,0 +1,2 @@
+# Extra ESP-IDF stack headroom for app_main() (runs low_flash_init + picokey_init + fp_init)
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
