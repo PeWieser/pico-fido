@@ -435,11 +435,7 @@ bool fp_uv_available(void) {
 void fp_get_status(fp_status_t *st) {
     memset(st, 0, sizeof(*st));
     st->supported = FP_FEATURE_ON;
-#if defined(ESP_PLATFORM)
-    st->flash_encrypted = flash_requirement_met();
-#else
     st->flash_encrypted = flash_encryption_active();
-#endif
     if (!FP_FEATURE_ON) {
         return;
     }

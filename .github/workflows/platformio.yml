@@ -19,6 +19,9 @@ on:
 permissions:
   contents: read
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -311,20 +314,18 @@ jobs:
           SHORT: ${{ steps.names.outputs.short }}
         run: |
           cat > notes.md <<EOF
-          Pico FIDO firmware ${VER} for ESP32-S3 (commit ${GITHUB_SHA}).
+          Pico FIDO Firmware **${VER}** für ESP32-S3 + GROW R558-S (Commit \`${GITHUB_SHA}\`).
 
-          Two images, pick the one that matches your device:
+          Zwei vollständige 4-MB-Flash-Images (Bootloader + Partitionstabelle \`part0\` + App, Flashen ab Adresse **\`0x0\`**, SPI-Modus \`DIO\`):
 
-          - \`pico-fido-esp32s3-${VER}-${SHORT}.bin\`: **Produktiv.** Requires flash encryption on the chip.
-            Pairing and restore are refused without it. Flash it only on boards that have flash encryption active.
-          - \`pico-fido-esp32s3-dev-${VER}-${SHORT}.bin\`: **Entwicklung.** No flash encryption required. The R558
-            sensor password is stored in plaintext in flash. Only for bench boards.
+          - \`pico-fido-esp32s3-dev-${VER}-${SHORT}.bin\` — **Entwicklung (\`buildType = "dev"\`):** Für Standard-Entwicklungsboards / ESP32-S3 Super Mini **ohne** gebrannte Flash-Verschlüsselungs-eFuses. Pairing & Restore sind direkt in der Webapp freigeschaltet.
+          - \`pico-fido-esp32s3-${VER}-${SHORT}.bin\` — **Produktiv (\`buildType = "prod"\`):** Erfordert aktive Hardware-Flash-Verschlüsselung am Chip (\`flashEncrypted = true\`). Ohne aktive eFuse-Verschlüsselung lehnt die Firmware Pairing & Restore ab.
 
-          Both are complete images (bootloader, partition table, app). Flash them at offset 0x0.
-          Verify with \`SHA256SUMS.txt\`.
-
-          See docs/release/WEBAPP_FIRMWARE_PROMPT.md for which image is for what and how the webapp handles it.
+          Prüfsummen stehen in \`SHA256SUMS.txt\`.
+          Verdrahtung & WebApp-Dokumentation: \`docs/DIAGNOSE_UND_ARCHITEKTUR.md\`, \`docs/fingerprint/WEBAPP_PROMPT.md\`, \`docs/release/WEBAPP_FIRMWARE_PROMPT.md\`.
           EOF
+          sed -i 's/^          //' notes.md
+          gh release view "$TAG" >/dev/null 2>&1 && gh release delete "$TAG" -y --cleanup-tag || true
           gh release create "$TAG" \
             out/pico-fido-esp32s3-${VER}-${SHORT}.bin \
             out/pico-fido-esp32s3-dev-${VER}-${SHORT}.bin \

@@ -46,23 +46,29 @@ Die Versionsnummer steht im Tag und im Dateinamen. `<Commit>` sind die ersten 7 
    verständliche Meldung und Link zur Releases-Seite.
 2. **Image wählen.** Zwei Karten mit Name, Version, Commit und dem Satz aus der Tabelle „Welches Image wofür“.
    Standard ist „Produktiv“. Die Entwicklungsvariante hat einen deutlichen Warnhinweis und muss ausdrücklich gewählt werden.
-3. **Gerät prüfen, bevor etwas heruntergeladen wird.** Ist ein Gerät verbunden, `status` lesen:
+3. **Gerät prüfen, bevor etwas heruntergeladen wird.** Ist ein Gerät verbunden, `status` lesen (`7: flashEncrypted`, `8: buildType` = `"prod"` | `"dev"`):
+   - Aktuell aktiven Build-Typ (`8: buildType`, falls vorhanden) und Verschlüsselungsstatus (`7: flashEncrypted`) klar am verbundenen Gerät anzeigen.
    - `7: flashEncrypted = false` und „Produktiv“ gewählt: Hinweis „Auf diesem Gerät ist die Flash-Verschlüsselung nicht
      aktiv. Mit dem Produktiv-Image bleibt das Pairing gesperrt. Entweder die Verschlüsselung aktivieren
-     (Einrichtungsassistent, Schritt 2a) oder das Entwicklungs-Image wählen.“
+     (Einrichtungsassistent, Schritt 2a) oder das Entwicklungs-Image (`dev`) wählen.“
    - `7: flashEncrypted = true` und „Entwicklung“ gewählt: Warnung „Auf diesem Gerät ist die Flash-Verschlüsselung
-     aktiv. Ein Entwicklungs-Image setzt die Verschlüsselung nicht zurück, es passt aber nicht zu dieser Einrichtung.
-     Bitte das Produktiv-Image wählen.“
-   - Kein Gerät verbunden: Die Auswahl ist erlaubt, es gibt nur den Hinweis, das Gerät vor dem Aufspielen zu prüfen.
-4. **Download und Prüfsumme.** Das Image herunterladen. `SHA256SUMS.txt` herunterladen und den SHA-256-Wert mit
-   WebCrypto (`crypto.subtle.digest`) prüfen. Stimmt er nicht: Abbruch, Datei verwerfen, Meldung
-   „Die Prüfsumme stimmt nicht. Die Datei nicht verwenden.“
-5. **Aufspielen (WebSerial).** Nur möglich, wenn `7: flashEncrypted = false` ist.
+     aktiv. Bitte das Produktiv-Image wählen; ein unverschlüsseltes Schreiben per WebSerial ist gesperrt.“
+   - Kein Gerät verbunden (z. B. fabrikneuer ESP32-S3 im Bootloader-Modus): Die Auswahl ist erlaubt! Für ein noch
+     unverschlüsseltes Board im Bootloader-Modus ohne bestehendes FIDO-Gerät darf WebSerial direkt an `0x0` flashen
+     (mit ausdrücklicher Bestätigung, dass keine Hardware-Flash-Verschlüsselungs-eFuses gebrannt sind).
+4. **Download und Prüfsumme (WICHTIG: GitHub-CORS beachten!).**
+   - **CORS-Regel im Browser:** **Nicht** `fetch(asset.browser_download_url)` aufrufen (`https://github.com/.../releases/download/...` hat im Browser keinen CORS-Header und schlägt mit NetworkError fehl!), sondern die Asset-API-URL aus dem Release-JSON verwenden:
+     `fetch(asset.url, { headers: { Accept: "application/octet-stream" } })` (`https://api.github.com/repos/PeWieser/pico-fido/releases/assets/<id>`).
+   - Zusätzlich immer einen **lokalen Datei-Upload (`<input type="file" accept=".bin">`)** anbieten (mit Link zur GitHub-Releases-Seite), damit der Nutzer ein heruntergeladenes `.bin` auch offline oder bei API-Rate-Limit direkt einspielen kann.
+   - `SHA256SUMS.txt` ebenfalls über `asset.url` mit `Accept: application/octet-stream` laden und den SHA-256-Wert mit WebCrypto (`crypto.subtle.digest("SHA-256", bytes)`) prüfen. Stimmt er nicht: Abbruch, Datei verwerfen, Meldung „Die Prüfsumme stimmt nicht. Die Datei nicht verwenden.“
+5. **Aufspielen (WebSerial).** Nur möglich, wenn kein verbundenes FIDO-Gerät `7: flashEncrypted = true` meldet.
    - Der Nutzer bestätigt in einem Dialog: „Das Gerät wird mit der Firmware <Version> überschrieben. Der Vorgang
      löscht den Flash-Inhalt, auch gekoppelte Sensordaten. Vorher ein Backup erstellen.“ Ein Backup-Button steht
      im Dialog bereit.
-   - Die Übertragung läuft über WebSerial mit einer ESP-Flash-Bibliothek (z. B. `esptool-js` oder esp-web-tools,
-     keine eigene Implementierung). Adresse `0x0`, das vollständige Image.
+   - **Wichtig beim WebHID-Handover:** Falls das Gerät aktuell per WebHID geöffnet ist, Verbindung sauber schließen
+     (`device.close()`), bevor WebSerial öffnet, und klaren Hinweis zeigen, wie das Board in den ESP32-S3-ROM-Download-Modus
+     gebracht wird (**BOOT gedrückt halten → kurz RESET drücken → BOOT loslassen**).
+   - Die Übertragung läuft über WebSerial mit `esptool-js` (`ESPLoader`, Baudrate `460800`, `flashMode: "dio"`, `flashFreq: "80m"`, `flashSize: "4MB"`, `eraseAll: false` bzw. optionaler Checkbox „Kompletten Flash löschen (`eraseFlash`) — empfohlen beim Wechsel von alter/fremder Firmware“). Geschrieben wird das vollständige Image ab Adresse **`0x0`**.
    - Fortschrittsanzeige. Bei Abbruch oder Fehler: Meldung, dass das Gerät danach eventuell neu geflasht werden muss.
    - Nach dem Schreiben: Gerät neu verbinden, `status` lesen und `version` anzeigen.
    - Hinweis für den Bootloader-Modus: Ist das Gerät nicht im Flash-Modus, sagt die Webapp, wie der Nutzer ihn
@@ -87,12 +93,11 @@ Die Webapp muss das technisch erzwingen, nicht nur per Hinweis:
 
 Das Lesen von `status` ist der Schutz, den die Webapp bietet. Sie passt Schreibknopf und Anleitung an den gelesenen Zustand an.
 
-## Was die Webapp nicht kann
+## Was die Webapp beachten muss
 
-- Sie erkennt nicht sicher, welches Image auf dem Gerät läuft. Das Gerät meldet nur `flashEncrypted`, nicht den Build-Typ.
-  Die Webapp darf deshalb nicht behaupten „Gerät läuft mit Entwicklungs-Image“.
-  Offener Punkt: ein Feld `8: buildType` (`"prod"` / `"dev"`) in `status` würde das ermöglichen. Das ist nicht
-  implementiert.
+- `status` liefert jetzt **sowohl** `7: flashEncrypted` (`bool`, echter Hardware-eFuse-Status) **als auch** `8: buildType` (`"prod"` oder `"dev"`):
+  - `buildType === "dev"` erlaubt Pairing & Restore auch bei `flashEncrypted === false` (für Testboards), während `flashEncrypted === false` gleichzeitig signalisiert, dass WebSerial-Updates weiterhin gefahrlos unverschlüsselt möglich sind.
+  - `flashEncrypted === true` sperrt WebSerial-Klartext-Updates strikt technisch.
 - Sie signiert nichts und prüft keine Secure-Boot-Signatur. Secure Boot gehört zur Produktiv-Einrichtung mit eigenem
   Schlüssel und ist nicht Teil der Releases.
 - Sie kann Geräte mit aktiver Flash-Verschlüsselung nicht per WebSerial aktualisieren. Das bleibt der Weg über die Doku.

@@ -272,7 +272,7 @@ def main() -> int:
 
         print("2. Pairing GROW R558-S & checking built-in RGB ring LED (0x3C) ...", flush=True)
         st = send_vendor_fp(ctap, 1)
-        assert st[1] is False and st[6] is True
+        assert st[1] is False and st[6] is True and st[7] is False and st[8] == "dev"
         sensor.led_history.clear()
         tok = cp.get_pin_token("246810", permissions=ClientPin.PERMISSION.AUTHENTICATOR_CFG)
         pair_res = send_vendor_fp(ctap, 2, pin_token=tok)

@@ -344,8 +344,9 @@ static int cbor_vendor_generic(uint8_t cmd, const uint8_t *data, size_t len) {
          * Subcommands (key 1). 0x01 is read-only. The others need a PIN token with the
          * authenticatorConfig permission and a user presence check.
          *   0x01 status            -> {1: paired, 2: locked, 3: capacity, 4: [enrolled slots], 5: failed attempts,
-         *                              6: supported (R558 feature built in), 7: flash encrypted}
-         *   0x02 pair              -> {1: capacity}          (PIN token, needs flash encryption, R1)
+         *                              6: supported (R558 feature built in), 7: flash encrypted,
+         *                              8: build type ("prod" | "dev")}
+         *   0x02 pair              -> {1: capacity}          (PIN token, needs flash encryption in "prod", R1)
          *   0x03 enroll            -> {1: slot}
          *   0x04 delete            -> key 2 param {1: slot as 2 bytes BE, 0xFFFF = all}, or no param = all
          *   0x05 unlock            -> {}
@@ -356,7 +357,7 @@ static int cbor_vendor_generic(uint8_t cmd, const uint8_t *data, size_t len) {
         if (vendorCmd == 0x01) {
             fp_status_t st;
             fp_get_status(&st);
-            CBOR_CHECK(cbor_encoder_create_map(&encoder, &mapEncoder, 7));
+            CBOR_CHECK(cbor_encoder_create_map(&encoder, &mapEncoder, 8));
             CBOR_CHECK(cbor_encode_uint(&mapEncoder, 0x01));
             CBOR_CHECK(cbor_encode_boolean(&mapEncoder, st.paired));
             CBOR_CHECK(cbor_encode_uint(&mapEncoder, 0x02));
@@ -377,6 +378,8 @@ static int cbor_vendor_generic(uint8_t cmd, const uint8_t *data, size_t len) {
             CBOR_CHECK(cbor_encode_boolean(&mapEncoder, st.supported));
             CBOR_CHECK(cbor_encode_uint(&mapEncoder, 0x07));
             CBOR_CHECK(cbor_encode_boolean(&mapEncoder, st.flash_encrypted));
+            CBOR_CHECK(cbor_encode_uint(&mapEncoder, 0x08));
+            CBOR_CHECK(cbor_encode_text_stringz(&mapEncoder, FP_REQUIRE_FLASH_ENCRYPTION ? "prod" : "dev"));
         }
         else if (vendorCmd >= 0x02 && vendorCmd <= 0x07) {
             int auth_ret = fp_pin_auth((uint8_t)pinUvAuthProtocol, &pinUvAuthParam, raw_vendor_params, raw_vendor_params_len, vendorCmd);
