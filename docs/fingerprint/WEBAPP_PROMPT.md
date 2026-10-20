@@ -99,9 +99,8 @@ Die PIN selbst: nur für den Token-Schritt verwenden, nicht speichern, nicht in 
    „Du legst den Finger zweimal auf den Sensor. Dazwischen hebst du ihn ab.“ Dann einen Button „Anlernen starten“.
    Nach dem Klick: PIN → Token → `enroll`. Während die Anfrage läuft:
    - Hinweis „Finger jetzt auflegen“, dann nach etwa 3 Sekunden „Finger abheben und warten“, dann „Finger erneut auflegen“.
-     Die Anfrage liefert **keine** Zwischenstände. Die Texte sind nur eine Zeitschätzung.
-     Der Ring am Gerät atmet blau (leichtes bis starkes Blau) während des Anlernens. Er ist die einzige
-     Rückmeldung am Gerät. Es gibt keinen Taster.
+     Die Anfrage liefert **keine** Zwischenstände (sendet aber laufend CTAPHID-Keepalives `0x02` und lässt sich per CTAPHID-Cancel sauber abbrechen). Die Texte sind eine Zeitschätzung.
+     Der **integrierte RGB-Leuchtring des GROW R558-S** (angesteuert per UART `PS_ControlBLN`, `0x3C`, sowie parallel ein optionaler WS2812-Ring an `GPIO4` und die Onboard-LED) atmet während des Wartens blau, blinkt nach Scan 1 kurz grün und nach erfolgreichem Speichern 2× grün (bzw. bei Fehler rot). Es gibt keinen Taster.
    - Ergebnis: Erfolg → Slot anzeigen und Liste aktualisieren. Fehler → Fehlermeldung aus der Tabelle unten,
      Button „Erneut versuchen“.
 5. **Liste der Slots.** Aus `status` (Schlüssel 4). Pro Slot „Löschen“ (PIN, Bestätigungsdialog).

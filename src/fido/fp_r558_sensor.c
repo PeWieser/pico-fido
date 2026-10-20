@@ -331,3 +331,16 @@ fp_sensor_status_t fp_sensor_template_num(const fp_transport_t *t, const fp_sess
     *count = get_u16_be(buf + 1);
     return FP_SENSOR_OK;
 }
+
+/* PS_ControlBLN (0x3C): controls the R558-S built-in RGB ring LED over UART. */
+fp_sensor_status_t fp_sensor_control_led(const fp_transport_t *t, uint32_t addr,
+                                         uint8_t func, uint8_t start_color, uint8_t end_color,
+                                         uint8_t cycles, uint8_t *code) {
+    uint8_t p[4] = { func, start_color, end_color, cycles };
+    uint8_t c = 0xFF;
+    fp_sensor_status_t st = fp_sensor_txn(t, addr, FP_INS_CONTROL_BLN, p, sizeof(p), NULL, 0, NULL, &c, 150, false);
+    if (code != NULL) {
+        *code = c;
+    }
+    return st;
+}

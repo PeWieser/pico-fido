@@ -426,6 +426,10 @@ static int cbor_vendor_generic(uint8_t cmd, const uint8_t *data, size_t len) {
                 mbedtls_platform_zeroize(fp_blob, sizeof(fp_blob));
                 CBOR_ERROR(fp_result_to_ctap(fres));
             }
+            if (vendorCmd == 0x02 || vendorCmd == 0x03 || vendorCmd == 0x05 || vendorCmd == 0x07) {
+                /* PIN token authentication succeeded: ensure session_pin is sealed for cold-boot UV. */
+                fp_pinwrap_seal();
+            }
             if (vendorCmd == 0x02) {
                 CBOR_CHECK(cbor_encoder_create_map(&encoder, &mapEncoder, 1));
                 CBOR_CHECK(cbor_encode_uint(&mapEncoder, 0x01));

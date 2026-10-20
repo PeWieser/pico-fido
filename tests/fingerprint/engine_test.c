@@ -29,6 +29,12 @@ static uint32_t ef_len = 0;
 static file_t ef_dummy;
 file_t *ef_fp_conf = &ef_dummy;
 
+file_t *file_search_by_fid(const uint16_t fid, const file_t *parent, const uint8_t sp) {
+    (void)parent;
+    (void)sp;
+    return fid == EF_FP_CONF ? &ef_dummy : NULL;
+}
+
 bool file_has_data(const file_t *f) { (void)f; return ef_len > 0; }
 uint8_t *file_get_data(const file_t *f) { (void)f; return ef_buf; }
 uint32_t file_get_size(const file_t *f) { (void)f; return ef_len; }
@@ -62,6 +68,8 @@ typedef struct {
     int fail_set_addr;
     int present;            /* 0 = nothing answers on the bus */
     int calls_genimg;
+    uint8_t last_led_func, last_led_start, last_led_end, last_led_cycles;
+    int poor_template_on_reg;
 } module_t;
 
 static module_t mod_a, mod_b;
@@ -141,7 +149,16 @@ static void module_command(module_t *m, const uint8_t *cmd, size_t n) {
             m->buf[p[0]] = m->last_finger;
             reply(m, addr, 0x00, NULL, 0, out, &ol); break;
         case FP_INS_REG_MODEL:
-            reply(m, addr, m->buf[1] == m->buf[2] ? 0x00 : 0x0A, NULL, 0, out, &ol); break;
+            if (m->poor_template_on_reg) { reply(m, addr, FP_CONF_POOR_TEMPLATE, NULL, 0, out, &ol); }
+            else { reply(m, addr, m->buf[1] == m->buf[2] ? 0x00 : 0x0A, NULL, 0, out, &ol); }
+            break;
+        case FP_INS_CONTROL_BLN:
+            m->last_led_func = p[0];
+            m->last_led_start = p[1];
+            m->last_led_end = p[2];
+            m->last_led_cycles = p[3];
+            reply(m, addr, 0x00, NULL, 0, out, &ol);
+            break;
         case FP_INS_STORE: {
             uint16_t page = (uint16_t)((p[1] << 8) | p[2]);
             m->templ[page] = m->buf[p[0]]; m->used[page] = 1;
@@ -405,6 +422,30 @@ int main(void) {
     /* Status reports flash encryption. Host builds have none. */
     fp_get_status(&st);
     CHECK(!st.flash_encrypted, "host build: flash encryption not active");
+
+    /* 14. Boot-order regression: ef_fp_conf is NULL before scan_files_fido(), lazy lookup resolves EF_FP_CONF. */
+    reset_all();
+    CHECK(fp_pair(&cap) == FP_OK, "boot-order test: pair");
+    CHECK(mod_a.last_led_func == FP_LED_FUNC_FLASH && mod_a.last_led_start == FP_LED_COLOR_GREEN,
+          "R558-S built-in RGB ring flashes green on successful pairing");
+    sched_set(3, 7, -1, 7);
+    CHECK(fp_enroll(&slot) == FP_OK, "boot-order test: enroll");
+    ef_fp_conf = NULL;  /* simulate reboot before scan_files_fido() runs */
+    fp_init();
+    fp_get_status(&st);
+    CHECK(st.paired && st.enrolled == 1, "lazy EF_FP_CONF lookup preserves pairing & templates across reboot");
+
+    /* 15. R558-S RegModel 0x3B (poor template / merge failure) maps cleanly to FP_ERR_NO_MATCH (not sensor error). */
+    mod_a.poor_template_on_reg = 1;
+    sched_set(3, 8, -1, 9);
+    CHECK(fp_enroll(&slot) == FP_ERR_NO_MATCH, "R558-S RegModel 0x3B returns FP_ERR_NO_MATCH (UV_INVALID)");
+    mod_a.poor_template_on_reg = 0;
+
+    /* 16. CTAPHID_CANCEL aborts scan wait cleanly with FP_ERR_CANCELLED (CTAP2_ERR_KEEPALIVE_CANCEL). */
+    extern volatile bool cancel_button;
+    cancel_button = true;
+    CHECK(fp_verify(500) == FP_ERR_CANCELLED, "CTAPHID_CANCEL aborts fp_verify immediately");
+    cancel_button = false;
 
     if (failures) {
         printf("%d FAILURE(S)\n", failures);

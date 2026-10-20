@@ -4,4 +4,5 @@
 idf_component_register(
     SRCS "pio_entry.c"
     INCLUDE_DIRS "."
+    REQUIRES fido pico-keys-sdk
 )

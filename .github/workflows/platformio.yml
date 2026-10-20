@@ -102,25 +102,33 @@ jobs:
           tail -n 40 merge.log
           exit 0
 
-      - name: Inspect ELF, partitions and boot in QEMU ESP32-S3
+      - name: Verify ELF symbols, partitions & boot in QEMU ESP32-S3
         id: qemu
         if: steps.merge.outputs.rc == '0'
         shell: bash
         run: |
           set +e
           BUILD_DIR=".pio/build/${{ matrix.env }}"
+          verify_rc=0
           {
             echo "=== SDKCONFIG KEYS ==="
-            grep -E "CONFIG_PARTITION_TABLE|CONFIG_ESPTOOLPY_FLASH|CONFIG_TINYUSB|CONFIG_PICO_FIDO|CONFIG_ESP_MAIN_TASK_STACK|CONFIG_FREERTOS_HZ" sdkconfig.* "$BUILD_DIR/config/sdkconfig.h" 2>/dev/null | head -n 60
+            grep -E "CONFIG_PARTITION_TABLE|CONFIG_ESPTOOLPY_FLASH|CONFIG_PICO_FIDO|CONFIG_ESP_MAIN_TASK_STACK|CONFIG_FREERTOS_HZ" sdkconfig.* "$BUILD_DIR/config/sdkconfig.h" 2>/dev/null | head -n 60
             echo "=== PARTITION TABLE ==="
             python3 ~/.platformio/packages/framework-espidf/components/partition_table/gen_esp32part.py "$BUILD_DIR/partitions.bin"
             echo "=== ELF SYMBOLS ==="
             ADDR2LINE=$(find ~/.platformio/packages -name "xtensa-esp32s3-elf-addr2line" | head -n 1)
             NM=$(find ~/.platformio/packages -name "xtensa-esp32s3-elf-nm" | head -n 1)
-            "$NM" "$BUILD_DIR/firmware.elf" | grep -E " (app_main|picokey_init|fp_init|fp_led_init|led_init|usb_init|tinyusb_driver_install)$"
+            SYMS=$("$NM" "$BUILD_DIR/firmware.elf" | grep -E " (app_main|picokey_init|fp_init|fp_led_init|fido_process_apdu|cbor_vendor|led_init|usb_init|tinyusb_driver_install)$")
+            echo "$SYMS"
+            for sym in picokey_init fp_init fp_led_init fido_process_apdu cbor_vendor; do
+              if ! echo "$SYMS" | grep -qE " T ${sym}$"; then
+                echo "FATAL: required strong symbol 'T ${sym}' missing from firmware.elf!"
+                verify_rc=1
+              fi
+            done
             echo "=== INSTALL & RUN ESPRESSIF QEMU (ESP32-S3) ==="
-            QEMU_TAR="esp-qemu-xtensa-softmmu-develop_9.0.0_20240606-x86_64-linux-gnu.tar.xz"
-            curl -fsSL "https://github.com/espressif/qemu/releases/download/esp-develop-9.0.0-20240606/$QEMU_TAR" -o /tmp/qemu.tar.xz
+            QEMU_URL="https://github.com/espressif/qemu/releases/download/esp-develop-9.2.2-20260417/qemu-xtensa-softmmu-esp_develop_9.2.2_20260417-x86_64-linux-gnu.tar.xz"
+            curl -fsSL "$QEMU_URL" -o /tmp/qemu.tar.xz
             mkdir -p /tmp/qemu && tar -xf /tmp/qemu.tar.xz -C /tmp/qemu
             QEMU_BIN=$(find /tmp/qemu -name "qemu-system-xtensa" | head -n 1)
             cp "release/${{ matrix.env }}.bin" /tmp/flash4m.bin
@@ -131,12 +139,21 @@ jobs:
             timeout 8s "$QEMU_BIN" -nographic -machine esp32s3 -drive file=/tmp/flash4m.bin,if=mtd,format=raw > /tmp/qemu_boot.log 2>&1
             echo "=== QEMU SERIAL OUTPUT ==="
             cat /tmp/qemu_boot.log | head -n 120
-            echo "=== DECODED BACKTRACE ==="
+            if grep -qE "invalid header: 0xffffffff|Guru Meditation Error|Stack canary watchpoint" /tmp/qemu_boot.log; then
+              echo "FATAL: ESP32-S3 boot panic / invalid flash layout detected in QEMU!"
+              verify_rc=1
+            fi
+            if ! grep -q "R558:" /tmp/qemu_boot.log; then
+              echo "FATAL: R558 initialization line never reached on ESP32-S3 boot!"
+              verify_rc=1
+            fi
+            echo "=== DECODED BACKTRACE (if any) ==="
             BT=$(grep -oE "0x4[0-9a-fA-F]{7}" /tmp/qemu_boot.log | tr '\n' ' ')
             if [ -n "$BT" ]; then
               "$ADDR2LINE" -pfiaC -e "$BUILD_DIR/firmware.elf" $BT
             fi
           } > qemu.log 2>&1
+          echo "rc=$verify_rc" >> "$GITHUB_OUTPUT"
           cat qemu.log
           exit 0
 
@@ -149,6 +166,7 @@ jobs:
           CFG_RC: ${{ steps.config.outputs.rc }}
           BUILD_RC: ${{ steps.build.outputs.rc }}
           MERGE_RC: ${{ steps.merge.outputs.rc }}
+          VERIFY_RC: ${{ steps.qemu.outputs.rc }}
           PIO_INSTALL_RC: ${{ steps.install.outputs.rc }}
         run: |
           set +e
@@ -161,8 +179,9 @@ jobs:
             echo "| Resolve configuration | ${CFG_RC:-not run} |"
             echo "| Build | ${BUILD_RC:-not run} |"
             echo "| Merge image | ${MERGE_RC:-not run} |"
+            echo "| ELF + Partitions + QEMU ESP32-S3 Boot | ${VERIFY_RC:-not run} |"
             echo ""
-            if [ "${BUILD_RC}" = "0" ] && [ "${CFG_RC}" = "0" ] && [ "${MERGE_RC}" = "0" ]; then
+            if [ "${BUILD_RC}" = "0" ] && [ "${CFG_RC}" = "0" ] && [ "${MERGE_RC}" = "0" ] && [ "${VERIFY_RC}" = "0" ]; then
               echo "**Result: success.**"
             else
               echo "**Result: failed.**"
@@ -228,6 +247,17 @@ jobs:
           name: firmware-${{ matrix.env }}
           path: release/${{ matrix.env }}.bin
           if-no-files-found: error
+
+      - name: Enforce build, merge & QEMU boot verification
+        if: always()
+        shell: bash
+        env:
+          CFG_RC: ${{ steps.config.outputs.rc }}
+          BUILD_RC: ${{ steps.build.outputs.rc }}
+          MERGE_RC: ${{ steps.merge.outputs.rc }}
+          VERIFY_RC: ${{ steps.qemu.outputs.rc }}
+        run: |
+          test "${CFG_RC}" = "0" && test "${BUILD_RC}" = "0" && test "${MERGE_RC}" = "0" && test "${VERIFY_RC}" = "0"
 
   release:
     # Only a successful push to main publishes a release. Pull requests and other branches only build.

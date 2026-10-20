@@ -168,6 +168,9 @@ extern uint8_t session_pin[32];
 extern bool keydev_unlocked;
 extern uint8_t certdev_sha256[32];
 
+extern void fp_pinwrap_seal(void);
+extern int fp_uv_authenticate(void);
+
 typedef enum {
     DEV_STATE_DEV_ID = 0x1,
     DEV_STATE_CRED_STATE = 0x2,

@@ -56,6 +56,26 @@
 #define FP_INS_SET_PWD          0x12
 #define FP_INS_VFY_PWD          0x13
 #define FP_INS_SET_CHIP_ADDR    0x15
+#define FP_INS_CONTROL_BLN      0x3C
+
+/* R558-S built-in RGB ring LED modes (PS_ControlBLN, datasheet p. 27-29). */
+#define FP_LED_FUNC_BREATHE     0x01
+#define FP_LED_FUNC_FLASH       0x02
+#define FP_LED_FUNC_ON          0x03
+#define FP_LED_FUNC_OFF         0x04
+#define FP_LED_FUNC_FADE_ON     0x05
+#define FP_LED_FUNC_FADE_OFF    0x06
+#define FP_LED_FUNC_RAINBOW     0x07
+
+/* R558-S built-in RGB ring LED colour bitmask (bit0=Blue, bit1=Green, bit2=Red). */
+#define FP_LED_COLOR_OFF        0x00
+#define FP_LED_COLOR_BLUE       0x01
+#define FP_LED_COLOR_GREEN      0x02
+#define FP_LED_COLOR_CYAN       0x03
+#define FP_LED_COLOR_RED        0x04
+#define FP_LED_COLOR_PURPLE     0x05
+#define FP_LED_COLOR_YELLOW     0x06
+#define FP_LED_COLOR_WHITE      0x07
 
 /* Confirmation codes. */
 #define FP_CONF_OK              0x00
@@ -66,11 +86,13 @@
 #define FP_CONF_IMG_FEW_POINTS  0x07
 #define FP_CONF_NO_MATCH        0x08  /* 1:1 match failed */
 #define FP_CONF_NOT_FOUND       0x09  /* search: no template found */
-#define FP_CONF_COMBINE_FAIL    0x0A  /* the two scans do not belong to the same finger */
+#define FP_CONF_COMBINE_FAIL    0x0A  /* classic ZFM merge failure */
 #define FP_CONF_PAGE_RANGE      0x0B
 #define FP_CONF_NO_IMAGE_BUF    0x15
 #define FP_CONF_FLASH_ERR       0x18
 #define FP_CONF_WRONG_PWD       0x13
+#define FP_CONF_SMALL_AREA      0x33  /* R558-S: small image area on capacitive pad */
+#define FP_CONF_POOR_TEMPLATE   0x3B  /* R558-S: poor template quality / merge failure (RegModel 0x05) */
 
 #define FP_BUF_1                0x01
 #define FP_BUF_2                0x02
@@ -142,5 +164,8 @@ fp_sensor_status_t fp_sensor_store(const fp_transport_t *t, const fp_session_t *
 fp_sensor_status_t fp_sensor_delete_chars(const fp_transport_t *t, const fp_session_t *s, uint16_t page_id, uint16_t count, uint8_t *code);
 fp_sensor_status_t fp_sensor_empty(const fp_transport_t *t, const fp_session_t *s, uint8_t *code);
 fp_sensor_status_t fp_sensor_template_num(const fp_transport_t *t, const fp_session_t *s, uint16_t *count, uint8_t *code);
+fp_sensor_status_t fp_sensor_control_led(const fp_transport_t *t, uint32_t addr,
+                                         uint8_t func, uint8_t start_color, uint8_t end_color,
+                                         uint8_t cycles, uint8_t *code);
 
 #endif /* FP_R558_SENSOR_H_ */

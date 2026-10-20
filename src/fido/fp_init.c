@@ -17,6 +17,7 @@
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
 
+#include <stdbool.h>
 #include "picokeys.h"
 #include "fp_led.h"
 #include "fp_r558.h"
@@ -27,3 +28,16 @@ int picokey_init(void) {
     fp_init();
     return 0;
 }
+
+/*
+ * Ensures USB CTAP sends CTAPHID_KEEPALIVE(STATUS_UPNEEDED = 0x02) every 250 ms
+ * while waiting for user finger interaction on the R558-S sensor, without touching
+ * the pico-keys-sdk submodule.
+ */
+#if defined(ESP_PLATFORM) || defined(__linux__)
+extern bool __real_is_req_button_pending(void);
+bool __wrap_is_req_button_pending(void);
+bool __wrap_is_req_button_pending(void) {
+    return __real_is_req_button_pending() || fp_is_waiting_finger();
+}
+#endif
