@@ -1,2 +1,6 @@
+# Use DIO SPI flash mode so both Winbond and GigaDevice/Zbit 4MB ESP32-S3 Super Mini chips
+# initialize cleanly in __esp_system_init_fn_init_flash() instead of aborting on QIO QIE bit.
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+
 # Extra ESP-IDF stack headroom for app_main() (runs low_flash_init + picokey_init + fp_init)
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
