@@ -130,6 +130,13 @@ endif()
 SET_BUILD_NUMBER("${CMAKE_CURRENT_LIST_DIR}")
 
 if(NOT FIDO_ESP_IDF)
+    if(ENABLE_EMULATION AND UNIX AND NOT APPLE AND (NOT TSS2_ESYS_LIB OR NOT TSS2_TCTILDR_LIB))
+        list(REMOVE_ITEM PICOKEYS_SOURCES ${CMAKE_CURRENT_LIST_DIR}/pico-keys-sdk/src/otp/otp_linux.c)
+        list(APPEND PICOKEYS_SOURCES ${CMAKE_CURRENT_LIST_DIR}/pico-keys-sdk/src/otp/otp_emulation.c)
+        if(TARGET picokeys_sdk)
+            set_target_properties(picokeys_sdk PROPERTIES INTERFACE_SOURCES "${PICOKEYS_SOURCES}")
+        endif()
+    endif()
     set(SOURCES ${PICOKEYS_SOURCES})
 endif()
 
@@ -197,6 +204,9 @@ if(NOT FIDO_ESP_IDF)
         -Wall
     )
     target_compile_options(pico_fido PRIVATE ${COMMON_COMPILE_OPTIONS})
+    if(UNIX AND NOT APPLE)
+        target_link_options(pico_fido PRIVATE "-Wl,--wrap=is_req_button_pending")
+    endif()
 
     picokeys_apply_strict_flags(
         SOURCES ${SOURCES}

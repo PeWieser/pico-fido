@@ -47,6 +47,7 @@
 #define EF_OTP_SLOT4    0xBB03
 #define EF_OTP_PIN      0x10A0 // Nitrokey OTP PIN
 #define EF_FP_CONF      0x1104 // R558 fingerprint sensor pairing and template state
+#define EF_FP_PINWRAP   0x1105 // AEAD-wrapped session_pin bound to hardware KDF + paired sensor secret
 
 extern file_t *ef_keydev;
 extern file_t *ef_certdev;

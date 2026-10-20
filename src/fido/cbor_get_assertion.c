@@ -369,7 +369,7 @@ int cbor_get_assertion(const uint8_t *data, size_t len, bool next) {
         }
 
         if (uv && pinUvAuthParam.present == false) { // built-in UV: the fingerprint also counts as user presence
-            int fp_ret = fp_uv_ctap_status();
+            int fp_ret = fp_uv_authenticate();
             if (fp_ret != 0) {
                 CBOR_ERROR(fp_ret);
             }

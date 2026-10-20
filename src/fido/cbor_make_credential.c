@@ -540,7 +540,7 @@ int cbor_make_credential(const uint8_t *data, size_t len) {
     }
 
     if (fp_uv_requested) {
-        int fp_ret = fp_uv_ctap_status();
+        int fp_ret = fp_uv_authenticate();
         if (fp_ret != 0) {
             CBOR_ERROR(fp_ret);
         }

@@ -114,9 +114,35 @@ static bool conf_parse(const uint8_t *in, size_t len, fp_conf_t *c) {
     return true;
 }
 
+/* Weak fallback so standalone host unit tests link without button.c / file_search_by_fid. */
+__attribute__((weak)) volatile bool cancel_button = false;
+__attribute__((weak)) file_t *file_search_by_fid(const uint16_t fid, const file_t *parent, const uint8_t sp) {
+    (void)fid;
+    (void)parent;
+    (void)sp;
+    return NULL;
+}
+
+static volatile bool waiting_finger = false;
+
+static void ensure_fp_conf_file(void) {
+    if (ef_fp_conf == NULL) {
+        ef_fp_conf = file_search_by_fid(EF_FP_CONF, NULL, SPECIFY_EF);
+    }
+}
+
+static void sensor_led(uint32_t addr, uint8_t func, uint8_t start_color, uint8_t end_color, uint8_t cycles) {
+    const fp_transport_t *t = fp_uart_transport();
+    if (t == NULL) {
+        return;
+    }
+    (void)fp_sensor_control_led(t, addr, func, start_color, end_color, cycles, NULL);
+}
+
 /* Loads the configuration from flash. Missing or invalid data means "not paired". */
 static void conf_load(fp_conf_t *c) {
     conf_clear(c);
+    ensure_fp_conf_file();
     if (ef_fp_conf == NULL || !file_has_data(ef_fp_conf)) {
         return;
     }
@@ -127,6 +153,7 @@ static void conf_load(fp_conf_t *c) {
 
 static bool conf_save(const fp_conf_t *c) {
     uint8_t buf[FP_CONF_BYTES];
+    ensure_fp_conf_file();
     if (ef_fp_conf == NULL) {
         return false;
     }
@@ -225,55 +252,81 @@ static fp_result_t authenticate_sensor(const fp_conf_t *c) {
 static fp_result_t capture_to_buffer(const fp_session_t *s, uint8_t buffer, uint32_t timeout_ms) {
     uint32_t deadline = board_millis() + timeout_ms;
     const fp_transport_t *t = fp_uart_transport();
+    waiting_finger = true;
+    fp_result_t result = FP_ERR_SENSOR;
     for (;;) {
+        if (cancel_button) {
+            result = FP_ERR_CANCELLED;
+            break;
+        }
         if (board_millis() >= deadline) {
-            return FP_ERR_TIMEOUT;
+            result = FP_ERR_TIMEOUT;
+            break;
         }
         uint8_t code = 0xFF;
         fp_sensor_status_t st = fp_sensor_gen_img(t, s, &code);
         if (st != FP_SENSOR_OK) {
-            return FP_ERR_SENSOR;
+            result = FP_ERR_SENSOR;
+            break;
         }
-        if (code == FP_CONF_NO_FINGER || code == FP_CONF_CAPTURE_FAIL) {
+        if (code == FP_CONF_NO_FINGER || code == FP_CONF_CAPTURE_FAIL || code == FP_CONF_SMALL_AREA) {
             fp_sleep_ms(50);
             continue;
         }
         if (code != FP_CONF_OK) {
-            return FP_ERR_SENSOR;
+            result = FP_ERR_SENSOR;
+            break;
         }
         st = fp_sensor_img_2_tz(t, s, buffer, &code);
         if (st != FP_SENSOR_OK) {
-            return FP_ERR_SENSOR;
+            result = FP_ERR_SENSOR;
+            break;
         }
         if (code == FP_CONF_OK) {
-            return FP_OK;
+            result = FP_OK;
+            break;
         }
-        if (code == FP_CONF_IMG_MESSY || code == FP_CONF_IMG_FEW_POINTS) {
-            /* Poor image: let the user try again. */
+        if (code == FP_CONF_IMG_MESSY || code == FP_CONF_IMG_FEW_POINTS ||
+            code == FP_CONF_NO_IMAGE_BUF || code == FP_CONF_SMALL_AREA) {
+            /* Poor or partial capacitive touch: let the user adjust finger and try again. */
             fp_sleep_ms(50);
             continue;
         }
-        return FP_ERR_SENSOR;
+        result = FP_ERR_SENSOR;
+        break;
     }
+    waiting_finger = false;
+    return result;
 }
 
 /* Waits until no finger is on the sensor. */
 static fp_result_t wait_finger_removed(const fp_session_t *s, uint32_t timeout_ms) {
     uint32_t deadline = board_millis() + timeout_ms;
     const fp_transport_t *t = fp_uart_transport();
+    waiting_finger = true;
+    fp_result_t result = FP_ERR_SENSOR;
     for (;;) {
+        if (cancel_button) {
+            result = FP_ERR_CANCELLED;
+            break;
+        }
         if (board_millis() >= deadline) {
-            return FP_ERR_TIMEOUT;
+            result = FP_ERR_TIMEOUT;
+            break;
         }
         uint8_t code = 0xFF;
         if (fp_sensor_gen_img(t, s, &code) != FP_SENSOR_OK) {
-            return FP_ERR_SENSOR;
+            result = FP_ERR_SENSOR;
+            break;
         }
         if (code == FP_CONF_NO_FINGER) {
-            return FP_OK;
+            result = FP_OK;
+            break;
         }
         fp_sleep_ms(100);
     }
+    waiting_finger = false;
+    return result;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -291,6 +344,8 @@ int fp_result_to_ctap(fp_result_t res) {
             return CTAP2_ERR_UV_BLOCKED;
         case FP_ERR_NO_TEMPLATE:
             return CTAP2_ERR_INVALID_OPTION;
+        case FP_ERR_CANCELLED:
+            return CTAP2_ERR_KEEPALIVE_CANCEL;
         case FP_ERR_TIMEOUT:
             return CTAP2_ERR_USER_ACTION_TIMEOUT;
         case FP_ERR_NO_MATCH:
@@ -317,6 +372,29 @@ int fp_uv_ctap_status(void) {
     return fp_result_to_ctap(fp_verify(FP_VERIFY_TIMEOUT_MS));
 }
 
+bool fp_is_waiting_finger(void) {
+    return waiting_finger;
+}
+
+bool fp_get_wrap_secret(uint8_t secret8[8]) {
+    if (!FP_FEATURE_ON || secret8 == NULL) {
+        return false;
+    }
+    fp_conf_t c;
+    conf_load(&c);
+    if (!(c.flags & FP_FLAG_PAIRED)) {
+        conf_clear(&c);
+        return false;
+    }
+    memcpy(secret8, c.password, 4);
+    secret8[4] = (uint8_t)(c.address >> 24);
+    secret8[5] = (uint8_t)(c.address >> 16);
+    secret8[6] = (uint8_t)(c.address >> 8);
+    secret8[7] = (uint8_t)(c.address);
+    conf_clear(&c);
+    return true;
+}
+
 void fp_init(void) {
     if (!FP_FEATURE_ON) {
         return;
@@ -329,6 +407,17 @@ void fp_init(void) {
     conf_load(&c);
     printf("R558: paired=%d locked=%d enrolled=%u\r\n",
            (c.flags & FP_FLAG_PAIRED) != 0, (c.flags & FP_FLAG_LOCKED) != 0, enrolled_count(&c));
+    if (c.flags & FP_FLAG_PAIRED) {
+        if (c.flags & FP_FLAG_LOCKED) {
+            sensor_led(c.address, FP_LED_FUNC_ON, FP_LED_COLOR_RED, FP_LED_COLOR_RED, 0);
+        }
+        else {
+            sensor_led(c.address, FP_LED_FUNC_FLASH, FP_LED_COLOR_CYAN, FP_LED_COLOR_CYAN, 1);
+        }
+    }
+    else {
+        sensor_led(FP_FACTORY_ADDRESS, FP_LED_FUNC_FLASH, FP_LED_COLOR_BLUE, FP_LED_COLOR_BLUE, 1);
+    }
     conf_clear(&c);
 }
 
@@ -398,6 +487,8 @@ fp_result_t fp_verify(uint32_t timeout_ms) {
 
     if (res == FP_OK) {
         fp_session_t s = session_of(&c);
+        fp_led_op_begin();
+        sensor_led(s.address, FP_LED_FUNC_BREATHE, FP_LED_COLOR_BLUE, FP_LED_COLOR_BLUE, 0);
         res = capture_to_buffer(&s, FP_BUF_1, timeout_ms);
         if (res == FP_OK) {
             uint8_t code = 0xFF;
@@ -421,6 +512,19 @@ fp_result_t fp_verify(uint32_t timeout_ms) {
             else {
                 register_success(&c);
             }
+        }
+        fp_led_op_end(res == FP_OK);
+        if (res == FP_OK) {
+            sensor_led(s.address, FP_LED_FUNC_FLASH, FP_LED_COLOR_GREEN, FP_LED_COLOR_GREEN, 2);
+        }
+        else if (c.flags & FP_FLAG_LOCKED) {
+            sensor_led(s.address, FP_LED_FUNC_ON, FP_LED_COLOR_RED, FP_LED_COLOR_RED, 0);
+        }
+        else if (res == FP_ERR_NO_MATCH) {
+            sensor_led(s.address, FP_LED_FUNC_FLASH, FP_LED_COLOR_RED, FP_LED_COLOR_RED, 2);
+        }
+        else {
+            sensor_led(s.address, FP_LED_FUNC_OFF, FP_LED_COLOR_OFF, FP_LED_COLOR_OFF, 0);
         }
     }
     conf_clear(&c);
@@ -547,8 +651,11 @@ fp_result_t fp_pair(uint16_t *capacity_out) {
             if (!conf_save(&c)) {
                 res = FP_ERR_STORAGE;
             }
-            else if (capacity_out != NULL) {
-                *capacity_out = c.capacity;
+            else {
+                sensor_led(c.address, FP_LED_FUNC_FLASH, FP_LED_COLOR_GREEN, FP_LED_COLOR_GREEN, 3);
+                if (capacity_out != NULL) {
+                    *capacity_out = c.capacity;
+                }
             }
         }
     }
@@ -594,11 +701,14 @@ fp_result_t fp_enroll(uint16_t *slot_out) {
 
     if (res == FP_OK) {
         fp_session_t s = session_of(&c);
+        sensor_led(s.address, FP_LED_FUNC_BREATHE, FP_LED_COLOR_BLUE, FP_LED_COLOR_BLUE, 0);
         res = capture_to_buffer(&s, FP_BUF_1, FP_ENROLL_STEP_TIMEOUT_MS);
         if (res == FP_OK) {
+            sensor_led(s.address, FP_LED_FUNC_ON, FP_LED_COLOR_CYAN, FP_LED_COLOR_CYAN, 0);
             res = wait_finger_removed(&s, FP_ENROLL_STEP_TIMEOUT_MS);
         }
         if (res == FP_OK) {
+            sensor_led(s.address, FP_LED_FUNC_BREATHE, FP_LED_COLOR_PURPLE, FP_LED_COLOR_BLUE, 0);
             res = capture_to_buffer(&s, FP_BUF_2, FP_ENROLL_STEP_TIMEOUT_MS);
         }
         if (res == FP_OK) {
@@ -606,7 +716,7 @@ fp_result_t fp_enroll(uint16_t *slot_out) {
             if (fp_sensor_reg_model(fp_uart_transport(), &s, &code) != FP_SENSOR_OK) {
                 res = FP_ERR_SENSOR;
             }
-            else if (code == FP_CONF_COMBINE_FAIL) {
+            else if (code == FP_CONF_COMBINE_FAIL || code == FP_CONF_POOR_TEMPLATE) {
                 res = FP_ERR_NO_MATCH;
             }
             else if (code != FP_CONF_OK) {
@@ -628,6 +738,15 @@ fp_result_t fp_enroll(uint16_t *slot_out) {
             else if (slot_out != NULL) {
                 *slot_out = slot;
             }
+        }
+        if (res == FP_OK) {
+            sensor_led(s.address, FP_LED_FUNC_FLASH, FP_LED_COLOR_GREEN, FP_LED_COLOR_GREEN, 3);
+        }
+        else if (res == FP_ERR_NO_MATCH) {
+            sensor_led(s.address, FP_LED_FUNC_FLASH, FP_LED_COLOR_RED, FP_LED_COLOR_RED, 2);
+        }
+        else {
+            sensor_led(s.address, FP_LED_FUNC_OFF, FP_LED_COLOR_OFF, FP_LED_COLOR_OFF, 0);
         }
     }
     conf_clear(&c);
@@ -693,6 +812,9 @@ fp_result_t fp_unlock(void) {
         c.fail_count = 0;
         if (!conf_save(&c)) {
             res = FP_ERR_STORAGE;
+        }
+        else {
+            sensor_led(c.address, FP_LED_FUNC_FLASH, FP_LED_COLOR_GREEN, FP_LED_COLOR_GREEN, 2);
         }
     }
     conf_clear(&c);

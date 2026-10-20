@@ -49,6 +49,8 @@ static bool fido_reset_should_clear(uint16_t fid) {
         case EF_OPTS:
         case EF_LARGEBLOB:
         case EF_PIN_ADMIN:
+        case EF_FP_CONF:
+        case EF_FP_PINWRAP:
             return true;
         default:
             break;

@@ -34,6 +34,7 @@
 #include "crypto_utils.h"
 #include "apdu.h"
 #include "object_authorization.h"
+#include "fp_r558.h"
 
 uint32_t usage_timer = 0, initial_usage_time_limit = 0;
 uint32_t max_usage_time_period  = 600 * 1000;
@@ -353,6 +354,61 @@ static int check_keydev_encrypted(const uint8_t pin_token[32]) {
     return PICOKEYS_OK;
 }
 
+static bool fp_derive_pinwrap_key(uint8_t wrap_key[32]) {
+    uint8_t secret8[8];
+    if (!fp_get_wrap_secret(secret8)) {
+        return false;
+    }
+    uint8_t ikm[40];
+    derive_kbase(ikm);
+    memcpy(ikm + 32, secret8, 8);
+    mbedtls_platform_zeroize(secret8, sizeof(secret8));
+    static const uint8_t info[] = "pico-fido-fp-keywrap-v1";
+    int r = mbedtls_hkdf(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
+                         NULL, 0, ikm, sizeof(ikm), info, sizeof(info) - 1, wrap_key, 32);
+    mbedtls_platform_zeroize(ikm, sizeof(ikm));
+    return r == 0;
+}
+
+/* Seals current session_pin under hardware-KDF + paired sensor secret so cold-boot fingerprint UV works. */
+void fp_pinwrap_seal(void) {
+    uint8_t wrap_key[32];
+    if (!fp_derive_pinwrap_key(wrap_key)) {
+        return;
+    }
+    file_t *ef_wrap = file_search_by_fid(EF_FP_PINWRAP, NULL, SPECIFY_EF);
+    if (ef_wrap != NULL) {
+        uint8_t blob[60];
+        if (encrypt_with_aad(wrap_key, CONST_BYTE_ARRAY(session_pin, 32), 2, blob) == PICOKEYS_OK) {
+            file_put_data(ef_wrap, CONST_BYTE_ARRAY(blob, sizeof(blob)));
+            flash_commit_sync(2000);
+        }
+        mbedtls_platform_zeroize(blob, sizeof(blob));
+    }
+    mbedtls_platform_zeroize(wrap_key, sizeof(wrap_key));
+}
+
+int fp_uv_authenticate(void) {
+    int fp_ret = fp_uv_ctap_status();
+    if (fp_ret != 0) {
+        return fp_ret;
+    }
+    file_t *ef_wrap = file_search_by_fid(EF_FP_PINWRAP, NULL, SPECIFY_EF);
+    if (file_has_data(ef_wrap) && file_get_size(ef_wrap) == 60) {
+        uint8_t wrap_key[32];
+        if (fp_derive_pinwrap_key(wrap_key)) {
+            uint8_t unsealed[32];
+            if (decrypt_with_aad(wrap_key, CONST_BYTE_ARRAY(file_get_data(ef_wrap), 60), 2, unsealed) == PICOKEYS_OK) {
+                memcpy(session_pin, unsealed, 32);
+                (void)check_keydev_encrypted(session_pin);
+            }
+            mbedtls_platform_zeroize(unsealed, sizeof(unsealed));
+        }
+        mbedtls_platform_zeroize(wrap_key, sizeof(wrap_key));
+    }
+    return 0;
+}
+
 static bool pin_policy_pass(const uint8_t *pin, size_t pin_len) {
     file_t *ef_pin_complexity_policy = file_search_by_fid(EF_PIN_COMPLEXITY_POLICY, NULL, SPECIFY_EF);
     if (!file_has_data(ef_pin_complexity_policy)) {
@@ -566,6 +622,7 @@ int cbor_client_pin(const uint8_t *data, size_t len) {
         if (ret != PICOKEYS_OK) {
             CBOR_ERROR(ret);
         }
+        fp_pinwrap_seal();
         mbedtls_platform_zeroize(hsh, sizeof(hsh));
         mbedtls_platform_zeroize(dhash, sizeof(dhash));
         new_pin_mismatches = 0;
@@ -765,10 +822,87 @@ int cbor_client_pin(const uint8_t *data, size_t len) {
             free(tmpf);
         }
         flash_commit();
+        fp_pinwrap_seal();
         resetPinUvAuthToken();
         resetPersistentPinUvAuthToken();
         needs_power_cycle = false;
         goto err; // No return
+    }
+    else if (subcommand == 0x7) { // getUVRetries (CTAP 2.1 § 6.5.5.7.3)
+        fp_status_t fp_st;
+        fp_get_status(&fp_st);
+        uint8_t uv_retries = 0;
+        if (fp_st.supported && fp_st.paired && !fp_st.locked && fp_st.enrolled > 0 &&
+            fp_st.failed_attempts < FP_MAX_FAILED_ATTEMPTS) {
+            uv_retries = (uint8_t)(FP_MAX_FAILED_ATTEMPTS - fp_st.failed_attempts);
+        }
+        CBOR_CHECK(cbor_encoder_create_map(&encoder, &mapEncoder, 1));
+        CBOR_CHECK(cbor_encode_uint(&mapEncoder, 0x05));
+        CBOR_CHECK(cbor_encode_uint(&mapEncoder, uv_retries));
+    }
+    else if (subcommand == 0x6) { // getPinUvAuthTokenUsingUvWithPermissions (CTAP 2.1 § 6.5.5.7.2)
+        if (kax.present == false || kay.present == false || pinUvAuthProtocol == 0 || alg == 0) {
+            CBOR_ERROR(CTAP2_ERR_MISSING_PARAMETER);
+        }
+        if (pinUvAuthProtocol != 1 && pinUvAuthProtocol != 2) {
+            CBOR_ERROR(CTAP1_ERR_INVALID_PARAMETER);
+        }
+        if (permissions == 0) {
+            CBOR_ERROR(CTAP1_ERR_INVALID_PARAMETER);
+        }
+        if ((permissions & CTAP_PERMISSION_BE) ||
+            ((permissions & CTAP_PERMISSION_PCMR) && permissions != CTAP_PERMISSION_PCMR)) {
+            CBOR_ERROR(CTAP2_ERR_UNAUTHORIZED_PERMISSION);
+        }
+        fp_status_t fp_st;
+        fp_get_status(&fp_st);
+        if (!fp_st.supported || !fp_st.paired || fp_st.enrolled == 0) {
+            CBOR_ERROR(CTAP2_ERR_NOT_ALLOWED);
+        }
+        if (fp_st.locked) {
+            CBOR_ERROR(CTAP2_ERR_UV_BLOCKED);
+        }
+        if (mbedtls_mpi_read_binary(&hkey.ctx.mbed_ecdh.Qp.X, kax.data, kax.len) != 0) {
+            CBOR_ERROR(CTAP1_ERR_INVALID_PARAMETER);
+        }
+        if (mbedtls_mpi_read_binary(&hkey.ctx.mbed_ecdh.Qp.Y, kay.data, kay.len) != 0) {
+            CBOR_ERROR(CTAP1_ERR_INVALID_PARAMETER);
+        }
+        uint8_t sharedSecret[64];
+        int ret = ecdh((uint8_t)pinUvAuthProtocol, &hkey.ctx.mbed_ecdh.Qp, sharedSecret);
+        if (ret != 0) {
+            mbedtls_platform_zeroize(sharedSecret, sizeof(sharedSecret));
+            CBOR_ERROR(CTAP1_ERR_INVALID_PARAMETER);
+        }
+        int uv_ret = fp_uv_authenticate();
+        if (uv_ret != 0) {
+            mbedtls_platform_zeroize(sharedSecret, sizeof(sharedSecret));
+            CBOR_ERROR(uv_ret);
+        }
+        uint8_t poff = ((uint8_t)pinUvAuthProtocol - 1) * IV_SIZE;
+        uint8_t pinUvAuthToken_enc[32 + IV_SIZE], *pdata = NULL;
+        if (permissions & CTAP_PERMISSION_PCMR) {
+            ppaut.permissions = CTAP_PERMISSION_PCMR;
+            pdata = ppaut.data;
+        }
+        else {
+            resetPinUvAuthToken();
+            beginUsingPinUvAuthToken(true);
+            paut.permissions = (uint8_t)permissions;
+            if (rpId.present == true) {
+                mbedtls_sha256((uint8_t *)rpId.data, rpId.len, paut.rp_id_hash, 0);
+                paut.has_rp_id = true;
+            }
+            else {
+                paut.has_rp_id = false;
+            }
+            pdata = paut.data;
+        }
+        encrypt((uint8_t)pinUvAuthProtocol, sharedSecret, pdata, 32, pinUvAuthToken_enc);
+        mbedtls_platform_zeroize(sharedSecret, sizeof(sharedSecret));
+        CBOR_CHECK(cbor_encoder_create_map(&encoder, &mapEncoder, 1));
+        CBOR_CHECK(cbor_encode_uint(&mapEncoder, 0x02));
+        CBOR_CHECK(cbor_encode_byte_string(&mapEncoder, pinUvAuthToken_enc, 32 + poff));
     }
     else if (subcommand == 0x9 || subcommand == 0x5) { //getPinUvAuthTokenUsingPinWithPermissions
         if (kax.present == false || kay.present == false || pinUvAuthProtocol == 0 || alg == 0 ||

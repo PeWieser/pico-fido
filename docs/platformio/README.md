@@ -14,70 +14,99 @@ PlatformIO mit dem ESP-IDF-Framework und nutzt dieselbe CMake-Konfiguration wie 
 ```bash
 git clone https://github.com/PeWieser/pico-fido.git
 cd pico-fido
-git checkout arena/c392330f-pico-fido     # oder main, sobald der Branch gemergt ist
 git submodule update --init --recursive
 ```
 
 Die Submodule sind nötig. Ohne `pico-keys-sdk` bricht der Build ab.
 
-## 3. Bauen
+## 3. Bauen (Wichtig: Profil wählen!)
+
+Für **normale Entwicklungsboards ohne gebrannte Flash-Verschlüsselungs-eFuses** (Standardfall!) **unbedingt** das Entwicklungsprofil `esp32s3_dev` verwenden:
 
 ```bash
-pio run
+pio run -e esp32s3_dev
 ```
 
+| Umgebung (`-e ...`) | Partitionstabelle | `factory`-Offset | Schlüsselspeicher (`part0`) | Einsatz |
+|---|---|---|---|---|
+| `esp32s3_dev` | `pico-keys-sdk/config/esp32/partitions.csv` | `0x20000` | `0x200000` (2 MB, unverschlüsselt) | **Standard für Test-/Bench-Hardware ohne Flash-Encryption-eFuses** |
+| `esp32s3` | `pico-keys-sdk/config/esp32/partitions.csv` | `0x20000` | `0x200000` (2 MB) | Produktivprofil (erfordert aktive Hardware-Flash-Verschlüsselung) |
+| `esp32s3_secure` | `config/esp32/partitions_secure.csv` | `0x30000` | `0x200000` (`encrypted`-Flag) | Secure Boot v2 + Flash Encryption (brennt eFuses!) |
+
 Die erste Ausführung lädt ESP-IDF, die Toolchain und die verwalteten Komponenten herunter. Das dauert einige Minuten.
-Das Ergebnis liegt unter `.pio/build/esp32s3/`.
+Das Ergebnis liegt unter `.pio/build/esp32s3_dev/`.
 
 Die Versionen sind in `platformio.ini` festgelegt:
 
 | Eintrag | Wert | Grund |
 |---|---|---|
 | `platform` | `espressif32@6.12.0` | liefert ESP-IDF 5.5.x |
-| `framework-espidf` | (von der Plattform) `~3.50500.0` | ESP-IDF 5.5.0; kein eigener Pin, da `~3.50501.0` in der Registry fehlt |
+| `framework-espidf` | (von der Plattform) `~3.50500.0` | ESP-IDF 5.5.0 |
 | `board` | `esp32-s3-devkitc-1` | generischer ESP32-S3 |
 | `board_upload.flash_size` | `4MB` | passend zu `sdkconfig.defaults` und `partitions.csv` |
+| `board_build.flash_mode` | `dio` | stabiler Boot auf QSPI- und Octal-ESP32-S3-Modulen |
+| `board_build.partitions` | `pico-keys-sdk/config/esp32/partitions.csv` | `factory @ 0x20000` + `part0 @ 0x200000` |
 
 
-## 4. In den Bootloader wechseln
+## 4. Richtigen USB-Port nutzen & in den Bootloader wechseln
 
-Das Super Mini nutzt den nativen USB-Anschluss des ESP32-S3. Dieser Anschluss ist später der FIDO-Token. Zum Flashen
-muss der Chip in den Download-Modus:
+**Wichtiger Hinweis zu ESP32-S3-DevKits mit 2 USB-C-Buchsen:**
+- Der FIDO2-/Pico-Key-USB-Stack (TinyUSB HID + CCID/WebUSB) läuft **ausschließlich** über den **nativen USB-OTG-Port** des ESP32-S3 (**`GPIO19` = `D-`, `GPIO20` = `D+`**, auf DevKits beschriftet mit **`USB`** bzw. **`OTG`**).
+- Die zweite Buchse (**`UART`** / **`COM`**, angebunden an einen CH343 / CP2102 USB-Seriell-Chip) kann **niemals** als FIDO-Key am PC erscheinen!
+- Bei einem **ESP32-S3 Super Mini** (nur 1 USB-C-Buchse) liegt diese direkt auf `GPIO19`/`GPIO20` — dort unbedingt ein **echtes USB-Datenkabel** (kein reines Ladekabel) verwenden.
 
-1. Taste **BOOT** gedrückt halten.
-2. Kurz **RESET** drücken (oder das USB-Kabel bei gedrückter BOOT-Taste einstecken).
-3. BOOT loslassen.
+Zum erstmaligen Flashen den Chip in den Download-Modus versetzen:
+
+1. Taste **BOOT** (`GPIO0`) gedrückt halten.
+2. Kurz **RESET** (`RST`) drücken (oder das USB-Kabel bei gedrückter BOOT-Taste einstecken).
+3. **BOOT** loslassen.
 
 ## 5. Flashen
 
+Mit PlatformIO (flasht automatisch Bootloader, Partitionstabelle `partitions.bin` und Firmware `0x20000`):
+
 ```bash
-pio run -t upload
+pio run -e esp32s3_dev -t upload
 ```
 
-Ist der Port nicht richtig erkannt, setze in `platformio.ini` den Eintrag `upload_port`
-(z. B. `/dev/ttyACM0` unter Linux, `COM5` unter Windows) oder nutze `pio device list`.
+Oder mit dem fertigen Komplett-Image (`esp32s3_dev.bin`) ab Adresse **`0x0`**:
 
-Danach den Chip mit RESET neu starten. Das Gerät meldet sich als FIDO-Token.
+```bash
+esptool.py --chip esp32s3 --baud 460800 write_flash --flash_mode dio --flash_size 4MB 0x0 pico-fido-esp32s3-dev-*.bin
+```
+
+Danach den Chip einmal per **RESET**-Taste (oder kurzes Aus-/Einstecken am **`USB`**-OTG-Port) neu starten. Das Gerät meldet sich sofort als **Pico Key** (`VID 0x20A0` / konfigurierte VID:PID, WebUSB + CTAPHID + CCID) und der LED-Status startet.
 
 ## 6. Serielle Ausgabe
 
+Auf einem Board mit separater `UART`-Buchse (CH343/CP2102 an `UART0`, `GPIO43`/`GPIO44`, 115200 Baud) lässt sich der komplette ESP-IDF-Bootlog parallel zum aktiven USB-FIDO-Betrieb mitlesen:
+
 ```bash
-pio device monitor
+pio device monitor -b 115200
 ```
 
-Die Ausgabe läuft über den USB-Serial/JTAG-Anschluss. Wenn der FIDO-USB-Modus aktiv ist, ist dieser Anschluss
-möglicherweise nicht verfügbar. Dann bleibt die Konsole leer.
+Auf einem Ein-Buchsen-Board (Super Mini) übernimmt TinyUSB nach dem Booten `GPIO19`/`GPIO20` für FIDO2/CCID, sodass der interne USB-Serial/JTAG-Port nach `usb_init()` abgemeldet wird (das ist normal!).
 
-## 7. Verdrahtung des Fingerabdrucksensors
+## 7. Exakte 6-Pin-Verdrahtung des GROW R558-S Fingerabdrucksensors (Datenblatt V1.1.1, S. 7–8)
 
-| Signal | ESP32-S3 | Hinweis |
-|---|---|---|
-| R558 TX | GPIO18 | ESP RX |
-| R558 RX | GPIO17 | ESP TX |
-| R558 VCC / GND | 3,3 V / GND | Sensor nur mit 3,3 V betreiben |
-| LED-Ring Daten | GPIO4 | WS2812, 12 Pixel |
+**WICHTIG — Häufigster Hardware-Fehler beim GROW R558-S:**
+Der **GROW R558-S** besitzt einen **6-poligen MX-1,25-mm-Stecker** mit **zwei getrennten 3,3-V-Versorgungspins** (`Pin 1` für die kapazitive Touch-Erkennung **und** `Pin 3` für den Sensor-Prozessor samt integriertem RGB-Leuchtring). **Beide Pins (`Pin 1` UND `Pin 3`) müssen zwingend mit `3,3 V` verbunden werden!** Bleibt `Pin 3` offen, sind sowohl UART als auch der eingebaute RGB-Ring des R558-S komplett stromlos; bleibt `Pin 1` offen, erkennt der Sensor keinen Finger. **Niemals an `5 V` anschließen** (Maximalspannung laut Datenblatt S. 6: `3,6 V`!).
 
-Die UART-Parameter sind 57600 Baud, 8N2, nach dem Datenblatt des R558-S (Handbuch V1.1).
+| R558-S Pin (MX 1.25mm) | Typische Kabelfarbe | R558-S Signalname (Handbuch S. 7) | Anschluss am ESP32-S3 | Funktion |
+|---|---|---|---|---|
+| **Pin 1** | Rot (oder Pin 1 Markierung) | **`V_Touch` / `VCC_3.3V`** | **`3V3` (3,3 V)** | Dauerhafte 3,3-V-Speisung des Touch-Detektors (**Pflicht!**) |
+| **Pin 2** | Gelb | **`Touch_Out` (`Vout`)** | *offen lassen (NC)* | Touch-IRQ-Ausgang (High bei Berührung, optional) |
+| **Pin 3** | Blau | **`VCC` / `VCC_MCU`** | **`3V3` (3,3 V)** | **Hauptstromversorgung Sensor-MCU & eingebauter RGB-Ring (Pflicht!)** |
+| **Pin 4** | Grün | **`TX` (`UART_TX`)** | **`GPIO18`** (`FP_UART_RX_GPIO`) | Sensor sendet -> ESP32-S3 empfängt (3,3-V-Logik) |
+| **Pin 5** | Weiß | **`RX` (`UART_RX`)** | **`GPIO17`** (`FP_UART_TX_GPIO`) | ESP32-S3 sendet -> Sensor empfängt (3,3-V-Logik) |
+| **Pin 6** | Schwarz | **`GND`** | **`GND`** | Gemeinsame Masse (**Pflicht!**) |
+
+**LED-Ansteuerung (dreifach unterstützt — out of the box ohne Zusatzbauteil):**
+1. **Integrierter RGB-Ring im GROW R558-S:** Wird von der Firmware **direkt über UART (`PS_ControlBLN`, Befehl `0x3C`)** angesteuert (Blau atmend = Finger auflegen, Grün blinkend = Erfolg/Fortschritt, Rot blinkend = Fehler/Kein Treffer, Rot dauerhaft = 5x Fehlversuch / gesperrt). Es ist **kein externer LED-Ring nötig**!
+2. **Onboard-RGB-LED des ESP32-S3-Boards (`GPIO48`, RMT-Treiber aus `pico-keys-sdk`):** Bleibt vollständig aktiv und zeigt den normalen Pico-Key-Status an.
+3. **Optionaler externer WS2812-LED-Ring an `GPIO4`:** Wird parallel ebenfalls mitangesteuert, falls angeschlossen.
+
+Die UART-Parameter sind **57600 Baud, 8N2** gemäß GROW R558-S Handbuch V1.1.1.
 
 ## 8. Sicherheit
 

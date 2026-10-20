@@ -54,6 +54,7 @@ typedef enum {
     FP_ERR_NOT_SECURE,       /* flash encryption required but not active (R1) */
     FP_ERR_BACKUP_FORMAT,    /* malformed backup blob */
     FP_ERR_BACKUP_MISMATCH,  /* backup does not match the connected sensor */
+    FP_ERR_CANCELLED,        /* host sent CTAPHID_CANCEL during scan wait */
 } fp_result_t;
 
 /* Backup blob (R3): 1 version | 4 password | 4 address (BE) | 2 capacity (BE) | 32 slot bitmap. */
@@ -104,5 +105,11 @@ int fp_result_to_ctap(fp_result_t res);
 
 /* Runs a fingerprint verification for a CTAP request and returns a CTAP status code (0 = verified). */
 int fp_uv_ctap_status(void);
+
+/* True while the firmware is actively waiting for a finger to be placed or lifted on the R558-S. */
+bool fp_is_waiting_finger(void);
+
+/* Writes password[4] || BE32(address) to secret8 if paired; returns false if unpaired. */
+bool fp_get_wrap_secret(uint8_t secret8[8]);
 
 #endif /* FP_R558_H_ */

@@ -131,6 +131,11 @@ int cbor_get_info(void) {
     }
     CBOR_CHECK(cbor_encode_text_stringz(&arrayEncoder, "rk"));
     CBOR_CHECK(cbor_encode_boolean(&arrayEncoder, !(get_opts() & FIDO2_OPT_NORK)));
+    if (fp_uv_ok) {
+        /* Canonical CBOR order: 2-char keys ("ep", "rk", "uv") MUST precede longer option keys! */
+        CBOR_CHECK(cbor_encode_text_stringz(&arrayEncoder, "uv"));
+        CBOR_CHECK(cbor_encode_boolean(&arrayEncoder, true));
+    }
     CBOR_CHECK(cbor_encode_text_stringz(&arrayEncoder, "alwaysUv"));
     CBOR_CHECK(cbor_encode_boolean(&arrayEncoder, alwaysUv));
     CBOR_CHECK(cbor_encode_text_stringz(&arrayEncoder, "credMgmt"));
@@ -149,11 +154,6 @@ int cbor_get_info(void) {
     CBOR_CHECK(cbor_encode_boolean(&arrayEncoder, true));
     CBOR_CHECK(cbor_encode_text_stringz(&arrayEncoder, "makeCredUvNotRqd"));
     CBOR_CHECK(cbor_encode_boolean(&arrayEncoder, get_opts() & FIDO2_OPT_AUV ? false : get_opts() & FIDO2_OPT_MCUV_NOTRQD));
-    if (fp_uv_ok) {
-        /* Built-in UV: the R558 fingerprint is paired, not locked and has at least one enrolled finger. */
-        CBOR_CHECK(cbor_encode_text_stringz(&arrayEncoder, "uv"));
-        CBOR_CHECK(cbor_encode_boolean(&arrayEncoder, true));
-    }
     CBOR_CHECK(cbor_encoder_close_container(&mapEncoder, &arrayEncoder));
 
     CBOR_CHECK(cbor_encode_uint(&mapEncoder, 0x05));
@@ -223,8 +223,7 @@ int cbor_get_info(void) {
         CBOR_CHECK(cbor_encode_uint(&mapEncoder, *file_get_data(ef_minpin))); // minPINLength
     }
     else {
-        CBOR_CHECK(cbor_encode_uint(&mapEncoder, 4)); // minPINLength
-
+        CBOR_CHECK(cbor_encode_uint(&mapEncoder, FIDO_MIN_PIN_LENGTH_DEFAULT)); // minPINLength
     }
     CBOR_CHECK(cbor_encode_uint(&mapEncoder, 0x0E));
     CBOR_CHECK(cbor_encode_uint(&mapEncoder, PICO_FIDO_VERSION)); // firmwareVersion

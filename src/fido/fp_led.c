@@ -1,5 +1,5 @@
 /*
- * Pico FIDO - status ring for the R558 fingerprint feature.
+ * Pico FIDO - status LED integration for the R558 fingerprint feature.
  *
  * This file is part of the Pico FIDO distribution (https://github.com/polhenarejos/pico-fido).
  * Copyright (c) 2022 Pol Henarejos.
@@ -15,6 +15,15 @@
  *
  * You should have received a copy of the GNU Affero General Public License
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
+ *
+ * Architecture note:
+ *  1. The GROW R558-S sensor contains its own integrated multi-colour RGB ring LED controlled
+ *     directly over UART via PS_ControlBLN (0x3C) in fp_r558.c.
+ *  2. The ESP32-S3 board's own onboard RGB LED (GPIO48 / PHY-configured pin, driven by
+ *     pico-keys-sdk's led_driver_neopixel via ESP-IDF RMT) MUST stay active for normal Pico-Fido
+ *     idle heartbeat, USB activity and FIDO status blinks, while reflecting active fingerprint states.
+ *  3. An optional external WS2812 ring on FP_LED_GPIO is only initialised when FP_EXTERNAL_NEOPIXEL_RING=1
+ *     is explicitly enabled at compile time.
  */
 
 #include "picokeys.h"
@@ -24,12 +33,15 @@
 
 #if defined(ESP_PLATFORM) && defined(ENABLE_R558_FINGERPRINT)
 
-#include "neopixel.h"
 #include "compat/esp_compat.h"
 
+#if defined(FP_EXTERNAL_NEOPIXEL_RING) && FP_EXTERNAL_NEOPIXEL_RING
+#include "neopixel.h"
 static tNeopixelContext ring = NULL;
 static tNeopixel ring_pixels[FP_LED_COUNT];
+#endif
 
+static led_driver_t *prev_led_driver = NULL;
 static volatile bool requesting = false;
 static volatile bool saving = false;
 static volatile bool enrolling = false;
@@ -55,7 +67,7 @@ void fp_led_enrolling(bool on) {
     enrolling = on;
 }
 
-/* Same colour order mapping as led_neopixel.c, so the PHY LED order setting applies to the ring too. */
+#if defined(FP_EXTERNAL_NEOPIXEL_RING) && FP_EXTERNAL_NEOPIXEL_RING
 static uint32_t ring_rgb(uint8_t r, uint8_t g, uint8_t b) {
     switch (phy_data.led_order) {
         case PHY_LED_ORDER_RBG:
@@ -73,70 +85,96 @@ static uint32_t ring_rgb(uint8_t r, uint8_t g, uint8_t b) {
             return NP_RGB(r, g, b);
     }
 }
+#endif
 
-static void ring_init(void) {
+static void fp_chain_init(void) {
+#if defined(FP_EXTERNAL_NEOPIXEL_RING) && FP_EXTERNAL_NEOPIXEL_RING
     ring = neopixel_Init(FP_LED_COUNT, FP_LED_GPIO);
     for (int i = 0; i < FP_LED_COUNT; i++) {
         ring_pixels[i].index = (uint16_t)i;
         ring_pixels[i].rgb = ring_rgb(0, 0, 0);
     }
+#endif
 }
 
-/* The ring ignores the mode bits of the generic LED engine: it only shows the fingerprint states. */
-static void ring_set_color(uint8_t color, uint32_t led_brightness, float progress) {
-    (void)color;
-    (void)led_brightness;
-    (void)progress;
-
-    uint8_t r = 0, g = 0, b = 0;
+static void fp_chain_set_color(uint8_t color, uint32_t led_brightness, float progress) {
     uint32_t now = board_millis();
+    bool override_active = true;
+    uint8_t ov_color = color;
+    float ov_progress = progress;
 
     if (saving) {
         uint32_t phase = now % FP_LED_PULSE_PERIOD_MS;
-        float x = (float)phase / (float)FP_LED_PULSE_PERIOD_MS;      /* 0..1 */
-        float tri = x < 0.5f ? 2.0f * x : 2.0f * (1.0f - x);          /* triangle 0..1..0 */
-        b = (uint8_t)(20.0f + 235.0f * tri);
+        float x = (float)phase / (float)FP_LED_PULSE_PERIOD_MS;
+        ov_progress = x < 0.5f ? 2.0f * x : 2.0f * (1.0f - x);
+        ov_color = LED_COLOR_BLUE;
     }
     else if (enrolling) {
-        /* Breathing between light blue (about 15 %) and full blue. */
         uint32_t phase = now % FP_LED_BREATH_PERIOD_MS;
         float x = (float)phase / (float)FP_LED_BREATH_PERIOD_MS;
-        float tri = x < 0.5f ? 2.0f * x : 2.0f * (1.0f - x);
-        b = (uint8_t)(40.0f + 215.0f * tri);
+        ov_progress = 0.2f + 0.8f * (x < 0.5f ? 2.0f * x : 2.0f * (1.0f - x));
+        ov_color = LED_COLOR_BLUE;
     }
     else if (result != 0 && now < result_until) {
-        if (result == 1) {
-            g = 255;
-        }
-        else {
-            r = 255;
-        }
+        ov_color = (result == 1) ? LED_COLOR_GREEN : LED_COLOR_RED;
+        ov_progress = 1.0f;
     }
     else if (requesting) {
-        b = 255;
+        ov_color = LED_COLOR_BLUE;
+        ov_progress = 1.0f;
     }
     else {
         result = 0;
+        override_active = false;
     }
 
-    uint32_t rgb = ring_rgb(r, g, b);
-    for (int i = 0; i < FP_LED_COUNT; i++) {
-        ring_pixels[i].rgb = rgb;
+    if (prev_led_driver != NULL && prev_led_driver->set_color != NULL) {
+        if (override_active) {
+            prev_led_driver->set_color(ov_color, led_brightness > 0 ? led_brightness : MAX_BTNESS, ov_progress);
+        }
+        else {
+            prev_led_driver->set_color(color, led_brightness, progress);
+        }
     }
-    neopixel_SetPixel(ring, ring_pixels, FP_LED_COUNT);
+
+#if defined(FP_EXTERNAL_NEOPIXEL_RING) && FP_EXTERNAL_NEOPIXEL_RING
+    if (ring != NULL) {
+        uint8_t r = 0, g = 0, b = 0;
+        if (override_active) {
+            uint8_t scale = (uint8_t)(255.0f * ov_progress);
+            if (ov_color == LED_COLOR_GREEN) {
+                g = scale;
+            }
+            else if (ov_color == LED_COLOR_RED) {
+                r = scale;
+            }
+            else {
+                b = scale;
+            }
+        }
+        uint32_t rgb = ring_rgb(r, g, b);
+        for (int i = 0; i < FP_LED_COUNT; i++) {
+            ring_pixels[i].rgb = rgb;
+        }
+        neopixel_SetPixel(ring, ring_pixels, FP_LED_COUNT);
+    }
+#endif
 }
 
-static led_driver_t fp_ring_driver = {
-    .init = ring_init,
-    .set_color = ring_set_color,
+static led_driver_t fp_chain_driver = {
+    .init = fp_chain_init,
+    .set_color = fp_chain_set_color,
 };
 
 void fp_led_init(void) {
-    led_driver = &fp_ring_driver;
-    led_driver->init();
+    if (led_driver != &fp_chain_driver) {
+        prev_led_driver = led_driver;
+        led_driver = &fp_chain_driver;
+    }
+    fp_chain_driver.init();
 }
 
-#else /* feature disabled or not an ESP32 build: no status ring */
+#else /* feature disabled or not an ESP32 build */
 
 void fp_led_init(void) {
 }

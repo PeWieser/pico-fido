@@ -45,7 +45,7 @@ Das Gerät akzeptiert Fingerabdrücke **nur** über den unten beschriebenen Vend
 
 | Code | Name | Auth | Parameter | Antwort (Map) |
 |---|---|---|---|---|
-| `0x01` | status | keine | – | `{1: bool paired, 2: bool locked, 3: uint capacity, 4: [uint slots], 5: uint failedAttempts, 6: bool supported, 7: bool flashEncrypted}` |
+| `0x01` | status | keine | – | `{1: bool paired, 2: bool locked, 3: uint capacity, 4: [uint slots], 5: uint failedAttempts, 6: bool supported, 7: bool flashEncrypted, 8: text buildType ("prod" \| "dev")}` |
 | `0x02` | pair | PIN-Token, Berechtigung ACFG | – | `{1: uint capacity}` |
 | `0x03` | enroll | PIN-Token, Berechtigung ACFG | – | `{1: uint slot}` |
 | `0x04` | delete | PIN-Token, Berechtigung ACFG | Schlüssel 2 optional: `{1: bytes(2)}` = Slot als 2 Byte Big-Endian, `0xFFFF` = alle. Ohne Schlüssel 2 werden **alle** gelöscht. | `{}` |
@@ -99,17 +99,20 @@ Die PIN selbst: nur für den Token-Schritt verwenden, nicht speichern, nicht in 
    „Du legst den Finger zweimal auf den Sensor. Dazwischen hebst du ihn ab.“ Dann einen Button „Anlernen starten“.
    Nach dem Klick: PIN → Token → `enroll`. Während die Anfrage läuft:
    - Hinweis „Finger jetzt auflegen“, dann nach etwa 3 Sekunden „Finger abheben und warten“, dann „Finger erneut auflegen“.
-     Die Anfrage liefert **keine** Zwischenstände. Die Texte sind nur eine Zeitschätzung.
-     Der Ring am Gerät atmet blau (leichtes bis starkes Blau) während des Anlernens. Er ist die einzige
-     Rückmeldung am Gerät. Es gibt keinen Taster.
+     Die Anfrage liefert **keine** Zwischenstände (sendet aber laufend CTAPHID-Keepalives `0x02` und lässt sich per CTAPHID-Cancel sauber abbrechen). Die Texte sind eine Zeitschätzung.
+     Der **integrierte RGB-Leuchtring des GROW R558-S** (angesteuert per UART `PS_ControlBLN`, `0x3C`, sowie parallel ein optionaler WS2812-Ring an `GPIO4` und die Onboard-LED) atmet während des Wartens blau, blinkt nach Scan 1 kurz grün und nach erfolgreichem Speichern 2× grün (bzw. bei Fehler rot). Es gibt keinen Taster.
    - Ergebnis: Erfolg → Slot anzeigen und Liste aktualisieren. Fehler → Fehlermeldung aus der Tabelle unten,
      Button „Erneut versuchen“.
 5. **Liste der Slots.** Aus `status` (Schlüssel 4). Pro Slot „Löschen“ (PIN, Bestätigungsdialog).
    „Alle löschen“ mit doppelter Bestätigung (PIN, Bestätigungsdialog mit dem Wort „LÖSCHEN“).
 6. Nach jedem schreibenden Befehl `status` neu abfragen.
-7. **Flash-Verschlüsselung.** Ist `7: flashEncrypted = false`, zeigt die App einen Warnhinweis: „Die Flash-Verschlüsselung
-   ist am Gerät nicht aktiv. Koppeln und Wiederherstellen sind gesperrt, bis sie aktiv ist.“ Pairing und Restore
-   sind dann ausgeschaltet. Die App versucht es nicht erst, sondern deaktiviert die Schaltflächen.
+7. **Flash-Verschlüsselung & Build-Typ (`7: flashEncrypted`, `8: buildType`).**
+   - `7: flashEncrypted` meldet den **echten Hardware-eFuse-Status** des ESP32-S3 (`true` = Flash-Verschlüsselung am Chip aktiv, `false` = unverschlüsselt).
+   - `8: buildType` (optionales Textfeld `"prod"` oder `"dev"`, Fallback `"prod"` bei älterer Firmware ohne Schlüssel 8) gibt an, welches Firmware-Image auf dem Gerät läuft.
+   - **Regel für Pairing & Restore:**
+     - **`flashEncrypted === true`** *(Produktivbetrieb)*: Pairing und Restore sind **aktiv** (kein Warnbanner).
+     - **`flashEncrypted === false && buildType === "dev"`** *(Entwicklungs-Image `esp32s3_dev`)*: Gelben Info-Banner anzeigen (*„Entwicklungs-Firmware (`dev`) aktiv: Koppeln & Wiederherstellen sind ohne Hardware-Flash-Verschlüsselung für Testboards freigeschaltet.“*) — **Pairing und Restore sind AKTIV und freigeschaltet!**
+     - **`flashEncrypted === false && buildType !== "dev"`** *(Produktiv-Image auf unverschlüsseltem Board)*: Warnhinweis zeigen: *„Die Flash-Verschlüsselung ist am Gerät nicht aktiv, aber es läuft das Produktiv-Image (`prod`). Koppeln und Wiederherstellen sind gesperrt — wechsle im Bereich ‚Firmware‘ auf das Entwicklungs-Image (`dev`) oder aktiviere die Hardware-Flash-Verschlüsselung.“* Pairing und Restore sind in diesem Fall deaktiviert.
 8. **Backup (R3).** Im Fingerabdruck-Bereich ein Button „Backup erstellen“ (nur bei `paired = true`).
    Ablauf:
    - PIN → Token → `backup` (0x06) → 43-Byte-Blob.
@@ -212,6 +215,6 @@ nicht selbst führen, soll aber bei `0x33` deutlich auf die Restversuche hinweis
 - Backup: Verschlüsseln und Entschlüsseln rund um (gleiche Passphrase → gleicher Blob). Falsche Passphrase → Fehler.
   Geänderte Datei → Fehler. Blob mit falscher Länge oder Version → Fehler, nichts wird gesendet.
 - Restore: Ohne PIN-Token kein `0x07`. Nach erfolgreichem Restore zeigt `status` die Slots aus dem Backup.
-- Ist `flashEncrypted = false`, sind Pairing und Restore deaktiviert, und die App sendet dafür keinen Befehl.
+- Ist `flashEncrypted = false` **und** `buildType !== "dev"`, sind Pairing und Restore deaktiviert, und die App sendet dafür keinen Befehl. Bei `buildType === "dev"` sind Pairing und Restore mit gelbem Entwicklungs-Hinweis aktiv.
 - Neue PIN mit 5 Ziffern oder Buchstaben wird vor dem Senden abgelehnt. Anmeldung mit einer 4-stelligen Altpin geht.
 - Ist `supported = false`, zeigt die App keinen Fingerabdruck-Bereich und sendet keine Befehle außer `status`.

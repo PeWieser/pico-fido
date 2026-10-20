@@ -200,8 +200,8 @@ def test_pin(CPRes):
 def test_set_pin_twice(device, client_pin):
     """ Setting pin when a pin is already set should result in error NotAllowed. """
     with pytest.raises(CtapError) as e:
-        client_pin.set_pin('1234')
-        client_pin.set_pin('1234')
+        client_pin.set_pin('123456')
+        client_pin.set_pin('123456')
 
     assert e.value.code == CtapError.ERR.NOT_ALLOWED
 
