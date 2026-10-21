@@ -23,15 +23,15 @@
 #ifndef FP_R558_CONFIG_H_
 #define FP_R558_CONFIG_H_
 
-/* R558 UART (3.3 V TTL, 57600 8N2). Module TX -> FP_UART_RX_GPIO (RX/GP44), module RX <- FP_UART_TX_GPIO (TX/GP43). */
+/* R558 UART (3.3 V TTL, 57600 8N2 default; auto-probed across GP1/GP2, GP43/GP44, GP4/GP5, GP17/GP18 + swapped TX/RX). */
 #ifndef FP_UART_NUM
 #define FP_UART_NUM            1
 #endif
 #ifndef FP_UART_TX_GPIO
-#define FP_UART_TX_GPIO       43
+#define FP_UART_TX_GPIO        1
 #endif
 #ifndef FP_UART_RX_GPIO
-#define FP_UART_RX_GPIO       44
+#define FP_UART_RX_GPIO        2
 #endif
 #ifndef FP_UART_BAUD
 #define FP_UART_BAUD          57600
