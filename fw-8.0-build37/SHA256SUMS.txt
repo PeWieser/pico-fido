@@ -1,0 +1,2 @@
+0cfa9fd8e5ba381b6c583e132c76dd39361548727862dab3018d808fcd9efc88  pico-fido-esp32s3-8.0-ad38fbf.bin
+2cb4aa226f05b029b155559716be85234870d1fe918b26d840b8b91c98da7ebb  pico-fido-esp32s3-dev-8.0-ad38fbf.bin
