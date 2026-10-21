@@ -59,6 +59,8 @@ typedef struct {
     uint32_t address;
     uint8_t password[4];
     int password_set;
+    int session_verified;
+    uint16_t capacity;
     int used[256];
     int templ[256];
     int buf[3];
@@ -78,6 +80,7 @@ static module_t *active = &mod_a;
 static void module_reset(module_t *m, uint32_t addr) {
     memset(m, 0, sizeof(*m));
     m->address = addr;
+    m->capacity = 200;
     m->present = 1;
 }
 
@@ -115,10 +118,16 @@ static void module_command(module_t *m, const uint8_t *cmd, size_t n) {
     uint8_t ins = cmd[9];
     const uint8_t *p = cmd + 10;
     uint8_t out[40]; uint16_t ol = 0;
+    /* Real GROW R558-S silicon rejects all non-VfyPwd commands until VfyPwd succeeds in session. */
+    if (ins != FP_INS_VFY_PWD && !m->session_verified) {
+        reply(m, addr, 0x01, NULL, 0, out, &ol);
+        send_ack(addr, out, ol);
+        return;
+    }
     switch (ins) {
         case FP_INS_READ_SYS_PARA: {
             /* status(2) sysid(2) capacity(2) security(2) address(4) packet size(2) baud(2); the confirmation code is added by reply() */
-            uint8_t d[16] = { 0, 0, 0, 9, 0, 200, 0, 3, 0, 0, 0, 0, 0, 2, 0, 6 };
+            uint8_t d[16] = { 0, 0, 0, 9, (uint8_t)(m->capacity >> 8), (uint8_t)m->capacity, 0, 3, 0, 0, 0, 0, 0, 2, 0, 6 };
             d[8] = (uint8_t)(m->address >> 24); d[9] = (uint8_t)(m->address >> 16); d[10] = (uint8_t)(m->address >> 8); d[11] = (uint8_t)m->address;
             reply(m, addr, 0x00, d, 16, out, &ol); break;
         }
@@ -126,8 +135,14 @@ static void module_command(module_t *m, const uint8_t *cmd, size_t n) {
             memcpy(m->password, p, 4); m->password_set = 1;
             reply(m, addr, 0x00, NULL, 0, out, &ol); break;
         case FP_INS_VFY_PWD:
-            if (m->password_set && memcmp(m->password, p, 4) != 0) { reply(m, addr, FP_CONF_WRONG_PWD, NULL, 0, out, &ol); }
-            else { reply(m, addr, 0x00, NULL, 0, out, &ol); }
+            if (m->password_set && memcmp(m->password, p, 4) != 0) {
+                m->session_verified = 0;
+                reply(m, addr, FP_CONF_WRONG_PWD, NULL, 0, out, &ol);
+            }
+            else {
+                m->session_verified = 1;
+                reply(m, addr, 0x00, NULL, 0, out, &ol);
+            }
             break;
         case FP_INS_SET_CHIP_ADDR: {
             if (m->fail_set_addr) { reply(m, addr, 0x01, NULL, 0, out, &ol); break; }
@@ -217,6 +232,8 @@ static const fp_transport_t transport = { .ctx = NULL, .write = t_write, .read =
 
 const fp_transport_t *fp_uart_transport(void) { return &transport; }
 int fp_uart_init(void) { return 0; }
+bool fp_uart_scan_pins(uint32_t paired_addr) { (void)paired_addr; return active->present != 0; }
+const char *fp_uart_active_pins(void) { return active->present ? "TX=GPIO1, RX=GPIO2 (57600 8N2)" : ""; }
 
 /* ---------------- test helpers ---------------- */
 
@@ -446,6 +463,25 @@ int main(void) {
     cancel_button = true;
     CHECK(fp_verify(500) == FP_ERR_CANCELLED, "CTAPHID_CANCEL aborts fp_verify immediately");
     cancel_button = false;
+
+    /* 17. Real R558-S boot visual check (VfyPwd first -> blue flash) & 300-template clamping. */
+    reset_all();
+    mod_a.capacity = 300;
+    fp_init();
+    fp_get_status(&st);
+    CHECK(st.sensor_detected, "fp_init detects live R558-S after VfyPwd");
+    CHECK(mod_a.last_led_func == FP_LED_FUNC_FLASH && mod_a.last_led_start == FP_LED_COLOR_BLUE,
+          "fp_init flashes R558-S RGB ring blue when unpaired sensor answers");
+    mod_a.session_verified = 0; /* simulate cold power-on before fp_pair() */
+    CHECK(fp_pair(&cap) == FP_OK && cap == FP_TEMPLATE_MAX,
+          "fp_pair sends VfyPwd before ReadSysPara and clamps 300-template sensor to FP_TEMPLATE_MAX");
+    mod_a.present = 0;
+    CHECK(!fp_probe(), "fp_probe reports false when sensor is unplugged");
+    fp_get_status(&st);
+    CHECK(!st.sensor_detected, "status reflects unplugged sensor after probe");
+    mod_a.present = 1;
+    mod_a.session_verified = 0;
+    CHECK(fp_probe(), "fp_probe re-detects live hot-plugged sensor");
 
     if (failures) {
         printf("%d FAILURE(S)\n", failures);

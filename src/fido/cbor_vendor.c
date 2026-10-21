@@ -341,23 +341,27 @@ static int cbor_vendor_generic(uint8_t cmd, const uint8_t *data, size_t len) {
     }
     else if (cmd == CTAP_VENDOR_FP) {
         /*
-         * Subcommands (key 1). 0x01 is read-only. The others need a PIN token with the
+         * Subcommands (key 1). 0x01 and 0x08 are read-only. The others need a PIN token with the
          * authenticatorConfig permission and a user presence check.
          *   0x01 status            -> {1: paired, 2: locked, 3: capacity, 4: [enrolled slots], 5: failed attempts,
          *                              6: supported (R558 feature built in), 7: flash encrypted,
-         *                              8: build type ("prod" | "dev")}
+         *                              8: build type ("prod" | "dev"), 9: sensor detected, 10: active UART pins}
          *   0x02 pair              -> {1: capacity}          (PIN token, needs flash encryption in "prod", R1)
          *   0x03 enroll            -> {1: slot}
          *   0x04 delete            -> key 2 param {1: slot as 2 bytes BE, 0xFFFF = all}, or no param = all
          *   0x05 unlock            -> {}
          *   0x06 backup            -> {1: bytes(43) backup blob}   (R3, plaintext: the caller must encrypt it)
          *   0x07 restore           -> key 2 param {1: bytes(43)}, {}  (R3, checks the sensor before trusting it)
+         *   0x08 probe             -> live UART multi-pin scan + LED ring flash + full status map {1..10}
          * Subcommands 0x02-0x07 need a PIN token (ACFG). No button: the sensor is the only interaction.
          */
-        if (vendorCmd == 0x01) {
+        if (vendorCmd == 0x01 || vendorCmd == 0x08) {
+            if (vendorCmd == 0x08) {
+                fp_probe();
+            }
             fp_status_t st;
             fp_get_status(&st);
-            CBOR_CHECK(cbor_encoder_create_map(&encoder, &mapEncoder, 8));
+            CBOR_CHECK(cbor_encoder_create_map(&encoder, &mapEncoder, 10));
             CBOR_CHECK(cbor_encode_uint(&mapEncoder, 0x01));
             CBOR_CHECK(cbor_encode_boolean(&mapEncoder, st.paired));
             CBOR_CHECK(cbor_encode_uint(&mapEncoder, 0x02));
@@ -380,6 +384,10 @@ static int cbor_vendor_generic(uint8_t cmd, const uint8_t *data, size_t len) {
             CBOR_CHECK(cbor_encode_boolean(&mapEncoder, st.flash_encrypted));
             CBOR_CHECK(cbor_encode_uint(&mapEncoder, 0x08));
             CBOR_CHECK(cbor_encode_text_stringz(&mapEncoder, FP_REQUIRE_FLASH_ENCRYPTION ? "prod" : "dev"));
+            CBOR_CHECK(cbor_encode_uint(&mapEncoder, 0x09));
+            CBOR_CHECK(cbor_encode_boolean(&mapEncoder, st.sensor_detected));
+            CBOR_CHECK(cbor_encode_uint(&mapEncoder, 0x0A));
+            CBOR_CHECK(cbor_encode_text_stringz(&mapEncoder, st.sensor_pins));
         }
         else if (vendorCmd >= 0x02 && vendorCmd <= 0x07) {
             int auth_ret = fp_pin_auth((uint8_t)pinUvAuthProtocol, &pinUvAuthParam, raw_vendor_params, raw_vendor_params_len, vendorCmd);

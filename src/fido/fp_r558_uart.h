@@ -20,10 +20,22 @@
 #ifndef FP_R558_UART_H_
 #define FP_R558_UART_H_
 
+#include <stdbool.h>
+#include <stdint.h>
 #include "fp_r558_sensor.h"
 
 /* Installs the UART driver. Returns 0 on success. */
 int fp_uart_init(void);
+
+/*
+ * Scans candidate UART TX/RX GPIO pairs (including auto TX/RX swap) and baud/stop-bit
+ * framings on ESP32 hardware until a live R558-S answers with a valid packet.
+ * Returns true if a sensor answered (or on host/emulation builds).
+ */
+bool fp_uart_scan_pins(uint32_t paired_addr);
+
+/* Human-readable active UART description (e.g. "TX=GPIO1, RX=GPIO2 @ 57600"), or "" if none answered. */
+const char *fp_uart_active_pins(void);
 
 /* Transport bound to the UART. On builds without UART it always reports an I/O error. */
 const fp_transport_t *fp_uart_transport(void);
