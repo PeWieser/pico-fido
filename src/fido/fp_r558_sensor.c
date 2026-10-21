@@ -96,11 +96,9 @@ static bool read_exact(const fp_transport_t *t, uint8_t *buf, size_t n, uint32_t
     return true;
 }
 
-fp_sensor_status_t fp_sensor_txn(const fp_transport_t *t, uint32_t addr, uint8_t ins,
-                                 const uint8_t *params, uint16_t params_len,
-                                 uint8_t *out, uint16_t out_cap, uint16_t *out_len,
-                                 uint8_t *code, uint32_t timeout_ms, bool check_address) {
-    if (t == NULL || t->read == NULL || t->write == NULL) {
+fp_sensor_status_t fp_sensor_send_cmd(const fp_transport_t *t, uint32_t addr, uint8_t ins,
+                                      const uint8_t *params, uint16_t params_len) {
+    if (t == NULL || t->write == NULL) {
         return FP_SENSOR_IO_ERROR;
     }
     if (params_len > FP_PACKET_MAX_PAYLOAD - 1u) {
@@ -121,6 +119,15 @@ fp_sensor_status_t fp_sensor_txn(const fp_transport_t *t, uint32_t addr, uint8_t
         t->flush(t->ctx);
     }
     if (t->write(t->ctx, packet, n) != 0) {
+        return FP_SENSOR_IO_ERROR;
+    }
+    return FP_SENSOR_OK;
+}
+
+fp_sensor_status_t fp_sensor_recv_ack(const fp_transport_t *t, uint32_t expected_addr,
+                                      uint8_t *out, uint16_t out_cap, uint16_t *out_len,
+                                      uint8_t *code, uint32_t timeout_ms, bool check_address) {
+    if (t == NULL || t->read == NULL) {
         return FP_SENSOR_IO_ERROR;
     }
 
@@ -178,7 +185,7 @@ fp_sensor_status_t fp_sensor_txn(const fp_transport_t *t, uint32_t addr, uint8_t
     if (pid != FP_PID_ACK || received_sum != fp_sensor_checksum(pid, length, body, body_len)) {
         return FP_SENSOR_BAD_FRAME;
     }
-    if (check_address && resp_addr != addr) {
+    if (check_address && resp_addr != expected_addr) {
         return FP_SENSOR_BAD_ADDRESS;
     }
 
@@ -197,6 +204,20 @@ fp_sensor_status_t fp_sensor_txn(const fp_transport_t *t, uint32_t addr, uint8_t
         *code = body[0];
     }
     return FP_SENSOR_OK;
+}
+
+fp_sensor_status_t fp_sensor_txn(const fp_transport_t *t, uint32_t addr, uint8_t ins,
+                                 const uint8_t *params, uint16_t params_len,
+                                 uint8_t *out, uint16_t out_cap, uint16_t *out_len,
+                                 uint8_t *code, uint32_t timeout_ms, bool check_address) {
+    if (t == NULL || t->read == NULL || t->write == NULL) {
+        return FP_SENSOR_IO_ERROR;
+    }
+    fp_sensor_status_t st = fp_sensor_send_cmd(t, addr, ins, params, params_len);
+    if (st != FP_SENSOR_OK) {
+        return st;
+    }
+    return fp_sensor_recv_ack(t, addr, out, out_cap, out_len, code, timeout_ms, check_address);
 }
 
 fp_sensor_status_t fp_sensor_read_sysparam(const fp_transport_t *t, uint32_t addr, fp_sysparam_t *out, uint8_t *code) {
@@ -256,11 +277,11 @@ fp_sensor_status_t fp_sensor_set_chip_address(const fp_transport_t *t, uint32_t 
 }
 
 fp_sensor_status_t fp_sensor_gen_img(const fp_transport_t *t, const fp_session_t *s, uint8_t *code) {
-    return simple_cmd(t, s, FP_INS_GEN_IMG, NULL, 0, 1000, code);
+    return simple_cmd(t, s, FP_INS_GEN_IMG, NULL, 0, 2000, code);
 }
 
 fp_sensor_status_t fp_sensor_img_2_tz(const fp_transport_t *t, const fp_session_t *s, uint8_t buffer, uint8_t *code) {
-    return simple_cmd(t, s, FP_INS_IMG_2_TZ, &buffer, 1, 1000, code);
+    return simple_cmd(t, s, FP_INS_IMG_2_TZ, &buffer, 1, 2000, code);
 }
 
 fp_sensor_status_t fp_sensor_search(const fp_transport_t *t, const fp_session_t *s, uint8_t buffer,
@@ -273,7 +294,7 @@ fp_sensor_status_t fp_sensor_search(const fp_transport_t *t, const fp_session_t 
     uint8_t buf[8];
     uint16_t len = 0;
     uint8_t c = 0xFF;
-    fp_sensor_status_t st = fp_sensor_txn(t, s->address, FP_INS_SEARCH, p, sizeof(p), buf, sizeof(buf), &len, &c, 2000, true);
+    fp_sensor_status_t st = fp_sensor_txn(t, s->address, FP_INS_SEARCH, p, sizeof(p), buf, sizeof(buf), &len, &c, 3000, true);
     if (code != NULL) {
         *code = c;
     }
@@ -292,14 +313,14 @@ fp_sensor_status_t fp_sensor_search(const fp_transport_t *t, const fp_session_t 
 }
 
 fp_sensor_status_t fp_sensor_reg_model(const fp_transport_t *t, const fp_session_t *s, uint8_t *code) {
-    return simple_cmd(t, s, FP_INS_REG_MODEL, NULL, 0, 1000, code);
+    return simple_cmd(t, s, FP_INS_REG_MODEL, NULL, 0, 2500, code);
 }
 
 fp_sensor_status_t fp_sensor_store(const fp_transport_t *t, const fp_session_t *s, uint8_t buffer, uint16_t page_id, uint8_t *code) {
     uint8_t p[3];
     p[0] = buffer;
     put_u16_be(p + 1, page_id);
-    return simple_cmd(t, s, FP_INS_STORE, p, sizeof(p), 2000, code);
+    return simple_cmd(t, s, FP_INS_STORE, p, sizeof(p), 3000, code);
 }
 
 fp_sensor_status_t fp_sensor_delete_chars(const fp_transport_t *t, const fp_session_t *s, uint16_t page_id, uint16_t count, uint8_t *code) {
@@ -332,13 +353,17 @@ fp_sensor_status_t fp_sensor_template_num(const fp_transport_t *t, const fp_sess
     return FP_SENSOR_OK;
 }
 
+fp_sensor_status_t fp_sensor_cancel(const fp_transport_t *t, const fp_session_t *s, uint8_t *code) {
+    return simple_cmd(t, s, FP_INS_CANCEL, NULL, 0, 500, code);
+}
+
 /* PS_ControlBLN (0x3C): controls the R558-S built-in RGB ring LED over UART. */
 fp_sensor_status_t fp_sensor_control_led(const fp_transport_t *t, uint32_t addr,
                                          uint8_t func, uint8_t start_color, uint8_t end_color,
                                          uint8_t cycles, uint8_t *code) {
     uint8_t p[4] = { func, start_color, end_color, cycles };
     uint8_t c = 0xFF;
-    fp_sensor_status_t st = fp_sensor_txn(t, addr, FP_INS_CONTROL_BLN, p, sizeof(p), NULL, 0, NULL, &c, 150, false);
+    fp_sensor_status_t st = fp_sensor_txn(t, addr, FP_INS_CONTROL_BLN, p, sizeof(p), NULL, 0, NULL, &c, 250, false);
     if (code != NULL) {
         *code = c;
     }

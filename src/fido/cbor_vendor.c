@@ -361,7 +361,7 @@ static int cbor_vendor_generic(uint8_t cmd, const uint8_t *data, size_t len) {
             }
             fp_status_t st;
             fp_get_status(&st);
-            CBOR_CHECK(cbor_encoder_create_map(&encoder, &mapEncoder, 10));
+            CBOR_CHECK(cbor_encoder_create_map(&encoder, &mapEncoder, 13));
             CBOR_CHECK(cbor_encode_uint(&mapEncoder, 0x01));
             CBOR_CHECK(cbor_encode_boolean(&mapEncoder, st.paired));
             CBOR_CHECK(cbor_encode_uint(&mapEncoder, 0x02));
@@ -388,6 +388,12 @@ static int cbor_vendor_generic(uint8_t cmd, const uint8_t *data, size_t len) {
             CBOR_CHECK(cbor_encode_boolean(&mapEncoder, st.sensor_detected));
             CBOR_CHECK(cbor_encode_uint(&mapEncoder, 0x0A));
             CBOR_CHECK(cbor_encode_text_stringz(&mapEncoder, st.sensor_pins));
+            CBOR_CHECK(cbor_encode_uint(&mapEncoder, 0x0B));
+            CBOR_CHECK(cbor_encode_uint(&mapEncoder, st.last_step));
+            CBOR_CHECK(cbor_encode_uint(&mapEncoder, 0x0C));
+            CBOR_CHECK(cbor_encode_uint(&mapEncoder, st.last_conf));
+            CBOR_CHECK(cbor_encode_uint(&mapEncoder, 0x0D));
+            CBOR_CHECK(cbor_encode_uint(&mapEncoder, st.last_transport));
         }
         else if (vendorCmd >= 0x02 && vendorCmd <= 0x07) {
             int auth_ret = fp_pin_auth((uint8_t)pinUvAuthProtocol, &pinUvAuthParam, raw_vendor_params, raw_vendor_params_len, vendorCmd);

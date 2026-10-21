@@ -233,6 +233,22 @@ static void register_success(fp_conf_t *c) {
 
 static bool last_sensor_detected = false;
 static bool sensor_probed_once = false;
+static bool use_auto_mode = false;
+static uint8_t last_err_ins = 0;
+static uint8_t last_err_conf = 0;
+static uint8_t last_err_transport = 0;
+
+static void fp_diag_reset(void) {
+    last_err_ins = 0;
+    last_err_conf = 0;
+    last_err_transport = 0;
+}
+
+static void fp_diag_err(uint8_t ins, uint8_t conf, fp_sensor_status_t transport) {
+    last_err_ins = ins;
+    last_err_conf = conf;
+    last_err_transport = (uint8_t)transport;
+}
 
 static void probe_and_init_sensor(const fp_conf_t *c) {
     sensor_probed_once = true;
@@ -244,9 +260,11 @@ static void probe_and_init_sensor(const fp_conf_t *c) {
 
     if (c->flags & FP_FLAG_PAIRED) {
         fp_session_t s = session_of(c);
-        if (fp_sensor_verify_password(t, &s, &code) == FP_SENSOR_OK) {
+        fp_sensor_status_t st = fp_sensor_verify_password(t, &s, &code);
+        if (st == FP_SENSOR_OK) {
             last_sensor_detected = true;
             if (code == FP_CONF_OK) {
+                fp_diag_reset();
                 if (c->flags & FP_FLAG_LOCKED) {
                     sensor_led(c->address, FP_LED_FUNC_ON, FP_LED_COLOR_RED, FP_LED_COLOR_RED, 0);
                 }
@@ -254,13 +272,18 @@ static void probe_and_init_sensor(const fp_conf_t *c) {
                     sensor_led(c->address, FP_LED_FUNC_FLASH, FP_LED_COLOR_CYAN, FP_LED_COLOR_CYAN, 2);
                 }
             }
+            else {
+                fp_diag_err(FP_INS_VFY_PWD, code, st);
+            }
             return;
         }
     }
 
     fp_session_t factory = { .address = FP_FACTORY_ADDRESS, .password = { 0, 0, 0, 0 } };
-    if (fp_sensor_verify_password(t, &factory, &code) == FP_SENSOR_OK) {
+    fp_sensor_status_t fst = fp_sensor_verify_password(t, &factory, &code);
+    if (fst == FP_SENSOR_OK) {
         last_sensor_detected = true;
+        fp_diag_reset();
         if (code == FP_CONF_OK && !(c->flags & FP_FLAG_PAIRED)) {
             sensor_led(FP_FACTORY_ADDRESS, FP_LED_FUNC_FLASH, FP_LED_COLOR_BLUE, FP_LED_COLOR_BLUE, 2);
         }
@@ -268,6 +291,7 @@ static void probe_and_init_sensor(const fp_conf_t *c) {
     }
 
     last_sensor_detected = false;
+    fp_diag_err(FP_INS_VFY_PWD, 0xFF, fst);
 }
 
 /* Checks the stored password at the stored address. Returns FP_OK, or FP_ERR_SENSOR_AUTH on a wrong password. */
@@ -281,23 +305,53 @@ static fp_result_t authenticate_sensor(const fp_conf_t *c) {
     }
     if (st != FP_SENSOR_OK) {
         last_sensor_detected = false;
+        fp_diag_err(FP_INS_VFY_PWD, 0xFF, st);
         return FP_ERR_SENSOR;
     }
     last_sensor_detected = true;
     if (code == FP_CONF_OK) {
         return FP_OK;
     }
+    fp_diag_err(FP_INS_VFY_PWD, code, FP_SENSOR_OK);
     if (code == FP_CONF_WRONG_PWD) {
         return FP_ERR_SENSOR_AUTH;
     }
     return FP_ERR_SENSOR;
 }
 
-/* Waits until the sensor reports a finger and turns it into characteristics in buffer. */
+static bool is_retryable_capture_code(uint8_t code) {
+    switch (code) {
+        case FP_CONF_NO_FINGER:
+        case FP_CONF_CAPTURE_FAIL:
+        case FP_CONF_IMG_DRY:
+        case FP_CONF_IMG_WET:
+        case FP_CONF_IMG_MESSY:
+        case FP_CONF_IMG_FEW_POINTS:
+        case FP_CONF_NO_MATCH:
+        case FP_CONF_COMBINE_FAIL:
+        case FP_CONF_NO_IMAGE_BUF:
+        case FP_CONF_RESIDUAL:
+        case FP_CONF_AREA_OVERLAP:
+        case FP_CONF_SMALL_AREA:
+        case FP_CONF_FOREIGN_IMG:
+        case FP_CONF_ILLEGAL_DATA:
+        case FP_CONF_REVERSE_MOULD:
+        case FP_CONF_FOREIGN_STATIC:
+        case FP_CONF_FOREIGN_DYN:
+        case FP_CONF_POOR_TEMPLATE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+/* Waits until the sensor reports a clean finger image and extracts features into buffer. */
 static fp_result_t capture_to_buffer(const fp_session_t *s, uint8_t buffer, uint32_t timeout_ms) {
     uint32_t deadline = board_millis() + timeout_ms;
     const fp_transport_t *t = fp_uart_transport();
     waiting_finger = true;
+    bool saw_mismatch = false;
+    uint8_t last_mismatch_code = 0;
     fp_result_t result = FP_ERR_SENSOR;
     for (;;) {
         if (cancel_button) {
@@ -305,25 +359,43 @@ static fp_result_t capture_to_buffer(const fp_session_t *s, uint8_t buffer, uint
             break;
         }
         if (board_millis() >= deadline) {
-            result = FP_ERR_TIMEOUT;
+            if (saw_mismatch) {
+                fp_diag_err(FP_INS_IMG_2_TZ, last_mismatch_code, FP_SENSOR_OK);
+                result = FP_ERR_NO_MATCH;
+            }
+            else {
+                result = FP_ERR_TIMEOUT;
+            }
             break;
         }
         uint8_t code = 0xFF;
         fp_sensor_status_t st = fp_sensor_gen_img(t, s, &code);
         if (st != FP_SENSOR_OK) {
+            fp_diag_err(FP_INS_GEN_IMG, code, st);
             result = FP_ERR_SENSOR;
             break;
-        }
-        if (code == FP_CONF_NO_FINGER || code == FP_CONF_CAPTURE_FAIL || code == FP_CONF_SMALL_AREA) {
-            fp_sleep_ms(50);
-            continue;
         }
         if (code != FP_CONF_OK) {
+            if (is_retryable_capture_code(code)) {
+                fp_sleep_ms(50);
+                continue;
+            }
+            fp_diag_err(FP_INS_GEN_IMG, code, FP_SENSOR_OK);
             result = FP_ERR_SENSOR;
             break;
         }
+#if defined(ESP_PLATFORM)
+        /* Allow capacitive pad contact to settle flat across the 8x8 mm array before extracting features. */
+        fp_sleep_ms(70);
+        uint8_t settled_code = 0xFF;
+        if (fp_sensor_gen_img(t, s, &settled_code) == FP_SENSOR_OK && settled_code != FP_CONF_OK) {
+            fp_sleep_ms(40);
+            continue;
+        }
+#endif
         st = fp_sensor_img_2_tz(t, s, buffer, &code);
         if (st != FP_SENSOR_OK) {
+            fp_diag_err(FP_INS_IMG_2_TZ, code, st);
             result = FP_ERR_SENSOR;
             break;
         }
@@ -331,12 +403,16 @@ static fp_result_t capture_to_buffer(const fp_session_t *s, uint8_t buffer, uint
             result = FP_OK;
             break;
         }
-        if (code == FP_CONF_IMG_MESSY || code == FP_CONF_IMG_FEW_POINTS ||
-            code == FP_CONF_NO_IMAGE_BUF || code == FP_CONF_SMALL_AREA) {
-            /* Poor or partial capacitive touch: let the user adjust finger and try again. */
-            fp_sleep_ms(50);
+        if (code == FP_CONF_NO_MATCH || code == FP_CONF_COMBINE_FAIL || code == FP_CONF_POOR_TEMPLATE) {
+            saw_mismatch = true;
+            last_mismatch_code = code;
+        }
+        if (is_retryable_capture_code(code)) {
+            /* Partial capacitive touch or angle/overlap feedback (R558-S Manual p. 13, 33): retry frame. */
+            fp_sleep_ms(60);
             continue;
         }
+        fp_diag_err(FP_INS_IMG_2_TZ, code, FP_SENSOR_OK);
         result = FP_ERR_SENSOR;
         break;
     }
@@ -360,7 +436,9 @@ static fp_result_t wait_finger_removed(const fp_session_t *s, uint32_t timeout_m
             break;
         }
         uint8_t code = 0xFF;
-        if (fp_sensor_gen_img(t, s, &code) != FP_SENSOR_OK) {
+        fp_sensor_status_t st = fp_sensor_gen_img(t, s, &code);
+        if (st != FP_SENSOR_OK) {
+            fp_diag_err(FP_INS_GEN_IMG, code, st);
             result = FP_ERR_SENSOR;
             break;
         }
@@ -372,6 +450,172 @@ static fp_result_t wait_finger_removed(const fp_session_t *s, uint32_t timeout_m
     }
     waiting_finger = false;
     return result;
+}
+
+/*
+ * Native R558-S PS_AutoEnroll (0x31) state machine (GROW R558-S V1.1 Manual p. 31-34).
+ * Used automatically when a module blocks manual RegModel/Store via EncryptionLevel (0x31) or similar.
+ */
+static fp_result_t fp_enroll_auto(const fp_session_t *s, uint16_t slot, uint8_t entries) {
+    const fp_transport_t *t = fp_uart_transport();
+    uint8_t tmp = 0xFF;
+    (void)fp_sensor_delete_chars(t, s, slot, 1, &tmp);
+    sensor_led(s->address, FP_LED_FUNC_BREATHE, FP_LED_COLOR_BLUE, FP_LED_COLOR_PURPLE, 0);
+
+    const uint8_t params[5] = {
+        (uint8_t)(slot >> 8),
+        (uint8_t)(slot & 0xFF),
+        entries,
+        0x00,
+        0x08 /* bit2=0 (step status ACKs enabled), bit3=1 (allow slot overwrite), bit4=0, bit5=0 (lift finger between scans) */
+    };
+    fp_sensor_status_t st = fp_sensor_send_cmd(t, s->address, FP_INS_AUTO_ENROLL, params, sizeof(params));
+    if (st != FP_SENSOR_OK) {
+        fp_diag_err(FP_INS_AUTO_ENROLL, 0xFF, st);
+        return FP_ERR_SENSOR;
+    }
+
+    uint32_t deadline = board_millis() + (FP_ENROLL_STEP_TIMEOUT_MS * 2u);
+    waiting_finger = true;
+    fp_result_t res = FP_ERR_SENSOR;
+
+    for (;;) {
+        if (cancel_button) {
+            (void)fp_sensor_cancel(t, s, &tmp);
+            res = FP_ERR_CANCELLED;
+            break;
+        }
+        if (board_millis() >= deadline) {
+            (void)fp_sensor_cancel(t, s, &tmp);
+            res = FP_ERR_TIMEOUT;
+            break;
+        }
+        uint8_t ack[8] = { 0 };
+        uint16_t ack_len = 0;
+        uint8_t conf = 0xFF;
+        st = fp_sensor_recv_ack(t, s->address, ack, sizeof(ack), &ack_len, &conf, 400, true);
+        if (st == FP_SENSOR_TIMEOUT) {
+            continue;
+        }
+        if (st != FP_SENSOR_OK) {
+            fp_diag_err(FP_INS_AUTO_ENROLL, conf, st);
+            (void)fp_sensor_cancel(t, s, &tmp);
+            res = FP_ERR_SENSOR;
+            break;
+        }
+        uint8_t step = ack_len >= 2 ? ack[1] : 0xFF;
+        if (conf == FP_CONF_OK) {
+            if (step == 0x06) {
+                /* Step 0x06 (00 06 F2): template stored in sensor flash. */
+                res = FP_OK;
+                break;
+            }
+            /* Steps 0x00..0x05 succeeded: continue reading next progress ACK. */
+            continue;
+        }
+        if ((step == 0x01 || step == 0x02 || step == 0x03) && is_retryable_capture_code(conf)) {
+            /* Module stays inside AutoEnroll waiting for cleaner touch / lift. */
+            continue;
+        }
+        if (conf == FP_CONF_MOD_TIMEOUT) {
+            res = FP_ERR_TIMEOUT;
+            break;
+        }
+        if (conf == FP_CONF_COMBINE_FAIL || conf == FP_CONF_POOR_TEMPLATE || conf == FP_CONF_NO_MATCH) {
+            fp_diag_err(FP_INS_AUTO_ENROLL, conf, FP_SENSOR_OK);
+            res = FP_ERR_NO_MATCH;
+            break;
+        }
+        if (conf == FP_CONF_LIB_FULL) {
+            fp_diag_err(FP_INS_AUTO_ENROLL, conf, FP_SENSOR_OK);
+            res = FP_ERR_FULL;
+            break;
+        }
+        fp_diag_err(FP_INS_AUTO_ENROLL, conf, FP_SENSOR_OK);
+        (void)fp_sensor_cancel(t, s, &tmp);
+        res = FP_ERR_SENSOR;
+        break;
+    }
+
+    waiting_finger = false;
+    return res;
+}
+
+/*
+ * Native R558-S PS_AutoIdentify (0x32) 1:N verification (GROW R558-S V1.1 Manual p. 34-35).
+ */
+static fp_result_t fp_verify_auto(const fp_session_t *s, uint32_t timeout_ms, uint16_t *page_out) {
+    const fp_transport_t *t = fp_uart_transport();
+    uint8_t tmp = 0xFF;
+    const uint8_t params[5] = {
+        3,          /* security level 3 */
+        0xFF, 0xFF, /* 0xFFFF = 1:N search across database */
+        0x00, 0x00  /* bit2=0 = emit step status ACKs */
+    };
+    fp_sensor_status_t st = fp_sensor_send_cmd(t, s->address, FP_INS_AUTO_ID, params, sizeof(params));
+    if (st != FP_SENSOR_OK) {
+        fp_diag_err(FP_INS_AUTO_ID, 0xFF, st);
+        return FP_ERR_SENSOR;
+    }
+
+    uint32_t deadline = board_millis() + timeout_ms;
+    waiting_finger = true;
+    fp_result_t res = FP_ERR_SENSOR;
+
+    for (;;) {
+        if (cancel_button) {
+            (void)fp_sensor_cancel(t, s, &tmp);
+            res = FP_ERR_CANCELLED;
+            break;
+        }
+        if (board_millis() >= deadline) {
+            (void)fp_sensor_cancel(t, s, &tmp);
+            res = FP_ERR_TIMEOUT;
+            break;
+        }
+        uint8_t ack[10] = { 0 };
+        uint16_t ack_len = 0;
+        uint8_t conf = 0xFF;
+        st = fp_sensor_recv_ack(t, s->address, ack, sizeof(ack), &ack_len, &conf, 400, true);
+        if (st == FP_SENSOR_TIMEOUT) {
+            continue;
+        }
+        if (st != FP_SENSOR_OK) {
+            fp_diag_err(FP_INS_AUTO_ID, conf, st);
+            (void)fp_sensor_cancel(t, s, &tmp);
+            res = FP_ERR_SENSOR;
+            break;
+        }
+        uint8_t step = ack_len >= 2 ? ack[1] : 0xFF;
+        if (conf == FP_CONF_OK) {
+            if (step == 0x05 && ack_len >= 4) {
+                *page_out = (uint16_t)((ack[2] << 8) | ack[3]);
+                res = FP_OK;
+                break;
+            }
+            continue;
+        }
+        if (step == 0x01 && is_retryable_capture_code(conf)) {
+            continue;
+        }
+        if (conf == FP_CONF_MOD_TIMEOUT) {
+            res = FP_ERR_TIMEOUT;
+            break;
+        }
+        if (conf == FP_CONF_NOT_FOUND || conf == FP_CONF_NO_MATCH ||
+            conf == FP_CONF_SLOT_EMPTY || conf == FP_CONF_LIB_EMPTY) {
+            fp_diag_err(FP_INS_AUTO_ID, conf, FP_SENSOR_OK);
+            res = FP_ERR_NO_MATCH;
+            break;
+        }
+        fp_diag_err(FP_INS_AUTO_ID, conf, FP_SENSOR_OK);
+        (void)fp_sensor_cancel(t, s, &tmp);
+        res = FP_ERR_SENSOR;
+        break;
+    }
+
+    waiting_finger = false;
+    return res;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -443,6 +687,8 @@ bool fp_get_wrap_secret(uint8_t secret8[8]) {
 void fp_init(void) {
     waiting_finger = false;
     last_sensor_detected = false;
+    use_auto_mode = false;
+    fp_diag_reset();
     if (!FP_FEATURE_ON) {
         return;
     }
@@ -500,6 +746,9 @@ void fp_get_status(fp_status_t *st) {
     st->enrolled = enrolled_count(&c);
     st->failed_attempts = c.fail_count;
     st->sensor_detected = last_sensor_detected;
+    st->last_step = last_err_ins;
+    st->last_conf = last_err_conf;
+    st->last_transport = last_err_transport;
     const char *pins = fp_uart_active_pins();
     if (pins != NULL) {
         snprintf(st->sensor_pins, sizeof(st->sensor_pins), "%s", pins);
@@ -522,6 +771,7 @@ fp_result_t fp_verify(uint32_t timeout_ms) {
     if (!FP_FEATURE_ON) {
         return FP_ERR_NOT_PAIRED;
     }
+    fp_diag_reset();
     fp_conf_t c;
     conf_load(&c);
     fp_result_t res = FP_OK;
@@ -545,34 +795,76 @@ fp_result_t fp_verify(uint32_t timeout_ms) {
 
     if (res == FP_OK) {
         fp_session_t s = session_of(&c);
+        uint16_t page = 0;
         fp_led_op_begin();
         sensor_led(s.address, FP_LED_FUNC_BREATHE, FP_LED_COLOR_BLUE, FP_LED_COLOR_BLUE, 0);
-        res = capture_to_buffer(&s, FP_BUF_1, timeout_ms);
-        if (res == FP_OK) {
-            uint8_t code = 0xFF;
-            uint16_t page = 0, score = 0;
-            fp_sensor_status_t st = fp_sensor_search(fp_uart_transport(), &s, FP_BUF_1, 0, c.capacity, &code, &page, &score);
-            if (st != FP_SENSOR_OK) {
-                res = FP_ERR_SENSOR;
-            }
-            else if (code == FP_CONF_NOT_FOUND) {
-                res = FP_ERR_NO_MATCH;
+
+        if (use_auto_mode) {
+            res = fp_verify_auto(&s, timeout_ms, &page);
+            if (res == FP_ERR_NO_MATCH) {
                 register_failure(&c, false);
             }
-            else if (code != FP_CONF_OK) {
-                res = FP_ERR_SENSOR;
+            else if (res == FP_OK) {
+                if (!slot_used(&c, page)) {
+                    res = FP_ERR_SENSOR_AUTH;
+                    register_failure(&c, true);
+                }
+                else {
+                    register_success(&c);
+                }
             }
-            else if (!slot_used(&c, page)) {
-                /* A template we did not enroll: the module content was changed. */
-                res = FP_ERR_SENSOR_AUTH;
-                register_failure(&c, true);
-            }
-            else {
-                register_success(&c);
+        }
+        else {
+            res = capture_to_buffer(&s, FP_BUF_1, timeout_ms);
+            if (res == FP_OK) {
+                uint8_t code = 0xFF;
+                uint16_t score = 0;
+                fp_sensor_status_t st = fp_sensor_search(fp_uart_transport(), &s, FP_BUF_1, 0, c.capacity, &code, &page, &score);
+                if (st != FP_SENSOR_OK) {
+                    fp_diag_err(FP_INS_SEARCH, code, st);
+                    res = FP_ERR_SENSOR;
+                }
+                else if (code == FP_CONF_ENC_MISMATCH) {
+                    /* R558-S has EncryptionLevel > 0: switch transparently to PS_AutoIdentify (0x32). */
+                    use_auto_mode = true;
+                    fp_diag_reset();
+                    res = fp_verify_auto(&s, timeout_ms, &page);
+                    if (res == FP_ERR_NO_MATCH) {
+                        register_failure(&c, false);
+                    }
+                    else if (res == FP_OK) {
+                        if (!slot_used(&c, page)) {
+                            res = FP_ERR_SENSOR_AUTH;
+                            register_failure(&c, true);
+                        }
+                        else {
+                            register_success(&c);
+                        }
+                    }
+                }
+                else if (code == FP_CONF_NOT_FOUND || code == FP_CONF_NO_MATCH ||
+                         code == FP_CONF_SLOT_EMPTY || code == FP_CONF_LIB_EMPTY) {
+                    fp_diag_err(FP_INS_SEARCH, code, FP_SENSOR_OK);
+                    res = FP_ERR_NO_MATCH;
+                    register_failure(&c, false);
+                }
+                else if (code != FP_CONF_OK) {
+                    fp_diag_err(FP_INS_SEARCH, code, FP_SENSOR_OK);
+                    res = FP_ERR_SENSOR;
+                }
+                else if (!slot_used(&c, page)) {
+                    /* A template we did not enroll: the module content was changed. */
+                    res = FP_ERR_SENSOR_AUTH;
+                    register_failure(&c, true);
+                }
+                else {
+                    register_success(&c);
+                }
             }
         }
         fp_led_op_end(res == FP_OK);
         if (res == FP_OK) {
+            fp_diag_reset();
             sensor_led(s.address, FP_LED_FUNC_FLASH, FP_LED_COLOR_GREEN, FP_LED_COLOR_GREEN, 2);
         }
         else if (c.flags & FP_FLAG_LOCKED) {
@@ -593,6 +885,7 @@ fp_result_t fp_pair(uint16_t *capacity_out) {
     if (!flash_requirement_met()) {
         return FP_ERR_NOT_SECURE;
     }
+    fp_diag_reset();
     fp_conf_t c;
     conf_load(&c);
     const fp_transport_t *t = fp_uart_transport();
@@ -742,6 +1035,7 @@ fp_result_t fp_enroll(uint16_t *slot_out) {
     if (!FP_FEATURE_ON) {
         return FP_ERR_NOT_PAIRED;
     }
+    fp_diag_reset();
     fp_conf_t c;
     conf_load(&c);
     fp_result_t res = FP_OK;
@@ -775,36 +1069,116 @@ fp_result_t fp_enroll(uint16_t *slot_out) {
     }
 
     if (res == FP_OK) {
+        const fp_transport_t *t = fp_uart_transport();
         fp_session_t s = session_of(&c);
-        sensor_led(s.address, FP_LED_FUNC_BREATHE, FP_LED_COLOR_BLUE, FP_LED_COLOR_BLUE, 0);
-        res = capture_to_buffer(&s, FP_BUF_1, FP_ENROLL_STEP_TIMEOUT_MS);
-        if (res == FP_OK) {
-            sensor_led(s.address, FP_LED_FUNC_ON, FP_LED_COLOR_CYAN, FP_LED_COLOR_CYAN, 0);
-            res = wait_finger_removed(&s, FP_ENROLL_STEP_TIMEOUT_MS);
+
+        if (use_auto_mode) {
+            res = fp_enroll_auto(&s, slot, 2);
         }
-        if (res == FP_OK) {
-            sensor_led(s.address, FP_LED_FUNC_BREATHE, FP_LED_COLOR_PURPLE, FP_LED_COLOR_BLUE, 0);
-            res = capture_to_buffer(&s, FP_BUF_2, FP_ENROLL_STEP_TIMEOUT_MS);
+        else {
+            uint8_t max_scans = 2;
+#if defined(ESP_PLATFORM)
+            max_scans = 4;
+#endif
+            fp_sysparam_t sp;
+            uint8_t sp_code = 0xFF;
+            if (fp_sensor_read_sysparam(t, s.address, &sp, &sp_code) == FP_SENSOR_OK && sp_code == FP_CONF_OK) {
+                if (sp.status_reg >= 2 && sp.status_reg <= 6 && sp.status_reg > max_scans) {
+                    max_scans = (uint8_t)sp.status_reg;
+                }
+            }
+
+            bool need_auto_fallback = false;
+            sensor_led(s.address, FP_LED_FUNC_BREATHE, FP_LED_COLOR_BLUE, FP_LED_COLOR_BLUE, 0);
+            res = capture_to_buffer(&s, FP_BUF_1, FP_ENROLL_STEP_TIMEOUT_MS);
+            if (res == FP_OK) {
+                sensor_led(s.address, FP_LED_FUNC_ON, FP_LED_COLOR_CYAN, FP_LED_COLOR_CYAN, 0);
+                res = wait_finger_removed(&s, FP_ENROLL_STEP_TIMEOUT_MS);
+            }
+            if (res == FP_OK) {
+                sensor_led(s.address, FP_LED_FUNC_BREATHE, FP_LED_COLOR_PURPLE, FP_LED_COLOR_BLUE, 0);
+                res = capture_to_buffer(&s, FP_BUF_2, FP_ENROLL_STEP_TIMEOUT_MS);
+            }
+
+            if (res == FP_OK) {
+                for (uint8_t scan = 2;; scan++) {
+                    uint8_t reg_code = 0xFF;
+                    fp_sensor_status_t rst = fp_sensor_reg_model(t, &s, &reg_code);
+                    if (rst != FP_SENSOR_OK) {
+                        fp_diag_err(FP_INS_REG_MODEL, reg_code, rst);
+                        res = FP_ERR_SENSOR;
+                        break;
+                    }
+                    if (reg_code == FP_CONF_OK) {
+                        res = FP_OK;
+                        break;
+                    }
+                    if (reg_code == FP_CONF_ENC_MISMATCH) {
+                        need_auto_fallback = true;
+                        break;
+                    }
+                    if (scan < max_scans) {
+                        /* R558-S EnrollTimes requires additional scans (e.g. 4-buffer merge). */
+                        sensor_led(s.address, FP_LED_FUNC_ON, FP_LED_COLOR_CYAN, FP_LED_COLOR_CYAN, 0);
+                        res = wait_finger_removed(&s, FP_ENROLL_STEP_TIMEOUT_MS);
+                        if (res != FP_OK) {
+                            break;
+                        }
+                        uint8_t next_color = (scan == 2) ? FP_LED_COLOR_YELLOW : FP_LED_COLOR_WHITE;
+                        sensor_led(s.address, FP_LED_FUNC_BREATHE, next_color, FP_LED_COLOR_BLUE, 0);
+                        res = capture_to_buffer(&s, (uint8_t)(scan + 1u), FP_ENROLL_STEP_TIMEOUT_MS);
+                        if (res != FP_OK) {
+                            break;
+                        }
+                        continue;
+                    }
+                    if (reg_code == FP_CONF_COMBINE_FAIL || reg_code == FP_CONF_POOR_TEMPLATE) {
+                        fp_diag_err(FP_INS_REG_MODEL, reg_code, FP_SENSOR_OK);
+                        res = FP_ERR_NO_MATCH;
+                    }
+                    else {
+                        fp_diag_err(FP_INS_REG_MODEL, reg_code, FP_SENSOR_OK);
+                        need_auto_fallback = true;
+                    }
+                    break;
+                }
+            }
+
+            if (res == FP_OK && !need_auto_fallback) {
+                uint8_t store_code = 0xFF;
+                fp_sensor_status_t st = fp_sensor_store(t, &s, FP_BUF_1, slot, &store_code);
+                if (st == FP_SENSOR_OK && store_code == FP_CONF_ENC_MISMATCH) {
+                    need_auto_fallback = true;
+                }
+                else if (st == FP_SENSOR_OK && store_code != FP_CONF_OK) {
+                    /* Ensure slot is clear in module flash (e.g. 0x22 occupied) and retry Store once. */
+                    uint8_t del_code = 0xFF;
+                    (void)fp_sensor_delete_chars(t, &s, slot, 1, &del_code);
+                    st = fp_sensor_store(t, &s, FP_BUF_1, slot, &store_code);
+                    if (st != FP_SENSOR_OK || store_code != FP_CONF_OK) {
+                        fp_diag_err(FP_INS_STORE, store_code, st);
+#if defined(ESP_PLATFORM)
+                        need_auto_fallback = true;
+#else
+                        res = FP_ERR_SENSOR;
+#endif
+                    }
+                }
+                else if (st != FP_SENSOR_OK) {
+                    fp_diag_err(FP_INS_STORE, store_code, st);
+                    res = FP_ERR_SENSOR;
+                }
+            }
+
+            if (need_auto_fallback) {
+                use_auto_mode = true;
+                fp_diag_reset();
+                sensor_led(s.address, FP_LED_FUNC_ON, FP_LED_COLOR_CYAN, FP_LED_COLOR_CYAN, 0);
+                (void)wait_finger_removed(&s, FP_ENROLL_STEP_TIMEOUT_MS);
+                res = fp_enroll_auto(&s, slot, 2);
+            }
         }
-        if (res == FP_OK) {
-            uint8_t code = 0xFF;
-            if (fp_sensor_reg_model(fp_uart_transport(), &s, &code) != FP_SENSOR_OK) {
-                res = FP_ERR_SENSOR;
-            }
-            else if (code == FP_CONF_COMBINE_FAIL || code == FP_CONF_POOR_TEMPLATE) {
-                res = FP_ERR_NO_MATCH;
-            }
-            else if (code != FP_CONF_OK) {
-                res = FP_ERR_SENSOR;
-            }
-        }
-        if (res == FP_OK) {
-            uint8_t code = 0xFF;
-            fp_sensor_status_t st = fp_sensor_store(fp_uart_transport(), &s, FP_BUF_1, slot, &code);
-            if (st != FP_SENSOR_OK || code != FP_CONF_OK) {
-                res = FP_ERR_SENSOR;
-            }
-        }
+
         if (res == FP_OK) {
             slot_set(&c, slot, true);
             if (!conf_save(&c)) {
@@ -815,6 +1189,7 @@ fp_result_t fp_enroll(uint16_t *slot_out) {
             }
         }
         if (res == FP_OK) {
+            fp_diag_reset();
             sensor_led(s.address, FP_LED_FUNC_FLASH, FP_LED_COLOR_GREEN, FP_LED_COLOR_GREEN, 3);
         }
         else if (res == FP_ERR_NO_MATCH) {
