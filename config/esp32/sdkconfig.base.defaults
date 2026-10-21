@@ -4,3 +4,13 @@ CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
 
 # Extra ESP-IDF stack headroom for app_main() (runs low_flash_init + picokey_init + fp_init)
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
+
+# Route ESP-IDF app console UART0 away from GPIO43/GPIO44 so the top-left TX (GP43) and RX (GP44)
+# pins on the ESP32-S3 Super Mini belong exclusively to GROW R558-S UART1 (57600 8N2), while keeping
+# UART0 active for QEMU serial boot verification.
+CONFIG_BOOTLOADER_LOG_LEVEL_WARN=y
+CONFIG_ESP_CONSOLE_UART_CUSTOM=y
+CONFIG_ESP_CONSOLE_UART_NUM=0
+CONFIG_ESP_CONSOLE_UART_TX_GPIO=46
+CONFIG_ESP_CONSOLE_UART_RX_GPIO=-1
+

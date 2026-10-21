@@ -22,7 +22,7 @@ Dieser Fork erweitert `polhenarejos/pico-fido` gezielt um **drei große Funktion
    - `main/pio_entry.c` + `main/CMakeLists.txt` + `main/idf_component.yml` (`zorxx/neopixel`) als ESP-IDF-Einstiegskomponente für PlatformIO.
    - `.github/workflows/platformio.yml` + `.github/scripts/merge_image.py` zum automatischen Erzeugen kompletter 4-MB-Flash-Images (`0x0`).
 2. **GROW R558-S Biometrie-Engine & Hardware-Treiber (`src/fido/fp_*`):**
-   - `fp_r558_uart.c`: ESP-IDF-UART1-Treiber (`57600 Baud, 8N2`, `TX = GPIO17`, `RX = GPIO18`) sowie TCP-Bridge für Hardware-in-the-Loop-/Emulations-Tests.
+   - `fp_r558_uart.c`: ESP-IDF-UART1-Treiber (`57600 Baud, 8N2`, `TX = GPIO43`, `RX = GPIO44`) sowie TCP-Bridge für Hardware-in-the-Loop-/Emulations-Tests.
    - `fp_r558_sensor.c`: Binärprotokoll des GROW R558-S (`0xEF01`-Header, `VfyPwd 0x13`, `SetPwd 0x12`, `ReadSysPara 0x0F`, `ReadIndexTable 0x1F`, `GetImage 0x01`, `GenChar 0x02`, `RegModel 0x05`, `StoreChar 0x06`, `SearchNow 0x3A`, `DeletChar 0x0C`, `Empty 0x0D`, sowie jetzt **`PS_ControlBLN 0x3C`** für den integrierten RGB-Ring des R558-S).
    - `fp_r558.c`: Sicherheits-Engine mit zufälligem 32-Bit-Sensorpasswort (Pairing), 5-Fehlversuchs-Lockout in Flash (`EF_FP_CONF = 0x1104`), Manipulationserkennung (Template-Bitmasken-Abgleich Sensor vs. ESP32-Flash) und verschlüsseltem Backup/Restore-Blob (`43 Byte`).
    - `fp_led.c`: Zustands-LED-Steuerung (Blau atmend = Warten auf Finger, Grün blinkend = Erfolg/Scan-Bestätigung, Rot blinkend = Fehler, Rot dauerhaft = Gesperrt).
@@ -104,8 +104,8 @@ Dabei zeigten sich **zwei katastrophale Showstopper beim Booten/Linken** (die ex
 | **Pin 1** | Rot | `V_Touch` (`VCC_3.3V`) | **`3V3` (3,3 V)** | **Pflicht!** Touch-Versorgung |
 | **Pin 2** | Gelb | `Touch_Out` (`Vout`) | *offen lassen (NC)* | Optionaler Touch-Ausgang |
 | **Pin 3** | Blau | `VCC` (`VCC_MCU`) | **`3V3` (3,3 V)** | **Pflicht!** Sensor-MCU + eingebauter RGB-Ring |
-| **Pin 4** | Grün | `TX` (`UART_TX`) | **`GPIO18`** | Sensor TX -> ESP32 RX |
-| **Pin 5** | Weiß | `RX` (`UART_RX`) | **`GPIO17`** | ESP32 TX -> Sensor RX |
+| **Pin 4** | Grün | `TX` (`UART_TX`) | **`RX / GPIO44`** | Sensor TX -> ESP32 RX |
+| **Pin 5** | Weiß | `RX` (`UART_RX`) | **`TX / GPIO43`** | ESP32 TX -> Sensor RX |
 | **Pin 6** | Schwarz | `GND` | **`GND`** | **Pflicht!** Masse |
 
 ### 3.2 Kompilieren & Flashen (Entwicklungsboard ohne eFuse-Verschlüsselung)

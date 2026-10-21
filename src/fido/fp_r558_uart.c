@@ -25,6 +25,7 @@
 #include "driver/uart.h"
 #include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #define FP_UART_RX_BUF 256
 
@@ -34,6 +35,8 @@ int fp_uart_init(void) {
     if (uart_ready) {
         return 0;
     }
+    gpio_reset_pin(FP_UART_TX_GPIO);
+    gpio_reset_pin(FP_UART_RX_GPIO);
     uart_config_t cfg = {
         .baud_rate = FP_UART_BAUD,
         .data_bits = UART_DATA_8_BITS,
@@ -49,9 +52,13 @@ int fp_uart_init(void) {
     if (uart_set_pin(FP_UART_NUM, FP_UART_TX_GPIO, FP_UART_RX_GPIO, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE) != ESP_OK) {
         return -1;
     }
+    (void)gpio_pullup_en(FP_UART_RX_GPIO);
     if (uart_driver_install(FP_UART_NUM, FP_UART_RX_BUF, 0, 0, NULL, 0) != ESP_OK) {
         return -1;
     }
+    /* Let UART line settle idle-high after ROM boot before first R558-S packet. */
+    vTaskDelay(pdMS_TO_TICKS(50));
+    (void)uart_flush_input(FP_UART_NUM);
     uart_ready = true;
     return 0;
 }

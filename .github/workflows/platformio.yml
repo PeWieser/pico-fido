@@ -305,6 +305,34 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           ls -la out
 
+      - name: Publish CORS-enabled firmware mirror branch (firmware-dist)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.names.outputs.tag }}
+          VER: ${{ steps.names.outputs.ver }}
+          SHORT: ${{ steps.names.outputs.short }}
+        run: |
+          set -e
+          WORK=$(mktemp -d)
+          REMOTE="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          if git ls-remote --heads "$REMOTE" firmware-dist | grep -q firmware-dist; then
+            git clone --depth 1 --branch firmware-dist "$REMOTE" "$WORK"
+          else
+            git init "$WORK"
+            git -C "$WORK" checkout --orphan firmware-dist
+            git -C "$WORK" remote add origin "$REMOTE"
+          fi
+          mkdir -p "$WORK/$TAG"
+          cp out/pico-fido-esp32s3-${VER}-${SHORT}.bin "$WORK/$TAG/"
+          cp out/pico-fido-esp32s3-dev-${VER}-${SHORT}.bin "$WORK/$TAG/"
+          cp out/SHA256SUMS.txt "$WORK/$TAG/"
+          git -C "$WORK" config user.name "github-actions[bot]"
+          git -C "$WORK" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C "$WORK" add -A
+          git -C "$WORK" commit -m "Publish CORS-enabled firmware assets for ${TAG}" --allow-empty
+          git -C "$WORK" push origin firmware-dist
+
       - name: Create release
         shell: bash
         env:
@@ -313,15 +341,19 @@ jobs:
           VER: ${{ steps.names.outputs.ver }}
           SHORT: ${{ steps.names.outputs.short }}
         run: |
+          SUMS_CONTENT=$(cat out/SHA256SUMS.txt)
           cat > notes.md <<EOF
-          Pico FIDO Firmware **${VER}** für ESP32-S3 + GROW R558-S (Commit \`${GITHUB_SHA}\`).
+          Pico FIDO Firmware **${VER}** für ESP32-S3 Super Mini + GROW R558-S (Commit \`${GITHUB_SHA}\`, R558-S an \`TX = GPIO43\` / \`RX = GPIO44\`).
 
           Zwei vollständige 4-MB-Flash-Images (Bootloader + Partitionstabelle \`part0\` + App, Flashen ab Adresse **\`0x0\`**, SPI-Modus \`DIO\`):
 
           - \`pico-fido-esp32s3-dev-${VER}-${SHORT}.bin\` — **Entwicklung (\`buildType = "dev"\`):** Für Standard-Entwicklungsboards / ESP32-S3 Super Mini **ohne** gebrannte Flash-Verschlüsselungs-eFuses. Pairing & Restore sind direkt in der Webapp freigeschaltet.
           - \`pico-fido-esp32s3-${VER}-${SHORT}.bin\` — **Produktiv (\`buildType = "prod"\`):** Erfordert aktive Hardware-Flash-Verschlüsselung am Chip (\`flashEncrypted = true\`). Ohne aktive eFuse-Verschlüsselung lehnt die Firmware Pairing & Restore ab.
 
-          Prüfsummen stehen in \`SHA256SUMS.txt\`.
+          ### SHA-256 Prüfsummen
+          \`\`\`text
+          ${SUMS_CONTENT}
+          \`\`\`
           Verdrahtung & WebApp-Dokumentation: \`docs/DIAGNOSE_UND_ARCHITEKTUR.md\`, \`docs/fingerprint/WEBAPP_PROMPT.md\`, \`docs/release/WEBAPP_FIRMWARE_PROMPT.md\`.
           EOF
           sed -i 's/^          //' notes.md
