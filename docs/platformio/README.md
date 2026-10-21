@@ -97,8 +97,8 @@ Der **GROW R558-S** besitzt einen **6-poligen MX-1,25-mm-Stecker** mit **zwei ge
 | **Pin 1** | Rot (oder Pin 1 Markierung) | **`V_Touch` / `VCC_3.3V`** | **`3V3` (3,3 V)** | Dauerhafte 3,3-V-Speisung des Touch-Detektors (**Pflicht!**) |
 | **Pin 2** | Gelb | **`Touch_Out` (`Vout`)** | *offen lassen (NC)* | Touch-IRQ-Ausgang (High bei Berührung, optional) |
 | **Pin 3** | Blau | **`VCC` / `VCC_MCU`** | **`3V3` (3,3 V)** | **Hauptstromversorgung Sensor-MCU & eingebauter RGB-Ring (Pflicht!)** |
-| **Pin 4** | Grün | **`TX` (`UART_TX`)** | **`GPIO18`** (`FP_UART_RX_GPIO`) | Sensor sendet -> ESP32-S3 empfängt (3,3-V-Logik) |
-| **Pin 5** | Weiß | **`RX` (`UART_RX`)** | **`GPIO17`** (`FP_UART_TX_GPIO`) | ESP32-S3 sendet -> Sensor empfängt (3,3-V-Logik) |
+| **Pin 4** | Grün | **`TX` (`UART_TX`)** | **`RX / GPIO44`** (`FP_UART_RX_GPIO`) | Sensor sendet -> ESP32-S3 empfängt (3,3-V-Logik) |
+| **Pin 5** | Weiß | **`RX` (`UART_RX`)** | **`TX / GPIO43`** (`FP_UART_TX_GPIO`) | ESP32-S3 sendet -> Sensor empfängt (3,3-V-Logik) |
 | **Pin 6** | Schwarz | **`GND`** | **`GND`** | Gemeinsame Masse (**Pflicht!**) |
 
 **LED-Ansteuerung (dreifach unterstützt — out of the box ohne Zusatzbauteil):**
