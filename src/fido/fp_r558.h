@@ -71,6 +71,9 @@ typedef struct {
     bool flash_encrypted;  /* ESP32 flash encryption active (R1) */
     bool sensor_detected;  /* live R558-S answered on UART */
     char sensor_pins[48];  /* e.g. "TX=GPIO1, RX=GPIO2 (57600 8N2)" */
+    uint8_t last_step;     /* last failing R558-S instruction opcode (0 if none) */
+    uint8_t last_conf;     /* last failing R558-S confirmation code (0 if OK) */
+    uint8_t last_transport;/* last failing fp_sensor_status_t (0 = FP_SENSOR_OK) */
 } fp_status_t;
 
 /* Call once at boot (after the file system is scanned). Initialises UART and loads configuration. */

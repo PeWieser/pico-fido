@@ -43,19 +43,26 @@
 #define FP_PID_ACK              0x07
 #define FP_PID_END_DATA         0x08
 
-/* Instruction codes (ZFM/R558 family). */
+/* Instruction codes (ZFM/R558 family, R558-S User Manual V1.1 p. 9). */
 #define FP_INS_GEN_IMG          0x01
 #define FP_INS_IMG_2_TZ         0x02
+#define FP_INS_MATCH            0x03
 #define FP_INS_SEARCH           0x04
 #define FP_INS_REG_MODEL        0x05
 #define FP_INS_STORE            0x06
+#define FP_INS_LOAD_CHAR        0x07
 #define FP_INS_DELET_CHAR       0x0C
 #define FP_INS_EMPTY            0x0D
-#define FP_INS_TEMPLATE_NUM     0x1D
+#define FP_INS_WRITE_REG        0x0E
 #define FP_INS_READ_SYS_PARA    0x0F
 #define FP_INS_SET_PWD          0x12
 #define FP_INS_VFY_PWD          0x13
 #define FP_INS_SET_CHIP_ADDR    0x15
+#define FP_INS_TEMPLATE_NUM     0x1D
+#define FP_INS_GET_ENROLL_IMG   0x29
+#define FP_INS_CANCEL           0x30
+#define FP_INS_AUTO_ENROLL      0x31
+#define FP_INS_AUTO_ID          0x32
 #define FP_INS_CONTROL_BLN      0x3C
 
 /* R558-S built-in RGB ring LED modes (PS_ControlBLN, datasheet p. 27-29). */
@@ -77,25 +84,46 @@
 #define FP_LED_COLOR_YELLOW     0x06
 #define FP_LED_COLOR_WHITE      0x07
 
-/* Confirmation codes. */
+/* Confirmation codes (GROW R558-S User Manual V1.1 p. 10-11). */
 #define FP_CONF_OK              0x00
 #define FP_CONF_PACKET_ERR      0x01
 #define FP_CONF_NO_FINGER       0x02
 #define FP_CONF_CAPTURE_FAIL    0x03
+#define FP_CONF_IMG_DRY         0x04  /* R558-S: fingerprint image too dry / faint */
+#define FP_CONF_IMG_WET         0x05  /* R558-S: fingerprint image too wet / mushy */
 #define FP_CONF_IMG_MESSY       0x06
 #define FP_CONF_IMG_FEW_POINTS  0x07
-#define FP_CONF_NO_MATCH        0x08  /* 1:1 match failed */
+#define FP_CONF_NO_MATCH        0x08  /* 1:1 match / GenChar similarity check failed */
 #define FP_CONF_NOT_FOUND       0x09  /* search: no template found */
-#define FP_CONF_COMBINE_FAIL    0x0A  /* classic ZFM merge failure */
+#define FP_CONF_COMBINE_FAIL    0x0A  /* feature merge failure */
 #define FP_CONF_PAGE_RANGE      0x0B
 #define FP_CONF_NO_IMAGE_BUF    0x15
+#define FP_CONF_RESIDUAL        0x17  /* R558-S: residual finger / finger not moved */
 #define FP_CONF_FLASH_ERR       0x18
 #define FP_CONF_WRONG_PWD       0x13
-#define FP_CONF_SMALL_AREA      0x33  /* R558-S: small image area on capacitive pad */
-#define FP_CONF_POOR_TEMPLATE   0x3B  /* R558-S: poor template quality / merge failure (RegModel 0x05) */
+#define FP_CONF_LIB_FULL        0x1F
+#define FP_CONF_SLOT_NOT_EMPTY  0x22  /* R558-S: template slot already occupied */
+#define FP_CONF_SLOT_EMPTY      0x23  /* R558-S: template slot empty */
+#define FP_CONF_LIB_EMPTY       0x24  /* R558-S: fingerprint library empty */
+#define FP_CONF_ENTRY_COUNT_ERR 0x25  /* R558-S: EnrollTimes entry count mismatch */
+#define FP_CONF_MOD_TIMEOUT     0x26  /* R558-S: internal command timeout */
+#define FP_CONF_ALREADY_ENROLLED 0x27 /* R558-S: duplicate finger already registered */
+#define FP_CONF_AREA_OVERLAP    0x28  /* R558-S: excessive overlap with previous scan */
+#define FP_CONF_ENC_MISMATCH    0x31  /* R558-S: function blocked by encryption level -> use 0x31/0x32 */
+#define FP_CONF_SMALL_AREA      0x33  /* R558-S: small contact area on capacitive pad */
+#define FP_CONF_FOREIGN_IMG     0x34  /* R558-S: static foreign object in image */
+#define FP_CONF_ILLEGAL_DATA    0x35  /* R558-S: illegal data during feature/template op */
+#define FP_CONF_REVERSE_MOULD   0x36  /* R558-S: reverse mould */
+#define FP_CONF_FOREIGN_STATIC  0x37  /* R558-S: static foreign object in feature */
+#define FP_CONF_FOREIGN_DYN     0x38  /* R558-S: dynamic foreign object in feature */
+#define FP_CONF_POOR_TEMPLATE   0x3B  /* R558-S: poor template quality / merge failure */
 
 #define FP_BUF_1                0x01
 #define FP_BUF_2                0x02
+#define FP_BUF_3                0x03
+#define FP_BUF_4                0x04
+#define FP_BUF_5                0x05
+#define FP_BUF_6                0x06
 
 typedef struct fp_transport {
     void *ctx;
@@ -132,6 +160,15 @@ typedef struct fp_session {
     uint8_t password[4];
 } fp_session_t;
 
+/* Sends a single command frame without waiting for an acknowledge packet (used by multi-ack AutoEnroll/AutoIdentify). */
+fp_sensor_status_t fp_sensor_send_cmd(const fp_transport_t *t, uint32_t addr, uint8_t ins,
+                                      const uint8_t *params, uint16_t params_len);
+
+/* Waits for and validates one acknowledge packet (PID 0x07). */
+fp_sensor_status_t fp_sensor_recv_ack(const fp_transport_t *t, uint32_t expected_addr,
+                                      uint8_t *out, uint16_t out_cap, uint16_t *out_len,
+                                      uint8_t *code, uint32_t timeout_ms, bool check_address);
+
 /*
  * Sends one command and waits for its acknowledge packet.
  * On a valid frame the full ack payload (confirmation code first) is copied to out.
@@ -164,6 +201,7 @@ fp_sensor_status_t fp_sensor_store(const fp_transport_t *t, const fp_session_t *
 fp_sensor_status_t fp_sensor_delete_chars(const fp_transport_t *t, const fp_session_t *s, uint16_t page_id, uint16_t count, uint8_t *code);
 fp_sensor_status_t fp_sensor_empty(const fp_transport_t *t, const fp_session_t *s, uint8_t *code);
 fp_sensor_status_t fp_sensor_template_num(const fp_transport_t *t, const fp_session_t *s, uint16_t *count, uint8_t *code);
+fp_sensor_status_t fp_sensor_cancel(const fp_transport_t *t, const fp_session_t *s, uint8_t *code);
 fp_sensor_status_t fp_sensor_control_led(const fp_transport_t *t, uint32_t addr,
                                          uint8_t func, uint8_t start_color, uint8_t end_color,
                                          uint8_t cycles, uint8_t *code);

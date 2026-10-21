@@ -54,16 +54,17 @@ void mbedtls_platform_zeroize(void *buf, size_t len) { memset(buf, 0, len); }
 
 /* ---------------- simulated module ---------------- */
 
-#define SCHED_MAX 16
+#define SCHED_MAX 32
 typedef struct {
     uint32_t address;
     uint8_t password[4];
     int password_set;
     int session_verified;
     uint16_t capacity;
+    uint16_t enroll_times;
     int used[256];
     int templ[256];
-    int buf[3];
+    int buf[8];
     int last_finger;
     int sched[SCHED_MAX];   /* finger shown at each GenImg: -1 = none */
     int sched_len, sched_pos;
@@ -72,6 +73,11 @@ typedef struct {
     int calls_genimg;
     uint8_t last_led_func, last_led_start, last_led_end, last_led_cycles;
     int poor_template_on_reg;
+    uint8_t img2tz_transient_seq[8];
+    int img2tz_transient_len, img2tz_transient_pos;
+    int require_4_scans;
+    int encrypted_mode_31;
+    int auto_finger;
 } module_t;
 
 static module_t mod_a, mod_b;
@@ -99,7 +105,7 @@ static void reply(const module_t *m, uint32_t addr, uint8_t code, const uint8_t 
 }
 
 /* Synthesises the acknowledge for one command and places it into the rx queue of the transport. */
-static uint8_t rx_pkt[256];
+static uint8_t rx_pkt[1024];
 static size_t rx_len = 0, rx_pos = 0;
 
 static void send_ack(uint32_t addr, const uint8_t *payload, uint16_t plen) {
@@ -126,8 +132,12 @@ static void module_command(module_t *m, const uint8_t *cmd, size_t n) {
     }
     switch (ins) {
         case FP_INS_READ_SYS_PARA: {
-            /* status(2) sysid(2) capacity(2) security(2) address(4) packet size(2) baud(2); the confirmation code is added by reply() */
-            uint8_t d[16] = { 0, 0, 0, 9, (uint8_t)(m->capacity >> 8), (uint8_t)m->capacity, 0, 3, 0, 0, 0, 0, 0, 2, 0, 6 };
+            /* status/EnrollTimes(2) sysid(2) capacity(2) security(2) address(4) packet size(2) baud(2) */
+            uint8_t d[16] = {
+                (uint8_t)(m->enroll_times >> 8), (uint8_t)m->enroll_times,
+                0, 9, (uint8_t)(m->capacity >> 8), (uint8_t)m->capacity,
+                0, 3, 0, 0, 0, 0, 0, 2, 0, 6
+            };
             d[8] = (uint8_t)(m->address >> 24); d[9] = (uint8_t)(m->address >> 16); d[10] = (uint8_t)(m->address >> 8); d[11] = (uint8_t)m->address;
             reply(m, addr, 0x00, d, 16, out, &ol); break;
         }
@@ -161,10 +171,23 @@ static void module_command(module_t *m, const uint8_t *cmd, size_t n) {
             break;
         }
         case FP_INS_IMG_2_TZ:
+            if (p[0] >= 2 && m->img2tz_transient_pos < m->img2tz_transient_len) {
+                reply(m, addr, m->img2tz_transient_seq[m->img2tz_transient_pos++], NULL, 0, out, &ol);
+                break;
+            }
             m->buf[p[0]] = m->last_finger;
             reply(m, addr, 0x00, NULL, 0, out, &ol); break;
         case FP_INS_REG_MODEL:
             if (m->poor_template_on_reg) { reply(m, addr, FP_CONF_POOR_TEMPLATE, NULL, 0, out, &ol); }
+            else if (m->require_4_scans) {
+                if (m->buf[3] == 0 || m->buf[4] == 0) {
+                    reply(m, addr, FP_CONF_ENTRY_COUNT_ERR, NULL, 0, out, &ol);
+                }
+                else {
+                    bool same = m->buf[1] == m->buf[2] && m->buf[1] == m->buf[3] && m->buf[1] == m->buf[4];
+                    reply(m, addr, same ? 0x00 : 0x0A, NULL, 0, out, &ol);
+                }
+            }
             else { reply(m, addr, m->buf[1] == m->buf[2] ? 0x00 : 0x0A, NULL, 0, out, &ol); }
             break;
         case FP_INS_CONTROL_BLN:
@@ -175,11 +198,19 @@ static void module_command(module_t *m, const uint8_t *cmd, size_t n) {
             reply(m, addr, 0x00, NULL, 0, out, &ol);
             break;
         case FP_INS_STORE: {
+            if (m->encrypted_mode_31) {
+                reply(m, addr, FP_CONF_ENC_MISMATCH, NULL, 0, out, &ol);
+                break;
+            }
             uint16_t page = (uint16_t)((p[1] << 8) | p[2]);
             m->templ[page] = m->buf[p[0]]; m->used[page] = 1;
             reply(m, addr, 0x00, NULL, 0, out, &ol); break;
         }
         case FP_INS_SEARCH: {
+            if (m->encrypted_mode_31) {
+                reply(m, addr, FP_CONF_ENC_MISMATCH, NULL, 0, out, &ol);
+                break;
+            }
             uint16_t start = (uint16_t)((p[1] << 8) | p[2]);
             uint16_t count = (uint16_t)((p[3] << 8) | p[4]);
             int found = -1;
@@ -193,6 +224,49 @@ static void module_command(module_t *m, const uint8_t *cmd, size_t n) {
             }
             break;
         }
+        case FP_INS_AUTO_ENROLL: {
+            uint16_t page = (uint16_t)((p[0] << 8) | p[1]);
+            /* Stream exact R558-S V1.1 Manual p. 31-33 multi-packet ACK sequence into UART rx buffer. */
+            const uint8_t steps[][3] = {
+                { 0x00, 0x00, 0x00 }, /* validity check OK */
+                { 0x00, 0x01, 0x01 }, /* collect image #1 */
+                { 0x00, 0x02, 0x01 }, /* gen feature #1 */
+                { 0x00, 0x03, 0x01 }, /* finger lifted after #1 */
+                { FP_CONF_RESIDUAL, 0x01, 0x02 }, /* realistic capacitive transient on scan #2 */
+                { 0x00, 0x01, 0x02 }, /* collect image #2 */
+                { 0x00, 0x02, 0x02 }, /* gen feature #2 */
+                { 0x00, 0x04, 0xF0 }, /* merge template OK */
+                { 0x00, 0x05, 0xF1 }, /* dup check OK */
+                { 0x00, 0x06, 0xF2 }, /* template stored OK */
+            };
+            m->templ[page] = m->auto_finger;
+            m->used[page] = 1;
+            for (size_t i = 0; i < sizeof(steps) / sizeof(steps[0]); i++) {
+                send_ack(addr, steps[i], 3);
+            }
+            return;
+        }
+        case FP_INS_AUTO_ID: {
+            int found = -1;
+            for (int i = 0; i < 256; i++) {
+                if (m->used[i] && m->templ[i] == m->auto_finger) { found = i; break; }
+            }
+            const uint8_t ack0[6] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+            const uint8_t ack1[6] = { 0x00, 0x01, 0x00, 0x00, 0x00, 0x00 };
+            send_ack(addr, ack0, 6);
+            send_ack(addr, ack1, 6);
+            if (found >= 0) {
+                uint8_t ack5[6] = { 0x00, 0x05, (uint8_t)(found >> 8), (uint8_t)found, 0x00, 100 };
+                send_ack(addr, ack5, 6);
+            }
+            else {
+                uint8_t ack_miss[6] = { FP_CONF_NOT_FOUND, 0x05, 0x00, 0x00, 0x00, 0x00 };
+                send_ack(addr, ack_miss, 6);
+            }
+            return;
+        }
+        case FP_INS_CANCEL:
+            reply(m, addr, 0x00, NULL, 0, out, &ol); break;
         case FP_INS_DELET_CHAR: {
             uint16_t page = (uint16_t)((p[0] << 8) | p[1]);
             uint16_t count = (uint16_t)((p[2] << 8) | p[3]);
@@ -482,6 +556,50 @@ int main(void) {
     mod_a.present = 1;
     mod_a.session_verified = 0;
     CHECK(fp_probe(), "fp_probe re-detects live hot-plugged sensor");
+
+    /* 18. Real R558-S capacitive transient codes on Scan #2 (0x28 overlap, 0x08 partial mismatch,
+     *     0x17 residual, 0x35 illegal data, 0x04 dry) retry cleanly instead of aborting with FP_ERR_SENSOR. */
+    mod_a.img2tz_transient_seq[0] = FP_CONF_AREA_OVERLAP;
+    mod_a.img2tz_transient_seq[1] = FP_CONF_NO_MATCH;
+    mod_a.img2tz_transient_seq[2] = FP_CONF_RESIDUAL;
+    mod_a.img2tz_transient_seq[3] = FP_CONF_ILLEGAL_DATA;
+    mod_a.img2tz_transient_seq[4] = FP_CONF_IMG_DRY;
+    mod_a.img2tz_transient_len = 5;
+    mod_a.img2tz_transient_pos = 0;
+    sched_set(8, 11, -1, 11, 11, 11, 11, 11, 11);
+    CHECK(fp_enroll(&slot) == FP_OK && slot == 0,
+          "fp_enroll retries capacitive R558-S Scan #2 codes (0x28/0x08/0x17/0x35/0x04) and succeeds");
+    mod_a.img2tz_transient_len = 0;
+
+    /* 19. R558-S 4-buffer EnrollTimes=4 mode (RegModel returns 0x25 until Buf1..Buf4 populated). */
+    mod_a.enroll_times = 4;
+    mod_a.require_4_scans = 1;
+    sched_set(7, 22, -1, 22, -1, 22, -1, 22);
+    CHECK(fp_enroll(&slot) == FP_OK && slot == 1,
+          "fp_enroll completes 4-buffer R558-S enrollment when EnrollTimes=4");
+    sched_set(1, 22);
+    CHECK(fp_verify(500) == FP_OK, "fp_verify matches template enrolled via 4-buffer synthesis");
+    mod_a.enroll_times = 0;
+    mod_a.require_4_scans = 0;
+
+    /* 20. Encrypted R558-S mode (0x31 FP_CONF_ENC_MISMATCH) automatic fallback to PS_AutoEnroll (0x31)
+     *     and PS_AutoIdentify (0x32), plus live error diagnostic status fields. */
+    reset_all();
+    mod_a.encrypted_mode_31 = 1;
+    mod_a.auto_finger = 77;
+    fp_init();
+    CHECK(fp_pair(&cap) == FP_OK, "fp_pair succeeds on encrypted R558-S module");
+    sched_set(4, 77, -1, 77, -1);
+    CHECK(fp_enroll(&slot) == FP_OK && slot == 0,
+          "fp_enroll transparently falls back to PS_AutoEnroll (0x31) when Store returns 0x31");
+    CHECK(fp_verify(500) == FP_OK,
+          "fp_verify transparently verifies via PS_AutoIdentify (0x32)");
+    mod_a.auto_finger = 99;
+    CHECK(fp_verify(500) == FP_ERR_NO_MATCH,
+          "PS_AutoIdentify (0x32) rejects non-matching finger with FP_ERR_NO_MATCH");
+    fp_get_status(&st);
+    CHECK(st.last_step == FP_INS_AUTO_ID && st.last_conf == FP_CONF_NOT_FOUND && st.last_transport == 0,
+          "fp_get_status exposes exact live failing opcode & R558-S confirmation code");
 
     if (failures) {
         printf("%d FAILURE(S)\n", failures);
