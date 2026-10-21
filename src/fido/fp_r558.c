@@ -232,8 +232,10 @@ static void register_success(fp_conf_t *c) {
 }
 
 static bool last_sensor_detected = false;
+static bool sensor_probed_once = false;
 
 static void probe_and_init_sensor(const fp_conf_t *c) {
+    sensor_probed_once = true;
     uint32_t hint_addr = (c->flags & (FP_FLAG_PAIRED | FP_FLAG_STAGED)) ? c->address : 0;
     fp_uart_scan_pins(hint_addr);
 
@@ -489,6 +491,9 @@ void fp_get_status(fp_status_t *st) {
     }
     fp_conf_t c;
     conf_load(&c);
+    if (!sensor_probed_once) {
+        probe_and_init_sensor(&c);
+    }
     st->paired = (c.flags & FP_FLAG_PAIRED) != 0;
     st->locked = (c.flags & FP_FLAG_LOCKED) != 0;
     st->capacity = c.capacity;

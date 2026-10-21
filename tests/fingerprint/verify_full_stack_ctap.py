@@ -52,6 +52,7 @@ class VirtualR558Sensor:
         self.address = 0xFFFFFFFF
         self.password = b"\x00\x00\x00\x00"
         self.password_set = False
+        self.session_verified = False
         self.capacity = 100  # R558-S datasheet p. 6: 100 templates
         self.templates: dict[int, int] = {}
         self.buffers: dict[int, int] = {1: -1, 2: -1, 3: -1}
@@ -132,6 +133,10 @@ class VirtualR558Sensor:
             p = body[1:]
             reply_addr = addr
 
+            # Real GROW R558-S silicon rejects non-VfyPwd commands until VfyPwd succeeds in session
+            if ins != 0x13 and not self.session_verified:
+                return self._encode_ack(reply_addr, b"\x01")
+
             if ins == 0x0F:  # ReadSysPara
                 data = struct.pack(">HHHHIBBH", 0, 9, self.capacity, 3, self.address, 0, 2, 6)
                 payload = b"\x00" + data
@@ -141,8 +146,10 @@ class VirtualR558Sensor:
                 payload = b"\x00"
             elif ins == 0x13:  # VfyPwd
                 if self.password_set and p[:4] != self.password:
+                    self.session_verified = False
                     payload = b"\x13"
                 else:
+                    self.session_verified = True
                     payload = b"\x00"
             elif ins == 0x15:  # SetChipAddr (R558-S manual p. 30: ACK uses NEW address!)
                 new_addr = struct.unpack(">I", p[:4])[0]
@@ -272,7 +279,10 @@ def main() -> int:
 
         print("2. Pairing GROW R558-S & checking built-in RGB ring LED (0x3C) ...", flush=True)
         st = send_vendor_fp(ctap, 1)
-        assert st[1] is False and st[6] is True and st[7] is False and st[8] == "dev"
+        assert st[1] is False and st[6] is True and st[7] is False and st[8] == "dev" and st[9] is True
+        assert (0x02, 0x01, 0x01, 2) in sensor.led_history, f"expected blue 2x boot flash after VfyPwd, got {sensor.led_history}"
+        probe_st = send_vendor_fp(ctap, 8)
+        assert probe_st[9] is True and isinstance(probe_st[10], str) and len(probe_st[10]) > 0
         sensor.led_history.clear()
         tok = cp.get_pin_token("246810", permissions=ClientPin.PERMISSION.AUTHENTICATOR_CFG)
         pair_res = send_vendor_fp(ctap, 2, pin_token=tok)

@@ -23,7 +23,7 @@
 /* ------------------------------------------------------------------------- */
 /* ESP32 implementation via the ESP-IDF UART driver (multi-pin auto-detect)  */
 /* ------------------------------------------------------------------------- */
-#if defined(ENABLE_R558_FINGERPRINT) && defined(ESP_PLATFORM)
+#if defined(ESP_PLATFORM)
 
 #include <stdio.h>
 #include <string.h>
@@ -66,7 +66,7 @@ static int esp_uart_write(void *ctx, const uint8_t *buf, size_t len) {
     if (n < 0 || (size_t)n != len) {
         return -1;
     }
-    return uart_wait_tx_done(FP_UART_NUM, pdMS_TO_TICKS(100)) == ESP_OK ? 0 : -1;
+    return uart_wait_tx_done(FP_UART_NUM, pdMS_TO_TICKS(200)) == ESP_OK ? 0 : -1;
 }
 
 static int esp_uart_read(void *ctx, uint8_t *buf, size_t max_len, uint32_t timeout_ms) {
@@ -78,7 +78,8 @@ static int esp_uart_read(void *ctx, uint8_t *buf, size_t max_len, uint32_t timeo
     if (ticks == 0 && timeout_ms > 0) {
         ticks = 1;
     }
-    return uart_read_bytes(FP_UART_NUM, buf, (uint32_t)max_len, ticks);
+    int r = uart_read_bytes(FP_UART_NUM, buf, (uint32_t)max_len, ticks);
+    return r < 0 ? -1 : r;
 }
 
 static void esp_uart_flush(void *ctx) {
@@ -88,7 +89,7 @@ static void esp_uart_flush(void *ctx) {
     }
 }
 
-static const fp_transport_t transport_instance = {
+static const fp_transport_t uart_transport = {
     .ctx = NULL,
     .write = esp_uart_write,
     .read = esp_uart_read,
@@ -127,17 +128,17 @@ static bool configure_uart_channel(int tx_gpio, int rx_gpio, int baud, uart_stop
     if (uart_set_pin(FP_UART_NUM, tx_gpio, rx_gpio, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE) != ESP_OK) {
         return false;
     }
-    gpio_pullup_en((gpio_num_t)rx_gpio);
+    (void)gpio_pullup_en((gpio_num_t)rx_gpio);
     cur_tx_gpio = tx_gpio;
     cur_rx_gpio = rx_gpio;
-    uart_flush_input(FP_UART_NUM);
+    (void)uart_flush_input(FP_UART_NUM);
     return true;
 }
 
 static bool probe_address_once(uint32_t addr, uint32_t timeout_ms) {
     const uint8_t zero_pwd[4] = { 0, 0, 0, 0 };
     uint8_t code = 0xFF;
-    return fp_sensor_txn(&transport_instance, addr, FP_INS_VFY_PWD,
+    return fp_sensor_txn(&uart_transport, addr, FP_INS_VFY_PWD,
                          zero_pwd, sizeof(zero_pwd), NULL, 0, NULL,
                          &code, timeout_ms, false) == FP_SENSOR_OK;
 }
@@ -211,133 +212,177 @@ const char *fp_uart_active_pins(void) {
     return active_desc;
 }
 
-/* ------------------------------------------------------------------------- */
-/* Emulation: Unix stream socket path from $PICO_FIDO_R558_SOCK (optional)   */
-/* ------------------------------------------------------------------------- */
-#elif defined(ENABLE_R558_FINGERPRINT) && defined(ENABLE_EMULATION)
+const fp_transport_t *fp_uart_transport(void) {
+    return &uart_transport;
+}
 
+/* ------------------------------------------------------------------------- */
+/* Emulation: TCP stream socket port from $PICO_FIDO_R558_PORT               */
+/* ------------------------------------------------------------------------- */
+#elif defined(ENABLE_EMULATION) && (defined(__linux__) || defined(__APPLE__))
+
+#include <arpa/inet.h>
 #include <errno.h>
 #include <poll.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
-#include <sys/un.h>
-#include <time.h>
 #include <unistd.h>
 
-static int sock_fd = -1;
+static int emu_fd = -1;
 
-static int emu_write(void *ctx, const uint8_t *buf, size_t len) {
-    (void)ctx;
-    if (sock_fd < 0) {
+static int emu_ensure_conn(void) {
+    if (emu_fd >= 0) {
+        return emu_fd;
+    }
+    const char *port_s = getenv("PICO_FIDO_R558_PORT");
+    if (port_s == NULL || port_s[0] == '\0') {
         return -1;
     }
-    size_t off = 0;
-    while (off < len) {
-        ssize_t n = send(sock_fd, buf + off, len - off, MSG_NOSIGNAL);
-        if (n < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            return -1;
-        }
-        off += (size_t)n;
-    }
-    return 0;
-}
-
-static int emu_read(void *ctx, uint8_t *buf, size_t max_len, uint32_t timeout_ms) {
-    (void)ctx;
-    if (sock_fd < 0) {
+    int port = atoi(port_s);
+    if (port <= 0 || port > 65535) {
         return -1;
     }
-    struct pollfd pfd = { .fd = sock_fd, .events = POLLIN };
-    int pr;
-    do {
-        pr = poll(&pfd, 1, (int)timeout_ms);
-    } while (pr < 0 && errno == EINTR);
-    if (pr <= 0) {
-        return pr == 0 ? 0 : -1;
-    }
-    ssize_t n;
-    do {
-        n = recv(sock_fd, buf, max_len, 0);
-    } while (n < 0 && errno == EINTR);
-    return n <= 0 ? -1 : (int)n;
-}
-
-static void emu_flush(void *ctx) {
-    (void)ctx;
-    if (sock_fd < 0) {
-        return;
-    }
-    uint8_t sink[64];
-    while (recv(sock_fd, sink, sizeof(sink), MSG_DONTWAIT) > 0) {
-    }
-}
-
-int fp_uart_init(void) {
-    const char *path = getenv("PICO_FIDO_R558_SOCK");
-    if (path == NULL || path[0] == '\0') {
-        return 0; /* run without a simulated sensor: calls report I/O errors cleanly */
-    }
-    struct sockaddr_un su;
-    if (strlen(path) >= sizeof(su.sun_path)) {
-        return -1;
-    }
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
         return -1;
     }
-    memset(&su, 0, sizeof(su));
-    su.sun_family = AF_UNIX;
-    strcpy(su.sun_path, path);
-    if (connect(fd, (const struct sockaddr *)&su, sizeof(su)) != 0) {
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((uint16_t)port);
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
         close(fd);
         return -1;
     }
-    sock_fd = fd;
+    emu_fd = fd;
+    return emu_fd;
+}
+
+int fp_uart_init(void) {
+    const char *port_s = getenv("PICO_FIDO_R558_PORT");
+    if (port_s == NULL || port_s[0] == '\0') {
+        return -1;
+    }
     return 0;
 }
 
 bool fp_uart_scan_pins(uint32_t paired_addr) {
     (void)paired_addr;
-    return sock_fd >= 0;
+    return emu_ensure_conn() >= 0;
 }
 
 const char *fp_uart_active_pins(void) {
-    return sock_fd >= 0 ? "emulated-uart" : "";
+    return emu_fd >= 0 ? "TX=GPIO1, RX=GPIO2 (57600 8N2)" : "";
 }
 
-static const fp_transport_t transport_instance = {
+static int emu_write(void *ctx, const uint8_t *data, size_t len) {
+    (void)ctx;
+    int fd = emu_ensure_conn();
+    if (fd < 0) {
+        return -1;
+    }
+    size_t off = 0;
+    while (off < len) {
+        ssize_t w = send(fd, data + off, len - off, MSG_NOSIGNAL);
+        if (w <= 0) {
+            close(fd);
+            emu_fd = -1;
+            return -1;
+        }
+        off += (size_t)w;
+    }
+    return 0;
+}
+
+static int emu_read(void *ctx, uint8_t *data, size_t len, uint32_t timeout_ms) {
+    (void)ctx;
+    int fd = emu_ensure_conn();
+    if (fd < 0) {
+        return -1;
+    }
+    struct pollfd pfd = { .fd = fd, .events = POLLIN };
+    int pr = poll(&pfd, 1, (int)timeout_ms);
+    if (pr <= 0) {
+        return pr == 0 ? 0 : -1;
+    }
+    ssize_t r = recv(fd, data, len, 0);
+    if (r <= 0) {
+        close(fd);
+        emu_fd = -1;
+        return 0;
+    }
+    return (int)r;
+}
+
+static void emu_flush(void *ctx) {
+    (void)ctx;
+    int fd = emu_ensure_conn();
+    if (fd < 0) {
+        return;
+    }
+    struct pollfd pfd = { .fd = fd, .events = POLLIN };
+    uint8_t sink[64];
+    while (poll(&pfd, 1, 0) > 0) {
+        if (recv(fd, sink, sizeof(sink), 0) <= 0) {
+            close(fd);
+            emu_fd = -1;
+            break;
+        }
+    }
+}
+
+static const fp_transport_t emu_transport = {
     .ctx = NULL,
     .write = emu_write,
     .read = emu_read,
     .flush = emu_flush,
 };
 
-/* ------------------------------------------------------------------------- */
-/* Default stub for platforms without an implementation                      */
-/* ------------------------------------------------------------------------- */
-#else
+const fp_transport_t *fp_uart_transport(void) {
+    return &emu_transport;
+}
 
-static int stub_write(void *ctx, const uint8_t *b, size_t n) { (void)ctx; (void)b; (void)n; return -1; }
-static int stub_read(void *ctx, uint8_t *b, size_t n, uint32_t t) { (void)ctx; (void)b; (void)n; (void)t; return -1; }
-static void stub_flush(void *ctx) { (void)ctx; }
+#else /* host or non-ESP builds without virtual sensor: no sensor attached */
 
-int fp_uart_init(void) { return 0; }
-bool fp_uart_scan_pins(uint32_t paired_addr) { (void)paired_addr; return false; }
-const char *fp_uart_active_pins(void) { return ""; }
+int fp_uart_init(void) {
+    return -1;
+}
 
-static const fp_transport_t transport_instance = {
+bool fp_uart_scan_pins(uint32_t paired_addr) {
+    (void)paired_addr;
+    return false;
+}
+
+const char *fp_uart_active_pins(void) {
+    return "";
+}
+
+static int no_write(void *ctx, const uint8_t *data, size_t len) {
+    (void)ctx;
+    (void)data;
+    (void)len;
+    return -1;
+}
+
+static int no_read(void *ctx, uint8_t *data, size_t len, uint32_t timeout_ms) {
+    (void)ctx;
+    (void)data;
+    (void)len;
+    (void)timeout_ms;
+    return -1;
+}
+
+static const fp_transport_t no_transport = {
     .ctx = NULL,
-    .write = stub_write,
-    .read = stub_read,
-    .flush = stub_flush,
+    .write = no_write,
+    .read = no_read,
+    .flush = NULL,
 };
 
-#endif
-
 const fp_transport_t *fp_uart_transport(void) {
-    return &transport_instance;
+    return &no_transport;
 }
+
+#endif
