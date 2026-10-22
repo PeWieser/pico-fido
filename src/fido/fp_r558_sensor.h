@@ -186,6 +186,7 @@ bool fp_sensor_has_last_ack(void);
 uint32_t fp_sensor_last_ack_addr(void);
 uint8_t fp_sensor_last_ack_conf(void);
 void fp_sensor_clear_last_ack(void);
+void fp_sensor_set_accept_any_ack_addr(bool allow);
 
 /* Encodes one packet into out. Returns number of bytes written or 0 if out is too small. */
 size_t fp_sensor_encode_packet(uint8_t *out, size_t out_cap, uint32_t addr, uint8_t pid,

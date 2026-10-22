@@ -244,11 +244,51 @@ static void test_wrong_device_address(void) {
     CHECK(st == FP_SENSOR_TIMEOUT, "factory sensor does not answer on a foreign stored address");
 }
 
+typedef struct { const uint8_t *buf; size_t len; size_t off; } raw_rx_t;
+static int raw_write_cb(void *ctx, const uint8_t *d, size_t l) { (void)ctx; (void)d; (void)l; return 0; }
+static int raw_read_cb(void *ctx, uint8_t *d, size_t l, uint32_t ms) {
+    (void)ms;
+    raw_rx_t *r = (raw_rx_t *)ctx;
+    if (r->off >= r->len) return 0;
+    size_t take = r->len - r->off < l ? r->len - r->off : l;
+    memcpy(d, r->buf + r->off, take);
+    r->off += take;
+    return (int)take;
+}
+
+static void test_ack_addr_override(void) {
+    /* Build 60: when R558-S answers 0xFFFFFFFF with its internal ChipAddr in the 0xEF01 ACK header,
+     * strict mode returns FP_SENSOR_BAD_ADDRESS while recording last_ack_addr, and relaxed mode accepts it. */
+    uint8_t reply[32];
+    const uint8_t body[1] = { FP_CONF_WRONG_PWD };
+    size_t n = fp_sensor_encode_packet(reply, sizeof(reply), 0xA1B2C3D4u, FP_PID_ACK, body, sizeof(body));
+    CHECK(n > 0, "encoded foreign-addr ACK");
+
+    raw_rx_t rx = { .buf = reply, .len = n, .off = 0 };
+    fp_transport_t t = { .ctx = &rx, .write = raw_write_cb, .read = raw_read_cb, .flush = NULL };
+
+    fp_sensor_clear_last_ack();
+    fp_sensor_set_accept_any_ack_addr(false);
+    fp_session_t fac = { .address = FP_FACTORY_ADDRESS, .password = { 0, 0, 0, 0 } };
+    uint8_t code = 0xFF;
+    fp_sensor_status_t st = fp_sensor_verify_password(&t, &fac, &code);
+    CHECK(st == FP_SENSOR_BAD_ADDRESS, "strict check rejects mismatched ACK address");
+    CHECK(fp_sensor_has_last_ack() && fp_sensor_last_ack_addr() == 0xA1B2C3D4u, "captures real sensor ChipAddr");
+    CHECK(fp_sensor_last_ack_conf() == FP_CONF_WRONG_PWD, "captures confirmation code before address check");
+
+    rx.off = 0;
+    fp_sensor_set_accept_any_ack_addr(true);
+    st = fp_sensor_verify_password(&t, &fac, &code);
+    CHECK(st == FP_SENSOR_OK && code == FP_CONF_WRONG_PWD, "relaxed mode accepts ACK from foreign ChipAddr");
+    fp_sensor_set_accept_any_ack_addr(false);
+}
+
 int main(void) {
     test_encoding();
     test_session();
     test_wire_faults();
     test_wrong_device_address();
+    test_ack_addr_override();
     if (failures) {
         printf("%d FAILURE(S)\n", failures);
         return 1;
