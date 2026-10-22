@@ -27,6 +27,7 @@
 static bool g_has_last_ack = false;
 static uint32_t g_last_ack_addr = 0;
 static uint8_t g_last_ack_conf = 0xFF;
+static bool g_accept_any_ack_addr = false;
 
 bool fp_sensor_has_last_ack(void) {
     return g_has_last_ack;
@@ -44,6 +45,10 @@ void fp_sensor_clear_last_ack(void) {
     g_has_last_ack = false;
     g_last_ack_addr = 0;
     g_last_ack_conf = 0xFF;
+}
+
+void fp_sensor_set_accept_any_ack_addr(bool allow) {
+    g_accept_any_ack_addr = allow;
 }
 
 static void put_u16_be(uint8_t *p, uint16_t v) {
@@ -214,7 +219,7 @@ fp_sensor_status_t fp_sensor_recv_ack(const fp_transport_t *t, uint32_t expected
     g_has_last_ack = true;
     g_last_ack_addr = resp_addr;
     g_last_ack_conf = body[0];
-    if (check_address && resp_addr != expected_addr) {
+    if (check_address && !g_accept_any_ack_addr && resp_addr != expected_addr) {
         return FP_SENSOR_BAD_ADDRESS;
     }
 

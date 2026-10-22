@@ -40,6 +40,9 @@ bool fp_uart_rescue_factory_reset(uint32_t hint_addr);
 /* Human-readable active UART description (e.g. "TX=GPIO1, RX=GPIO2 @ 57600"), or "" if none answered. */
 const char *fp_uart_active_pins(void);
 
+/* Updates active diagnostic description on ESP32 hardware. */
+void fp_uart_set_diag(const char *msg);
+
 /* Transport bound to the UART. On builds without UART it always reports an I/O error. */
 const fp_transport_t *fp_uart_transport(void);
 

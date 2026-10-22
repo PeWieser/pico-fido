@@ -308,6 +308,7 @@ const fp_transport_t *fp_uart_transport(void) { return &transport; }
 int fp_uart_init(void) { return 0; }
 bool fp_uart_scan_pins(uint32_t paired_addr) { (void)paired_addr; return active->present != 0; }
 const char *fp_uart_active_pins(void) { return active->present ? "TX=GPIO1, RX=GPIO2 (57600 8N2)" : ""; }
+void fp_uart_set_diag(const char *msg) { (void)msg; }
 
 /* ---------------- test helpers ---------------- */
 

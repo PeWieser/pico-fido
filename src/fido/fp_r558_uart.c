@@ -52,7 +52,7 @@ static int cur_tx_gpio = -1;
 static int cur_rx_gpio = -1;
 static bool has_bus_activity = false;
 static uint32_t last_bus_activity_ms = 0;
-static char active_desc[64] = "";
+static char active_desc[160] = "";
 
 static const int diag_header_gpios[] = { 1, 2, 3, 4, 43, 44 };
 #define NUM_DIAG_GPIOS (sizeof(diag_header_gpios) / sizeof(diag_header_gpios[0]))
@@ -331,7 +331,16 @@ bool fp_uart_scan_pins(uint32_t paired_addr) {
                 uart_flush_input(FP_UART_NUM);
                 has_bus_activity = false;
             }
-            bool ok = probe_address_fast(FP_FACTORY_ADDRESS, framings[f].timeout_ms);
+            bool ok = false;
+            if (i == 0 && f == 0) {
+                /* Try password-neutral HandShake (0x35) first so cold boot discovers ChipAddr before any wrong VfyPwd! */
+                uint8_t hs_code = 0xFF;
+                ok = fp_sensor_txn(&uart_transport, FP_FACTORY_ADDRESS, FP_INS_HANDSHAKE,
+                                   NULL, 0, NULL, 0, NULL, &hs_code, 25, false) == FP_SENSOR_OK;
+            }
+            if (!ok) {
+                ok = probe_address_fast(FP_FACTORY_ADDRESS, framings[f].timeout_ms);
+            }
             if (!ok && f == 0) {
                 ok = probe_address_fast(FP_DEV_SHARED_ADDR, framings[f].timeout_ms);
             }
@@ -471,6 +480,14 @@ const char *fp_uart_active_pins(void) {
     return active_desc;
 }
 
+void fp_uart_set_diag(const char *msg) {
+    if (msg == NULL) {
+        active_desc[0] = '\0';
+        return;
+    }
+    snprintf(active_desc, sizeof(active_desc), "%s", msg);
+}
+
 const fp_transport_t *fp_uart_transport(void) {
     return &uart_transport;
 }
@@ -538,6 +555,10 @@ bool fp_uart_rescue_factory_reset(uint32_t hint_addr) {
 
 const char *fp_uart_active_pins(void) {
     return emu_fd >= 0 ? "TX=GPIO1, RX=GPIO2 (57600 8N1)" : "";
+}
+
+void fp_uart_set_diag(const char *msg) {
+    (void)msg;
 }
 
 static int emu_write(void *ctx, const uint8_t *data, size_t len) {
@@ -625,6 +646,10 @@ bool fp_uart_rescue_factory_reset(uint32_t hint_addr) {
 
 const char *fp_uart_active_pins(void) {
     return "";
+}
+
+void fp_uart_set_diag(const char *msg) {
+    (void)msg;
 }
 
 static int no_write(void *ctx, const uint8_t *data, size_t len) {
