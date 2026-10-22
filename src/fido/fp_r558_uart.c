@@ -33,7 +33,6 @@
 #include "esp_mac.h"
 #include "esp_rom_gpio.h"
 #include "esp_rom_sys.h"
-#include "esp_timer.h"
 #include "soc/gpio_sig_map.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -45,13 +44,14 @@
 
 #define FP_UART_RX_BUF          256
 #define FP_POWERUP_SETTLE_MS    350
-#define FP_INTERFRAME_GUARD_US  12000 /* 12 ms idle mark so R558-S completes stop bits + re-arms RX */
+#define FP_INTERFRAME_GUARD_MS  15u   /* 15 ms idle mark so R558-S completes stop bits + re-arms RX */
 #define FP_DEV_SHARED_ADDR      0x5049434Fu /* "PICO" */
 
 static bool uart_installed = false;
 static int cur_tx_gpio = -1;
 static int cur_rx_gpio = -1;
-static int64_t last_bus_activity_us = 0;
+static bool has_bus_activity = false;
+static uint32_t last_bus_activity_ms = 0;
 static char active_desc[64] = "";
 
 static const int diag_header_gpios[] = { 1, 2, 3, 4, 43, 44 };
@@ -102,16 +102,10 @@ static int esp_uart_write(void *ctx, const uint8_t *buf, size_t len) {
      * Without this guard, a 240 MHz ESP32-S3 starts the next 0xEF01 packet within microseconds of
      * reading an ACK — colliding with the R558-S's 2nd stop bit before its MCU re-arms UART RX!
      */
-    if (last_bus_activity_us > 0) {
-        int64_t elapsed = esp_timer_get_time() - last_bus_activity_us;
-        if (elapsed >= 0 && elapsed < FP_INTERFRAME_GUARD_US) {
-            uint32_t wait_us = (uint32_t)(FP_INTERFRAME_GUARD_US - elapsed);
-            if (wait_us >= 10000u) {
-                vTaskDelay(pdMS_TO_TICKS((wait_us + 999u) / 1000u));
-            }
-            else {
-                esp_rom_delay_us(wait_us);
-            }
+    if (has_bus_activity) {
+        uint32_t elapsed = esp_now_ms() - last_bus_activity_ms;
+        if (elapsed < FP_INTERFRAME_GUARD_MS) {
+            vTaskDelay(pdMS_TO_TICKS(FP_INTERFRAME_GUARD_MS - elapsed));
         }
     }
     int n = uart_write_bytes(FP_UART_NUM, (const char *)buf, len);
@@ -119,7 +113,8 @@ static int esp_uart_write(void *ctx, const uint8_t *buf, size_t len) {
         return -1;
     }
     esp_err_t rc = uart_wait_tx_done(FP_UART_NUM, pdMS_TO_TICKS(200));
-    last_bus_activity_us = esp_timer_get_time();
+    last_bus_activity_ms = esp_now_ms();
+    has_bus_activity = true;
     return rc == ESP_OK ? 0 : -1;
 }
 
@@ -134,7 +129,8 @@ static int esp_uart_read(void *ctx, uint8_t *buf, size_t max_len, uint32_t timeo
     }
     int r = uart_read_bytes(FP_UART_NUM, buf, (uint32_t)max_len, ticks);
     if (r > 0) {
-        last_bus_activity_us = esp_timer_get_time();
+        last_bus_activity_ms = esp_now_ms();
+        has_bus_activity = true;
     }
     return r < 0 ? -1 : r;
 }
@@ -333,7 +329,7 @@ bool fp_uart_scan_pins(uint32_t paired_addr) {
                 uart_wait_tx_done(FP_UART_NUM, pdMS_TO_TICKS(8));
                 vTaskDelay(pdMS_TO_TICKS(15));
                 uart_flush_input(FP_UART_NUM);
-                last_bus_activity_us = esp_timer_get_time();
+                has_bus_activity = false;
             }
             bool ok = probe_address_fast(FP_FACTORY_ADDRESS, framings[f].timeout_ms);
             if (!ok && f == 0) {
@@ -421,7 +417,7 @@ bool fp_uart_rescue_factory_reset(uint32_t hint_addr) {
                 uart_wait_tx_done(FP_UART_NUM, pdMS_TO_TICKS(8));
                 vTaskDelay(pdMS_TO_TICKS(15));
                 uart_flush_input(FP_UART_NUM);
-                last_bus_activity_us = esp_timer_get_time();
+                has_bus_activity = false;
             }
 
             uint8_t code = 0xFF;
