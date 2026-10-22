@@ -216,9 +216,12 @@ static void test_wire_faults(void) {
     st = fp_sensor_verify_password(&t, &f, &code);
     CHECK(st == FP_SENSOR_BAD_FRAME, "corrupted checksum is rejected");
 
+    fp_sensor_clear_last_ack();
     s.tx_wrong_address = 1;
     st = fp_sensor_txn(&t, FP_FACTORY_ADDRESS, FP_INS_GEN_IMG, NULL, 0, NULL, 0, NULL, &code, 100, true);
     CHECK(st == FP_SENSOR_BAD_ADDRESS, "ack from a different address is rejected when checked");
+    CHECK(fp_sensor_has_last_ack() && fp_sensor_last_ack_addr() != FP_FACTORY_ADDRESS,
+          "self-reported module ChipAddr is captured before address rejection");
 
     s.silent = 1;
     st = fp_sensor_verify_password(&t, &f, &code);

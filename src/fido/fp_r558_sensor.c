@@ -24,6 +24,28 @@
 #define FP_BYTE_TIMEOUT_MS      100u
 #define FP_HUNT_LIMIT           512u   /* junk bytes accepted while looking for a header */
 
+static bool g_has_last_ack = false;
+static uint32_t g_last_ack_addr = 0;
+static uint8_t g_last_ack_conf = 0xFF;
+
+bool fp_sensor_has_last_ack(void) {
+    return g_has_last_ack;
+}
+
+uint32_t fp_sensor_last_ack_addr(void) {
+    return g_last_ack_addr;
+}
+
+uint8_t fp_sensor_last_ack_conf(void) {
+    return g_last_ack_conf;
+}
+
+void fp_sensor_clear_last_ack(void) {
+    g_has_last_ack = false;
+    g_last_ack_addr = 0;
+    g_last_ack_conf = 0xFF;
+}
+
 static void put_u16_be(uint8_t *p, uint16_t v) {
     p[0] = (uint8_t)(v >> 8);
     p[1] = (uint8_t)(v & 0xFF);
@@ -185,14 +207,17 @@ fp_sensor_status_t fp_sensor_recv_ack(const fp_transport_t *t, uint32_t expected
     if (pid != FP_PID_ACK || received_sum != fp_sensor_checksum(pid, length, body, body_len)) {
         return FP_SENSOR_BAD_FRAME;
     }
-    if (check_address && resp_addr != expected_addr) {
-        return FP_SENSOR_BAD_ADDRESS;
-    }
-
     if (body_len == 0) {
         /* A valid ack without confirmation code is treated as a protocol violation. */
         return FP_SENSOR_BAD_FRAME;
     }
+    g_has_last_ack = true;
+    g_last_ack_addr = resp_addr;
+    g_last_ack_conf = body[0];
+    if (check_address && resp_addr != expected_addr) {
+        return FP_SENSOR_BAD_ADDRESS;
+    }
+
     if (out != NULL) {
         uint16_t copy = body_len < out_cap ? body_len : out_cap;
         memcpy(out, body, copy);

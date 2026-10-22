@@ -35,7 +35,38 @@ from fido2 import cbor
 from fido2.ctap import CtapError
 from fido2.ctap2 import Ctap2, ClientPin, CredentialManagement
 from fido2.ctap2.pin import PinProtocolV2
+from fido2.hid.base import CtapHidConnection, HidDescriptor
+from fido2.hid import CtapHidDevice, CAPABILITY
 import fido2.hid
+
+
+class _TcpHidConnection(CtapHidConnection):
+    def __init__(self, host: str = "127.0.0.1", port: int = 35962) -> None:
+        self._sock = socket.create_connection((host, port), timeout=5.0)
+        self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+    def _recv_exact(self, n: int) -> bytes:
+        buf = b""
+        while len(buf) < n:
+            chunk = self._sock.recv(n - len(buf))
+            if not chunk:
+                raise OSError("emulator closed TCP HID socket")
+            buf += chunk
+        return buf
+
+    def write_packet(self, data: bytes) -> None:
+        pkt = bytes(data).ljust(64, b"\x00")[:64]
+        self._sock.sendall(struct.pack(">H", len(pkt)) + pkt)
+
+    def read_packet(self) -> bytes:
+        (plen,) = struct.unpack(">H", self._recv_exact(2))
+        return self._recv_exact(plen)
+
+    def close(self) -> None:
+        try:
+            self._sock.close()
+        except Exception:
+            pass
 
 
 class VirtualR558Sensor:
@@ -237,6 +268,7 @@ def main() -> int:
         nonlocal proc
         env = os.environ.copy()
         env["PICO_FIDO_R558_PORT"] = str(sensor.port)
+        env["PICOKEYS_EMULATION_DISABLE_CCID"] = "1"
         proc = subprocess.Popen([emu_bin], cwd=workdir, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         for _ in range(40):
             time.sleep(0.05)
@@ -248,6 +280,17 @@ def main() -> int:
                     return ctap
             except Exception:
                 pass
+            conn = None
+            try:
+                conn = _TcpHidConnection()
+                desc = HidDescriptor("tcp://127.0.0.1:35962", 0x2E8A, 0x10FE, 64, 64, "Pico Fido", "0000")
+                dev = CtapHidDevice(desc, conn)
+                ctap = Ctap2(dev)
+                _ = ctap.get_info()
+                return ctap
+            except Exception:
+                if conn is not None:
+                    conn.close()
         raise RuntimeError("pico_fido emulator did not start in time")
 
     def stop_emu() -> None:
