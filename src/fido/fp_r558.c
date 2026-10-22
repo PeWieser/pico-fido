@@ -209,6 +209,8 @@ typedef struct {
     uint8_t c32;
 } esp_dev_xray_t;
 
+static void fp_sleep_ms(uint32_t ms);
+
 static bool esp_dev_xray_probe(uint32_t seen_addr, esp_dev_xray_t *xr) {
 #if defined(ESP_PLATFORM)
     if (flash_encryption_active() || xr == NULL) {
@@ -327,7 +329,7 @@ static bool esp_dev_xray_probe(uint32_t seen_addr, esp_dev_xray_t *xr) {
     const uint8_t ai_params[5] = { 0x01, 0xFF, 0xFF, 0x00, 0x06 };
     uint8_t ai_buf[8] = { 0 };
     uint16_t ai_len = 0;
-    fp_sensor_status_t ai_st = fp_sensor_txn(t, seen_addr, FP_INS_AUTO_IDENTIFY,
+    fp_sensor_status_t ai_st = fp_sensor_txn(t, seen_addr, FP_INS_AUTO_ID,
                                              ai_params, sizeof(ai_params),
                                              ai_buf, sizeof(ai_buf), &ai_len, &xr->c32, 90, true);
     if (ai_st == FP_SENSOR_TIMEOUT) {
@@ -338,7 +340,7 @@ static bool esp_dev_xray_probe(uint32_t seen_addr, esp_dev_xray_t *xr) {
         (void)fp_sensor_txn(t, seen_addr, 0x33, NULL, 0, NULL, 0, NULL, &cc, 25, true);
     }
 
-    bool genimg_works = (xr->c01 == FP_CONF_OK || xr->c01 == FP_CONF_NO_FINGER || xr->c01 == FP_CONF_MESSY_IMAGE);
+    bool genimg_works = (xr->c01 == FP_CONF_OK || xr->c01 == FP_CONF_NO_FINGER || xr->c01 == FP_CONF_IMG_MESSY);
     bool auto_works = (xr->c32 == 0xAA || xr->c32 == FP_CONF_OK || xr->c32 == FP_CONF_NOT_FOUND ||
                        xr->c32 == 0x24 || xr->c32 == 0x26);
     if (genimg_works || auto_works) {
