@@ -29,11 +29,13 @@
 #include "fs/flash.h"
 #include "fs/file.h"
 #include "mbedtls/platform_util.h"
+#include "mbedtls/sha256.h"
 #include <stdio.h>
 #include <string.h>
 
 #if defined(ESP_PLATFORM)
 #include "esp_flash_encrypt.h"
+#include "esp_mac.h"
 #endif
 
 #if defined(ESP_PLATFORM)
@@ -121,6 +123,45 @@ __attribute__((weak)) file_t *file_search_by_fid(const uint16_t fid, const file_
     (void)parent;
     (void)sp;
     return NULL;
+}
+
+__attribute__((weak)) bool fp_uart_rescue_factory_reset(uint32_t hint_addr) {
+    return fp_uart_scan_pins(hint_addr);
+}
+
+static bool esp_dev_efuse_session(fp_session_t *out) {
+#if defined(ESP_PLATFORM)
+    if (flash_encryption_active()) {
+        return false;
+    }
+    uint8_t mac[6] = { 0 };
+    if (esp_efuse_mac_get_default(mac) != ESP_OK) {
+        return false;
+    }
+    static const uint8_t domain[] = "pico-fido-r558-efuse-bind-v1";
+    uint8_t digest[32];
+    mbedtls_sha256_context ctx;
+    mbedtls_sha256_init(&ctx);
+    mbedtls_sha256_starts(&ctx, 0);
+    mbedtls_sha256_update(&ctx, domain, sizeof(domain) - 1u);
+    mbedtls_sha256_update(&ctx, mac, sizeof(mac));
+    mbedtls_sha256_finish(&ctx, digest);
+    mbedtls_sha256_free(&ctx);
+
+    memcpy(out->password, digest, 4);
+    if (out->password[0] == 0 && out->password[1] == 0 && out->password[2] == 0 && out->password[3] == 0) {
+        out->password[0] = 0xA5;
+    }
+    uint32_t addr = ((uint32_t)digest[4] << 24) | ((uint32_t)digest[5] << 16) | ((uint32_t)digest[6] << 8) | digest[7];
+    if (addr == 0 || addr == FP_FACTORY_ADDRESS) {
+        addr = 0x5A3CC3A5u;
+    }
+    out->address = addr;
+    return true;
+#else
+    (void)out;
+    return false;
+#endif
 }
 
 static volatile bool waiting_finger = false;
@@ -283,11 +324,32 @@ static void probe_and_init_sensor(const fp_conf_t *c) {
     fp_sensor_status_t fst = fp_sensor_verify_password(t, &factory, &code);
     if (fst == FP_SENSOR_OK) {
         last_sensor_detected = true;
-        fp_diag_reset();
-        if (code == FP_CONF_OK && !(c->flags & FP_FLAG_PAIRED)) {
-            sensor_led(FP_FACTORY_ADDRESS, FP_LED_FUNC_FLASH, FP_LED_COLOR_BLUE, FP_LED_COLOR_BLUE, 2);
+        if (code == FP_CONF_OK) {
+            fp_diag_reset();
+            if (!(c->flags & FP_FLAG_PAIRED)) {
+                sensor_led(FP_FACTORY_ADDRESS, FP_LED_FUNC_FLASH, FP_LED_COLOR_BLUE, FP_LED_COLOR_BLUE, 2);
+            }
+        }
+        else {
+            fp_diag_err(FP_INS_VFY_PWD, code, FP_SENSOR_OK);
         }
         return;
+    }
+
+    fp_session_t ef;
+    if (esp_dev_efuse_session(&ef)) {
+        fp_sensor_status_t est = fp_sensor_verify_password(t, &ef, &code);
+        if (est == FP_SENSOR_OK) {
+            last_sensor_detected = true;
+            if (code == FP_CONF_OK) {
+                fp_diag_reset();
+                sensor_led(ef.address, FP_LED_FUNC_FLASH, FP_LED_COLOR_BLUE, FP_LED_COLOR_BLUE, 2);
+            }
+            else {
+                fp_diag_err(FP_INS_VFY_PWD, code, FP_SENSOR_OK);
+            }
+            return;
+        }
     }
 
     last_sensor_detected = false;
@@ -717,6 +779,40 @@ bool fp_probe(void) {
     return last_sensor_detected;
 }
 
+fp_result_t fp_factory_reset_sensor(void) {
+    if (!FP_FEATURE_ON) {
+        return FP_ERR_NOT_PAIRED;
+    }
+    fp_conf_t c;
+    conf_load(&c);
+    if (c.flags & FP_FLAG_PAIRED) {
+        fp_session_t s = session_of(&c);
+        uint8_t code = 0xFF;
+        if (fp_sensor_verify_password(fp_uart_transport(), &s, &code) == FP_SENSOR_OK && code == FP_CONF_OK) {
+            conf_clear(&c);
+            return FP_ERR_ALREADY_PAIRED;
+        }
+    }
+    uint32_t hint = (c.flags & (FP_FLAG_PAIRED | FP_FLAG_STAGED)) ? c.address : 0;
+    if (c.flags & (FP_FLAG_PAIRED | FP_FLAG_STAGED)) {
+        const uint8_t zero_pwd[4] = { 0, 0, 0, 0 };
+        fp_session_t s = session_of(&c);
+        uint8_t code = 0xFF;
+        if (fp_uart_scan_pins(s.address) &&
+            fp_sensor_verify_password(fp_uart_transport(), &s, &code) == FP_SENSOR_OK && code == FP_CONF_OK) {
+            (void)fp_sensor_empty(fp_uart_transport(), &s, &code);
+            (void)fp_sensor_set_password(fp_uart_transport(), s.address, zero_pwd, &code);
+            (void)fp_sensor_set_chip_address(fp_uart_transport(), s.address, FP_FACTORY_ADDRESS, &code);
+        }
+    }
+    (void)fp_uart_rescue_factory_reset(hint);
+    conf_clear(&c);
+    conf_load(&c);
+    probe_and_init_sensor(&c);
+    conf_clear(&c);
+    return last_sensor_detected ? FP_OK : FP_ERR_SENSOR;
+}
+
 bool fp_uv_available(void) {
     if (!FP_FEATURE_ON) {
         return false;
@@ -929,6 +1025,32 @@ fp_result_t fp_pair(uint16_t *capacity_out) {
 
     if (!resumed && !password_set_already) {
         /*
+         * Check whether this R558-S module was already bound to THIS physical ESP32-S3 board's eFuse MAC
+         * prior to an ESP32 flash erase. If so, seamlessly re-adopt the board's own sensor!
+         */
+        fp_session_t ef;
+        if (esp_dev_efuse_session(&ef) &&
+            fp_sensor_verify_password(t, &ef, &code) == FP_SENSOR_OK && code == FP_CONF_OK) {
+            fp_sysparam_t ef_sp;
+            if (fp_sensor_read_sysparam(t, ef.address, &ef_sp, &code) == FP_SENSOR_OK &&
+                code == FP_CONF_OK && ef_sp.capacity > 0) {
+                last_sensor_detected = true;
+                memset(&c, 0, sizeof(c));
+                c.flags = FP_FLAG_STAGED;
+                c.capacity = ef_sp.capacity > FP_TEMPLATE_MAX ? FP_TEMPLATE_MAX : ef_sp.capacity;
+                memcpy(c.password, ef.password, 4);
+                c.address = ef.address;
+                if (!conf_save(&c)) {
+                    conf_clear(&c);
+                    return FP_ERR_STORAGE;
+                }
+                resumed = true;
+            }
+        }
+    }
+
+    if (!resumed && !password_set_already) {
+        /*
          * R558-S Manual V1.1: VfyPwd (0x13) MUST be sent BEFORE ReadSysPara (0x0F) or any other command
          * after power-on, otherwise real R558-S hardware rejects ReadSysPara.
          */
@@ -936,11 +1058,13 @@ fp_result_t fp_pair(uint16_t *capacity_out) {
         fp_sensor_status_t st = fp_sensor_verify_password(t, &factory, &code);
         if (st != FP_SENSOR_OK) {
             last_sensor_detected = false;
+            fp_diag_err(FP_INS_VFY_PWD, 0xFF, st);
             conf_clear(&c);
             return FP_ERR_SENSOR;
         }
         last_sensor_detected = true;
         if (code != FP_CONF_OK) {
+            fp_diag_err(FP_INS_VFY_PWD, code, FP_SENSOR_OK);
             conf_clear(&c);
             return FP_ERR_NOT_FACTORY;
         }
@@ -957,15 +1081,23 @@ fp_result_t fp_pair(uint16_t *capacity_out) {
         uint16_t usable_cap = sp.capacity > FP_TEMPLATE_MAX ? FP_TEMPLATE_MAX : sp.capacity;
 
         uint8_t new_pwd[4];
-        uint8_t new_addr[4];
-        do {
-            random_fill_buffer(BYTE_ARRAY(new_pwd, sizeof(new_pwd)));
-        } while (new_pwd[0] == 0 && new_pwd[1] == 0 && new_pwd[2] == 0 && new_pwd[3] == 0);
         uint32_t addr = 0;
-        do {
-            random_fill_buffer(BYTE_ARRAY(new_addr, sizeof(new_addr)));
-            addr = ((uint32_t)new_addr[0] << 24) | ((uint32_t)new_addr[1] << 16) | ((uint32_t)new_addr[2] << 8) | new_addr[3];
-        } while (addr == 0 || addr == FP_FACTORY_ADDRESS);
+        fp_session_t ef_bind;
+        if (esp_dev_efuse_session(&ef_bind)) {
+            /* Hardware eFuse-bound pairing credentials in dev mode survive full ESP32-S3 flash erases. */
+            memcpy(new_pwd, ef_bind.password, 4);
+            addr = ef_bind.address;
+        }
+        else {
+            uint8_t new_addr[4];
+            do {
+                random_fill_buffer(BYTE_ARRAY(new_pwd, sizeof(new_pwd)));
+            } while (new_pwd[0] == 0 && new_pwd[1] == 0 && new_pwd[2] == 0 && new_pwd[3] == 0);
+            do {
+                random_fill_buffer(BYTE_ARRAY(new_addr, sizeof(new_addr)));
+                addr = ((uint32_t)new_addr[0] << 24) | ((uint32_t)new_addr[1] << 16) | ((uint32_t)new_addr[2] << 8) | new_addr[3];
+            } while (addr == 0 || addr == FP_FACTORY_ADDRESS);
+        }
 
         /* Stage the secrets before the sensor is changed. */
         memset(&c, 0, sizeof(c));

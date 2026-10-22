@@ -34,6 +34,9 @@ int fp_uart_init(void);
  */
 bool fp_uart_scan_pins(uint32_t paired_addr);
 
+/* Sweeps all candidate UART GPIO pairs and baud rates sending R558-S RestSetting (0x3B) + eFuse unlock. */
+bool fp_uart_rescue_factory_reset(uint32_t hint_addr);
+
 /* Human-readable active UART description (e.g. "TX=GPIO1, RX=GPIO2 @ 57600"), or "" if none answered. */
 const char *fp_uart_active_pins(void);
 

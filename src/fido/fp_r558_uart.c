@@ -29,9 +29,11 @@
 #include <string.h>
 #include "driver/uart.h"
 #include "driver/gpio.h"
+#include "esp_mac.h"
 #include "esp_rom_gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "mbedtls/sha256.h"
 
 #define FP_UART_RX_BUF       256
 #define FP_POWERUP_SETTLE_MS 350
@@ -135,11 +137,43 @@ static bool configure_uart_channel(int tx_gpio, int rx_gpio, int baud, uart_stop
     return true;
 }
 
+static bool uart_efuse_session(fp_session_t *out) {
+    uint8_t mac[6] = { 0 };
+    if (esp_efuse_mac_get_default(mac) != ESP_OK) {
+        return false;
+    }
+    static const uint8_t domain[] = "pico-fido-r558-efuse-bind-v1";
+    uint8_t digest[32];
+    mbedtls_sha256_context ctx;
+    mbedtls_sha256_init(&ctx);
+    mbedtls_sha256_starts(&ctx, 0);
+    mbedtls_sha256_update(&ctx, domain, sizeof(domain) - 1u);
+    mbedtls_sha256_update(&ctx, mac, sizeof(mac));
+    mbedtls_sha256_finish(&ctx, digest);
+    mbedtls_sha256_free(&ctx);
+
+    memcpy(out->password, digest, 4);
+    if (out->password[0] == 0 && out->password[1] == 0 && out->password[2] == 0 && out->password[3] == 0) {
+        out->password[0] = 0xA5;
+    }
+    uint32_t addr = ((uint32_t)digest[4] << 24) | ((uint32_t)digest[5] << 16) | ((uint32_t)digest[6] << 8) | digest[7];
+    if (addr == 0 || addr == FP_FACTORY_ADDRESS) {
+        addr = 0x5A3CC3A5u;
+    }
+    out->address = addr;
+    return true;
+}
+
 static bool probe_address_once(uint32_t addr, uint32_t timeout_ms) {
     const uint8_t zero_pwd[4] = { 0, 0, 0, 0 };
     uint8_t code = 0xFF;
-    return fp_sensor_txn(&uart_transport, addr, FP_INS_VFY_PWD,
-                         zero_pwd, sizeof(zero_pwd), NULL, 0, NULL,
+    if (fp_sensor_txn(&uart_transport, addr, FP_INS_VFY_PWD,
+                      zero_pwd, sizeof(zero_pwd), NULL, 0, NULL,
+                      &code, timeout_ms, false) == FP_SENSOR_OK) {
+        return true;
+    }
+    return fp_sensor_txn(&uart_transport, addr, FP_INS_HANDSHAKE,
+                         NULL, 0, NULL, 0, NULL,
                          &code, timeout_ms, false) == FP_SENSOR_OK;
 }
 
@@ -195,6 +229,13 @@ bool fp_uart_scan_pins(uint32_t paired_addr) {
             if (!ok && paired_addr != 0 && paired_addr != FP_FACTORY_ADDRESS) {
                 ok = probe_address_once(paired_addr, framings[f].timeout_ms);
             }
+            fp_session_t ef;
+            if (!ok && uart_efuse_session(&ef) && ef.address != paired_addr) {
+                ok = probe_address_once(ef.address, framings[f].timeout_ms);
+            }
+            if (!ok) {
+                ok = probe_address_once(0x00000000u, framings[f].timeout_ms);
+            }
             if (ok) {
                 snprintf(active_desc, sizeof(active_desc), "TX=GPIO%d, RX=GPIO%d (%s)",
                          pairs[i].tx_gpio, pairs[i].rx_gpio, framings[f].label);
@@ -206,6 +247,68 @@ bool fp_uart_scan_pins(uint32_t paired_addr) {
     active_desc[0] = '\0';
     configure_uart_channel(FP_UART_TX_GPIO, FP_UART_RX_GPIO, FP_UART_BAUD, UART_STOP_BITS_2);
     return false;
+}
+
+bool fp_uart_rescue_factory_reset(uint32_t hint_addr) {
+    if (!uart_installed && fp_uart_init() != 0) {
+        return false;
+    }
+    const fp_pin_pair_t pairs[] = {
+        { FP_UART_TX_GPIO, FP_UART_RX_GPIO },
+        { FP_UART_RX_GPIO, FP_UART_TX_GPIO },
+        { 43, 44 },
+        { 44, 43 },
+        { 4, 5 },
+        { 5, 4 },
+    };
+    const fp_framing_t framings[] = {
+        { 57600, UART_STOP_BITS_2, "57600 8N2", 60 },
+        { 57600, UART_STOP_BITS_1, "57600 8N1", 50 },
+        { 115200, UART_STOP_BITS_1, "115200 8N1", 50 },
+    };
+    fp_session_t ef = { 0 };
+    bool have_ef = uart_efuse_session(&ef);
+    const uint8_t zero_pwd[4] = { 0, 0, 0, 0 };
+
+    for (size_t i = 0; i < sizeof(pairs) / sizeof(pairs[0]); i++) {
+        for (size_t f = 0; f < sizeof(framings) / sizeof(framings[0]); f++) {
+            if (!configure_uart_channel(pairs[i].tx_gpio, pairs[i].rx_gpio, framings[f].baud, framings[f].stop_bits)) {
+                continue;
+            }
+            if (f == 0) {
+                const uint8_t wake = 0x00;
+                uart_write_bytes(FP_UART_NUM, (const char *)&wake, 1);
+                uart_wait_tx_done(FP_UART_NUM, pdMS_TO_TICKS(10));
+                vTaskDelay(pdMS_TO_TICKS(8));
+                uart_flush_input(FP_UART_NUM);
+            }
+            uint8_t code = 0xFF;
+            if (have_ef && fp_sensor_verify_password(&uart_transport, &ef, &code) == FP_SENSOR_OK && code == FP_CONF_OK) {
+                (void)fp_sensor_empty(&uart_transport, &ef, &code);
+                (void)fp_sensor_set_password(&uart_transport, ef.address, zero_pwd, &code);
+                (void)fp_sensor_set_chip_address(&uart_transport, ef.address, FP_FACTORY_ADDRESS, &code);
+                vTaskDelay(pdMS_TO_TICKS(50));
+            }
+            uint32_t addrs[4] = { FP_FACTORY_ADDRESS, 0x00000000u, hint_addr, have_ef ? ef.address : 0u };
+            for (size_t a = 0; a < 4; a++) {
+                if (a >= 2 && addrs[a] == 0u) {
+                    continue;
+                }
+                if (fp_sensor_rest_setting(&uart_transport, addrs[a], &code) == FP_SENSOR_OK && code == FP_CONF_OK) {
+                    vTaskDelay(pdMS_TO_TICKS(120));
+                    snprintf(active_desc, sizeof(active_desc), "TX=GPIO%d, RX=GPIO%d (%s)",
+                             pairs[i].tx_gpio, pairs[i].rx_gpio, framings[f].label);
+                    return true;
+                }
+            }
+            if (probe_address_once(FP_FACTORY_ADDRESS, framings[f].timeout_ms)) {
+                snprintf(active_desc, sizeof(active_desc), "TX=GPIO%d, RX=GPIO%d (%s)",
+                         pairs[i].tx_gpio, pairs[i].rx_gpio, framings[f].label);
+                return true;
+            }
+        }
+    }
+    return fp_uart_scan_pins(hint_addr);
 }
 
 const char *fp_uart_active_pins(void) {
@@ -271,6 +374,10 @@ int fp_uart_init(void) {
 bool fp_uart_scan_pins(uint32_t paired_addr) {
     (void)paired_addr;
     return emu_ensure_conn() >= 0;
+}
+
+bool fp_uart_rescue_factory_reset(uint32_t hint_addr) {
+    return fp_uart_scan_pins(hint_addr);
 }
 
 const char *fp_uart_active_pins(void) {
@@ -352,6 +459,11 @@ int fp_uart_init(void) {
 
 bool fp_uart_scan_pins(uint32_t paired_addr) {
     (void)paired_addr;
+    return false;
+}
+
+bool fp_uart_rescue_factory_reset(uint32_t hint_addr) {
+    (void)hint_addr;
     return false;
 }
 

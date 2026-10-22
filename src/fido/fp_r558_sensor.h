@@ -63,6 +63,8 @@
 #define FP_INS_CANCEL           0x30
 #define FP_INS_AUTO_ENROLL      0x31
 #define FP_INS_AUTO_ID          0x32
+#define FP_INS_HANDSHAKE        0x35
+#define FP_INS_REST_SETTING     0x3B
 #define FP_INS_CONTROL_BLN      0x3C
 
 /* R558-S built-in RGB ring LED modes (PS_ControlBLN, datasheet p. 27-29). */
@@ -202,6 +204,7 @@ fp_sensor_status_t fp_sensor_delete_chars(const fp_transport_t *t, const fp_sess
 fp_sensor_status_t fp_sensor_empty(const fp_transport_t *t, const fp_session_t *s, uint8_t *code);
 fp_sensor_status_t fp_sensor_template_num(const fp_transport_t *t, const fp_session_t *s, uint16_t *count, uint8_t *code);
 fp_sensor_status_t fp_sensor_cancel(const fp_transport_t *t, const fp_session_t *s, uint8_t *code);
+fp_sensor_status_t fp_sensor_rest_setting(const fp_transport_t *t, uint32_t addr, uint8_t *code);
 fp_sensor_status_t fp_sensor_control_led(const fp_transport_t *t, uint32_t addr,
                                          uint8_t func, uint8_t start_color, uint8_t end_color,
                                          uint8_t cycles, uint8_t *code);

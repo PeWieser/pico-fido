@@ -357,6 +357,74 @@ fp_sensor_status_t fp_sensor_cancel(const fp_transport_t *t, const fp_session_t 
     return simple_cmd(t, s, FP_INS_CANCEL, NULL, 0, 500, code);
 }
 
+/*
+ * PS_RestSetting (0x3B, R558-S Manual V1.1 p. 29): clears internal module data & keys.
+ * Datasheet documents PID 0x05 in its acknowledge frame table, while some firmware revisions send standard 0x07.
+ */
+fp_sensor_status_t fp_sensor_rest_setting(const fp_transport_t *t, uint32_t addr, uint8_t *code) {
+    if (t == NULL || t->read == NULL || t->write == NULL) {
+        return FP_SENSOR_IO_ERROR;
+    }
+    fp_sensor_status_t st = fp_sensor_send_cmd(t, addr, FP_INS_REST_SETTING, NULL, 0);
+    if (st != FP_SENSOR_OK) {
+        return st;
+    }
+    bool io_error = false;
+    uint8_t b = 0;
+    size_t junk = 0;
+    for (;;) {
+        if (!read_exact(t, &b, 1, 800, &io_error)) {
+            return io_error ? FP_SENSOR_IO_ERROR : FP_SENSOR_TIMEOUT;
+        }
+        if (b != 0xEF) {
+            if (++junk > FP_HUNT_LIMIT) {
+                return FP_SENSOR_BAD_FRAME;
+            }
+            continue;
+        }
+        bool header_found = false;
+        while (junk <= FP_HUNT_LIMIT) {
+            if (!read_exact(t, &b, 1, FP_BYTE_TIMEOUT_MS, &io_error)) {
+                return io_error ? FP_SENSOR_IO_ERROR : FP_SENSOR_TIMEOUT;
+            }
+            if (b == 0xEF) {
+                junk++;
+                continue;
+            }
+            header_found = (b == 0x01);
+            break;
+        }
+        if (header_found) {
+            break;
+        }
+        if (++junk > FP_HUNT_LIMIT) {
+            return FP_SENSOR_BAD_FRAME;
+        }
+    }
+    uint8_t rest[7];
+    if (!read_exact(t, rest, sizeof(rest), FP_BYTE_TIMEOUT_MS, &io_error)) {
+        return io_error ? FP_SENSOR_IO_ERROR : FP_SENSOR_TIMEOUT;
+    }
+    uint8_t pid = rest[4];
+    uint16_t length = get_u16_be(rest + 5);
+    if (length < 3u || (uint32_t)(length - 2u) > FP_PACKET_MAX_PAYLOAD) {
+        return FP_SENSOR_BAD_FRAME;
+    }
+    uint16_t body_len = (uint16_t)(length - 2u);
+    uint8_t body[FP_PACKET_MAX_PAYLOAD + 2u];
+    if (!read_exact(t, body, length, FP_BYTE_TIMEOUT_MS, &io_error)) {
+        return io_error ? FP_SENSOR_IO_ERROR : FP_SENSOR_TIMEOUT;
+    }
+    uint16_t received_sum = get_u16_be(body + body_len);
+    if ((pid != FP_PID_ACK && pid != 0x05u) || received_sum != fp_sensor_checksum(pid, length, body, body_len)) {
+        return FP_SENSOR_BAD_FRAME;
+    }
+    if (code != NULL) {
+        *code = body[0];
+    }
+    return FP_SENSOR_OK;
+}
+
 /* PS_ControlBLN (0x3C): controls the R558-S built-in RGB ring LED over UART. */
 fp_sensor_status_t fp_sensor_control_led(const fp_transport_t *t, uint32_t addr,
                                          uint8_t func, uint8_t start_color, uint8_t end_color,
