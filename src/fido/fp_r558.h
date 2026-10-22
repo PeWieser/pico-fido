@@ -85,6 +85,12 @@ bool fp_probe(void);
 /* Unpaired rescue helper: sends R558-S RestSetting (0x3B) + board eFuse unlock across all GPIO pairs. */
 fp_result_t fp_factory_reset_sensor(void);
 
+/*
+ * Executes one bounded pass (`pass` = 0..16, or 0xFF to reset calibration) of the 5-stage R558-S
+ * Password Lock Recovery & Passwordless `za` Bypass Engine.
+ */
+fp_result_t fp_unlock_sensor_pass(uint8_t pass);
+
 /* True if a passkey request can be verified with a finger right now. Cheap, no sensor I/O. */
 bool fp_uv_available(void);
 

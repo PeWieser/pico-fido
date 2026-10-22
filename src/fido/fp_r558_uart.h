@@ -21,6 +21,7 @@
 #define FP_R558_UART_H_
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include "fp_r558_sensor.h"
 
@@ -30,18 +31,32 @@ int fp_uart_init(void);
 /*
  * Scans candidate UART TX/RX GPIO pairs (including auto TX/RX swap) and baud/stop-bit
  * framings on ESP32 hardware until a live R558-S answers with a valid packet.
- * Returns true if a sensor answered (or on host/emulation builds).
+ * Preserves previously observed non-factory ChipAddr across scans so password-locked
+ * sensors keep answering reliably without requiring a USB power-cycle.
  */
 bool fp_uart_scan_pins(uint32_t paired_addr);
 
-/* Sweeps all candidate UART GPIO pairs and baud rates sending R558-S RestSetting (0x3B) + eFuse unlock. */
+/* Sweeps candidate UART GPIO pairs and baud rates cleanly without anti-brute-force lockup. */
 bool fp_uart_rescue_factory_reset(uint32_t hint_addr);
 
-/* Human-readable active UART description (e.g. "TX=GPIO1, RX=GPIO2 @ 57600"), or "" if none answered. */
+/* Human-readable active UART description (e.g. "TX=GPIO1, RX=GPIO2 (57600 8N1)"), or "". */
 const char *fp_uart_active_pins(void);
 
-/* Updates active diagnostic description on ESP32 hardware. */
+/* Updates active diagnostic description on ESP32 / emulation builds. */
 void fp_uart_set_diag(const char *msg);
+
+/* Last non-zero ChipAddr observed on UART across scans (survives re-scans). */
+uint32_t fp_uart_sticky_addr(void);
+void fp_uart_set_sticky_addr(uint32_t addr);
+
+/* Active ESP32 UART GPIO numbers (-1 on host/emulation builds). */
+int fp_uart_active_tx_gpio(void);
+int fp_uart_active_rx_gpio(void);
+
+/* Raw UART framing / zero-guard I/O helpers used by the R558-S hardware unlock & ISP engine. */
+bool fp_uart_reconfig_raw(int tx_gpio, int rx_gpio, int baud, bool even_parity, bool two_stop_bits);
+int fp_uart_write_raw_fast(const uint8_t *buf, size_t len);
+int fp_uart_read_raw_fast(uint8_t *buf, size_t max_len, uint32_t timeout_ms);
 
 /* Transport bound to the UART. On builds without UART it always reports an I/O error. */
 const fp_transport_t *fp_uart_transport(void);

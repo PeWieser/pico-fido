@@ -91,6 +91,8 @@ class VirtualR558Sensor:
         self.schedule: list[int] = []
         self.led_history: list[tuple[int, int, int, int]] = []
         self.force_reg_3b_once = False
+        self.allow_inf_leak = False
+        self.allow_za_bypass = False
         self._stop = False
         self._thread = threading.Thread(target=self._accept_loop, daemon=True)
         self._thread.start()
@@ -109,6 +111,12 @@ class VirtualR558Sensor:
     @staticmethod
     def _encode_ack(addr: int, payload: bytes) -> bytes:
         pid = 0x07
+        length = len(payload) + 2
+        cksum = (pid + (length >> 8) + (length & 0xFF) + sum(payload)) & 0xFFFF
+        return struct.pack(">HIBH", 0xEF01, addr, pid, length) + payload + struct.pack(">H", cksum)
+
+    @staticmethod
+    def _encode_pkt(addr: int, pid: int, payload: bytes) -> bytes:
         length = len(payload) + 2
         cksum = (pid + (length >> 8) + (length & 0xFF) + sum(payload)) & 0xFFFF
         return struct.pack(">HIBH", 0xEF01, addr, pid, length) + payload + struct.pack(">H", cksum)
@@ -158,15 +166,44 @@ class VirtualR558Sensor:
         if pid != 0x01 or not body:
             return None
         with self.lock:
-            if addr != self.address:
-                return None  # Real R558-S silently ignores wrong chip address
             ins = body[0]
             p = body[1:]
-            reply_addr = addr
+            # Real locked R558-S answers broadcast HandShake (0x35) with 0x21 carrying its own stored ChipAddr!
+            if addr != self.address:
+                if addr == 0xFFFFFFFF and ins == 0x35 and self.password_set:
+                    return self._encode_ack(self.address, b"\x21")
+                return None  # Real R558-S silently ignores wrong chip address
+            reply_addr = self.address
 
-            # Real GROW R558-S silicon rejects non-VfyPwd commands until VfyPwd succeeds in session
+            if ins == 0x16 and self.allow_inf_leak:
+                inf = bytearray(128)
+                struct.pack_into(">I", inf, 0x08, self.address)
+                inf[0x3C:0x40] = self.password
+                struct.pack_into(">H", inf, 0x7E, 0x1234)
+                return self._encode_ack(reply_addr, b"\x00") + self._encode_pkt(reply_addr, 0x08, bytes(inf))
+
+            if self.allow_za_bypass:
+                if ins == 0x53:
+                    return self._encode_ack(reply_addr, b"\x55")
+                if ins == 0xAA:
+                    return self._encode_ack(reply_addr, b"\x58")
+                if ins == 0x54:
+                    if len(p) < 2:
+                        return self._encode_ack(reply_addr, b"\x01")
+                    slot = struct.unpack(">H", p[0:2])[0]
+                    f = self.schedule.pop(0) if self.schedule else 11
+                    self.templates[slot] = f
+                    return self._encode_ack(reply_addr, b"\x00\x06")
+                if ins == 0x55:
+                    f = self.schedule.pop(0) if self.schedule else -1
+                    hit = next((slot for slot, tf in self.templates.items() if tf == f), None)
+                    if hit is None:
+                        return self._encode_ack(reply_addr, b"\x09")
+                    return self._encode_ack(reply_addr, b"\x00" + struct.pack(">HH", hit, 118))
+
+            # Real GROW R558-S silicon rejects non-VfyPwd commands with 0x21 until VfyPwd succeeds in session
             if ins != 0x13 and not self.session_verified:
-                return self._encode_ack(reply_addr, b"\x01")
+                return self._encode_ack(reply_addr, b"\x21" if self.password_set else b"\x01")
 
             if ins == 0x0F:  # ReadSysPara
                 data = struct.pack(">HHHHIBBH", 0, 9, self.capacity, 3, self.address, 0, 2, 6)
@@ -468,6 +505,49 @@ def main() -> int:
         uv_tok = cp.get_uv_token(permissions=ClientPin.PERMISSION.MAKE_CREDENTIAL, permissions_rpid="restored.example")
         assert len(uv_tok) == 32
         print("   ok: backup -> reset -> restore -> cold-boot UV verified!", flush=True)
+
+        print("9. Testing live CTAP 0x0A unlock on locked 0x29062D09 R558-S (ReadINFpage 0x16 -> factory) ...", flush=True)
+        ctap.reset()
+        with sensor.lock:
+            sensor.address = 0x29062D09
+            sensor.password = b"\xAB\xCD\xEF\x42"
+            sensor.password_set = True
+            sensor.session_verified = False
+            sensor.allow_inf_leak = True
+            sensor.allow_za_bypass = False
+        unlock_st = send_vendor_fp(ctap, 10, param=b"\x00")
+        assert unlock_st[9] is True and unlock_st[12] == 0, f"expected clean unlock status, got {unlock_st}"
+        assert "UNLOCKED via INF(0x16)" in unlock_st[10], f"unexpected telemetry: {unlock_st[10]}"
+        assert sensor.address == 0xFFFFFFFF and sensor.password == b"\x00\x00\x00\x00"
+        print("   ok: 0x0A extracted password via INF(0x16) and restored 0xFFFFFFFF factory state!", flush=True)
+
+        print("10. Testing live CTAP 0x0A OEM `za` passwordless bypass + COLD POWER-CYCLE #4 ...", flush=True)
+        with sensor.lock:
+            sensor.address = 0x29062D09
+            sensor.password = b"\xDE\xAD\xC0\xDE"
+            sensor.password_set = True
+            sensor.session_verified = False
+            sensor.allow_inf_leak = False
+            sensor.allow_za_bypass = True
+            sensor.templates.clear()
+        cp = ClientPin(ctap, PinProtocolV2())
+        cp.set_pin("246810")
+        za_st = send_vendor_fp(ctap, 10, param=b"\x00")
+        assert za_st[9] is True and "ZA=OK" in za_st[10], f"expected ZA=OK telemetry, got {za_st}"
+        tok = cp.get_pin_token("246810", permissions=ClientPin.PERMISSION.AUTHENTICATOR_CFG)
+        pair_res = send_vendor_fp(ctap, 2, pin_token=tok)
+        assert pair_res[1] == 100
+        sensor.set_schedule(55)
+        enr_res = send_vendor_fp(ctap, 3, pin_token=tok)
+        assert enr_res[1] == 0
+
+        stop_emu()
+        ctap = start_emu()
+        cp = ClientPin(ctap, PinProtocolV2())
+        sensor.set_schedule(55)
+        uv_tok4 = cp.get_uv_token(permissions=ClientPin.PERMISSION.MAKE_CREDENTIAL, permissions_rpid="za.example")
+        assert len(uv_tok4) == 32
+        print("   ok: passwordless `za` bypass pair + enroll + cold-boot Passkey UV verified!", flush=True)
 
         print("\nALL FULL-STACK CTAP 2.1 + R558-S HARDWARE PROTOCOL TESTS PASSED!", flush=True)
         return 0
