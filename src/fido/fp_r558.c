@@ -385,8 +385,33 @@ static void probe_and_init_sensor(const fp_conf_t *c) {
         }
     }
 
+    /*
+     * If the R558-S answered with a valid checksummed 0xEF01 frame under its own stored ChipAddr
+     * (e.g. from an earlier pairing before ESP32 flash erase), adopt/illuminate that address in dev mode!
+     */
+    if (esp_dev_shared_session(&dev_sh) && fp_sensor_has_last_ack()) {
+        uint32_t seen_addr = fp_sensor_last_ack_addr();
+        uint8_t seen_conf = fp_sensor_last_ack_conf();
+        last_sensor_detected = true;
+        fp_session_t zero_at_seen = { .address = seen_addr, .password = { 0, 0, 0, 0 } };
+        if (fp_sensor_verify_password(t, &zero_at_seen, &code) == FP_SENSOR_OK && code == FP_CONF_OK) {
+            fp_diag_reset();
+            sensor_led(seen_addr, FP_LED_FUNC_FLASH, FP_LED_COLOR_BLUE, FP_LED_COLOR_BLUE, 2);
+            return;
+        }
+        const uint8_t zero_pwd[4] = { 0, 0, 0, 0 };
+        if (fp_sensor_set_password(t, seen_addr, zero_pwd, &code) == FP_SENSOR_OK && code == FP_CONF_OK) {
+            fp_diag_reset();
+            sensor_led(seen_addr, FP_LED_FUNC_FLASH, FP_LED_COLOR_BLUE, FP_LED_COLOR_BLUE, 2);
+            return;
+        }
+        sensor_led(seen_addr, FP_LED_FUNC_FLASH, FP_LED_COLOR_BLUE, FP_LED_COLOR_BLUE, 2);
+        fp_diag_err(FP_INS_VFY_PWD, seen_conf, fst);
+        return;
+    }
+
     last_sensor_detected = false;
-    fp_diag_err(FP_INS_VFY_PWD, 0xFF, fst);
+    fp_diag_err(FP_INS_VFY_PWD, fp_sensor_has_last_ack() ? fp_sensor_last_ack_conf() : 0xFF, fst);
 }
 
 /* Checks the stored password at the stored address. Returns FP_OK, or FP_ERR_SENSOR_AUTH on a wrong password. */
@@ -1100,32 +1125,83 @@ fp_result_t fp_pair(uint16_t *capacity_out) {
          */
         fp_session_t factory = { .address = FP_FACTORY_ADDRESS, .password = { 0, 0, 0, 0 } };
         fp_sensor_status_t st = fp_sensor_verify_password(t, &factory, &code);
-        if (st != FP_SENSOR_OK) {
-            last_sensor_detected = false;
-            fp_diag_err(FP_INS_VFY_PWD, 0xFF, st);
-            conf_clear(&c);
-            return FP_ERR_SENSOR;
-        }
-        last_sensor_detected = true;
-        if (code != FP_CONF_OK) {
-            /* Some factory R558-S batches ship with 0xFFFFFFFF password or accept direct SetPwd(0) in dev mode. */
-            fp_session_t dev_chk;
-            if (esp_dev_shared_session(&dev_chk)) {
-                const uint8_t zero_pwd[4] = { 0, 0, 0, 0 };
-                fp_session_t ff_s = { .address = FP_FACTORY_ADDRESS, .password = { 0xFF, 0xFF, 0xFF, 0xFF } };
-                if ((fp_sensor_verify_password(t, &ff_s, &code) == FP_SENSOR_OK && code == FP_CONF_OK) ||
-                    (fp_sensor_set_password(t, FP_FACTORY_ADDRESS, zero_pwd, &code) == FP_SENSOR_OK && code == FP_CONF_OK)) {
-                    (void)fp_sensor_set_password(t, FP_FACTORY_ADDRESS, zero_pwd, &code);
-                    (void)fp_sensor_verify_password(t, &factory, &code);
+        fp_session_t dev_chk;
+        if (st != FP_SENSOR_OK && esp_dev_shared_session(&dev_chk) && fp_sensor_has_last_ack()) {
+            /* Module replied with its own stored 32-bit ChipAddr in the 0xEF01 ACK header — adopt/unlock it! */
+            uint32_t seen_addr = fp_sensor_last_ack_addr();
+            const uint8_t zero_pwd[4] = { 0, 0, 0, 0 };
+            fp_session_t try_s[2] = {
+                { .address = seen_addr, .password = { 0, 0, 0, 0 } },
+                { .address = seen_addr, .password = { 0xFF, 0xFF, 0xFF, 0xFF } },
+            };
+            bool unlocked_seen = false;
+            for (size_t k = 0; k < 2; k++) {
+                if (fp_sensor_verify_password(t, &try_s[k], &code) == FP_SENSOR_OK && code == FP_CONF_OK) {
+                    (void)fp_sensor_set_password(t, seen_addr, zero_pwd, &code);
+                    unlocked_seen = true;
+                    break;
+                }
+            }
+            if (!unlocked_seen && fp_sensor_set_password(t, seen_addr, zero_pwd, &code) == FP_SENSOR_OK && code == FP_CONF_OK) {
+                unlocked_seen = true;
+            }
+            (void)fp_sensor_set_chip_address(t, seen_addr, FP_FACTORY_ADDRESS, &code);
+            (void)fp_sensor_rest_setting(t, seen_addr, &code);
+            fp_sleep_ms(60);
+
+            st = fp_sensor_verify_password(t, &factory, &code);
+            if (st != FP_SENSOR_OK) {
+                /* Module retained seen_addr: adopt seen_addr + dev password directly into EF_FP_CONF! */
+                (void)fp_sensor_set_password(t, seen_addr, dev_chk.password, &code);
+                fp_session_t adopted = { .address = seen_addr };
+                memcpy(adopted.password, dev_chk.password, 4);
+                fp_sysparam_t seen_sp;
+                if (fp_sensor_verify_password(t, &adopted, &code) == FP_SENSOR_OK && code == FP_CONF_OK &&
+                    fp_sensor_read_sysparam(t, seen_addr, &seen_sp, &code) == FP_SENSOR_OK && code == FP_CONF_OK &&
+                    seen_sp.capacity > 0) {
+                    last_sensor_detected = true;
+                    memset(&c, 0, sizeof(c));
+                    c.flags = FP_FLAG_STAGED;
+                    c.capacity = seen_sp.capacity > FP_TEMPLATE_MAX ? FP_TEMPLATE_MAX : seen_sp.capacity;
+                    memcpy(c.password, adopted.password, 4);
+                    c.address = adopted.address;
+                    if (!conf_save(&c)) {
+                        conf_clear(&c);
+                        return FP_ERR_STORAGE;
+                    }
+                    resumed = true;
                 }
             }
         }
-        if (code != FP_CONF_OK) {
-            fp_diag_err(FP_INS_VFY_PWD, code, FP_SENSOR_OK);
-            conf_clear(&c);
-            return FP_ERR_NOT_FACTORY;
+        if (!resumed) {
+            if (st != FP_SENSOR_OK) {
+                last_sensor_detected = false;
+                fp_diag_err(FP_INS_VFY_PWD, fp_sensor_has_last_ack() ? fp_sensor_last_ack_conf() : 0xFF, st);
+                conf_clear(&c);
+                return FP_ERR_SENSOR;
+            }
+            last_sensor_detected = true;
+            if (code != FP_CONF_OK) {
+                /* Some factory R558-S batches ship with 0xFFFFFFFF password or accept direct SetPwd(0) in dev mode. */
+                if (esp_dev_shared_session(&dev_chk)) {
+                    const uint8_t zero_pwd[4] = { 0, 0, 0, 0 };
+                    fp_session_t ff_s = { .address = FP_FACTORY_ADDRESS, .password = { 0xFF, 0xFF, 0xFF, 0xFF } };
+                    if ((fp_sensor_verify_password(t, &ff_s, &code) == FP_SENSOR_OK && code == FP_CONF_OK) ||
+                        (fp_sensor_set_password(t, FP_FACTORY_ADDRESS, zero_pwd, &code) == FP_SENSOR_OK && code == FP_CONF_OK)) {
+                        (void)fp_sensor_set_password(t, FP_FACTORY_ADDRESS, zero_pwd, &code);
+                        (void)fp_sensor_verify_password(t, &factory, &code);
+                    }
+                }
+            }
+            if (code != FP_CONF_OK) {
+                fp_diag_err(FP_INS_VFY_PWD, code, FP_SENSOR_OK);
+                conf_clear(&c);
+                return FP_ERR_NOT_FACTORY;
+            }
         }
+    }
 
+    if (!resumed && !password_set_already) {
         fp_sysparam_t sp;
         if (fp_sensor_read_sysparam(t, FP_FACTORY_ADDRESS, &sp, &code) != FP_SENSOR_OK || code != FP_CONF_OK) {
             conf_clear(&c);
