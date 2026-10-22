@@ -42,19 +42,21 @@
 #define SIG_GPIO_OUT_IDX 256
 #endif
 
-#define FP_UART_RX_BUF          256
+#define FP_UART_RX_BUF          512
 #define FP_POWERUP_SETTLE_MS    350
 #define FP_INTERFRAME_GUARD_MS  15u   /* 15 ms idle mark so R558-S completes stop bits + re-arms RX */
 #define FP_DEV_SHARED_ADDR      0x5049434Fu /* "PICO" */
+#define FP_POWER_GLITCH_GPIO    3           /* GP3 next to GP2: powers Pin 3 (VCC_MCU) when wired there */
 
 static bool uart_installed = false;
 static int cur_tx_gpio = -1;
 static int cur_rx_gpio = -1;
 static bool has_bus_activity = false;
 static uint32_t last_bus_activity_ms = 0;
+static uint32_t s_sticky_ack_addr = 0;
 static char active_desc[160] = "";
 
-static const int diag_header_gpios[] = { 1, 2, 3, 4, 43, 44 };
+static const int diag_header_gpios[] = { 1, 2, 4, 43, 44 };
 #define NUM_DIAG_GPIOS (sizeof(diag_header_gpios) / sizeof(diag_header_gpios[0]))
 
 typedef struct {
@@ -73,12 +75,30 @@ static uint32_t esp_now_ms(void) {
     return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
 }
 
+/* Keeps GP3 cleanly driven HIGH at max 40 mA drive so Pin 3 (VCC_MCU) works on either 3V3 or GP3. */
+static void maintain_gp3_vcc_rail(void) {
+    if (cur_tx_gpio == FP_POWER_GLITCH_GPIO || cur_rx_gpio == FP_POWER_GLITCH_GPIO) {
+        return;
+    }
+    esp_rom_gpio_connect_out_signal((uint32_t)FP_POWER_GLITCH_GPIO, SIG_GPIO_OUT_IDX, false, false);
+    esp_rom_gpio_pad_select_gpio((uint32_t)FP_POWER_GLITCH_GPIO);
+    (void)gpio_set_drive_capability((gpio_num_t)FP_POWER_GLITCH_GPIO, GPIO_DRIVE_CAP_3);
+    (void)gpio_set_level((gpio_num_t)FP_POWER_GLITCH_GPIO, 1);
+    (void)gpio_set_direction((gpio_num_t)FP_POWER_GLITCH_GPIO, GPIO_MODE_OUTPUT);
+}
+
 static void detach_pin(int pin) {
     if (pin < 0) {
         return;
     }
     esp_rom_gpio_connect_out_signal((uint32_t)pin, SIG_GPIO_OUT_IDX, false, false);
     (void)gpio_reset_pin((gpio_num_t)pin);
+    if (pin == FP_POWER_GLITCH_GPIO) {
+        (void)gpio_set_drive_capability((gpio_num_t)pin, GPIO_DRIVE_CAP_3);
+        (void)gpio_set_level((gpio_num_t)pin, 1);
+        (void)gpio_set_direction((gpio_num_t)pin, GPIO_MODE_OUTPUT);
+        return;
+    }
     (void)gpio_set_direction((gpio_num_t)pin, GPIO_MODE_INPUT);
     (void)gpio_pulldown_dis((gpio_num_t)pin);
     (void)gpio_pullup_en((gpio_num_t)pin);
@@ -97,11 +117,6 @@ static int esp_uart_write(void *ctx, const uint8_t *buf, size_t len) {
     if (!uart_installed) {
         return -1;
     }
-    /*
-     * Enforce a 12 ms idle turnaround guard after any prior RX/TX activity on the R558-S line.
-     * Without this guard, a 240 MHz ESP32-S3 starts the next 0xEF01 packet within microseconds of
-     * reading an ACK — colliding with the R558-S's 2nd stop bit before its MCU re-arms UART RX!
-     */
     if (has_bus_activity) {
         uint32_t elapsed = esp_now_ms() - last_bus_activity_ms;
         if (elapsed < FP_INTERFRAME_GUARD_MS) {
@@ -149,15 +164,19 @@ static const fp_transport_t uart_transport = {
     .flush = esp_uart_flush,
 };
 
-static bool configure_uart_channel(int tx_gpio, int rx_gpio, int baud, uart_stop_bits_t stop_bits) {
+bool fp_uart_reconfig_raw(int tx_gpio, int rx_gpio, int baud, bool even_parity, bool two_stop_bits) {
     int prev_tx = cur_tx_gpio;
     int prev_rx = cur_rx_gpio;
-    detach_pin(prev_tx);
-    detach_pin(prev_rx);
-    detach_pin(tx_gpio);
-    detach_pin(rx_gpio);
     cur_tx_gpio = -1;
     cur_rx_gpio = -1;
+    detach_pin(prev_tx);
+    detach_pin(prev_rx);
+    if (tx_gpio != FP_POWER_GLITCH_GPIO) {
+        detach_pin(tx_gpio);
+    }
+    if (rx_gpio != FP_POWER_GLITCH_GPIO) {
+        detach_pin(rx_gpio);
+    }
 
     esp_rom_gpio_pad_select_gpio((uint32_t)tx_gpio);
     esp_rom_gpio_pad_select_gpio((uint32_t)rx_gpio);
@@ -165,24 +184,27 @@ static bool configure_uart_channel(int tx_gpio, int rx_gpio, int baud, uart_stop
     const uart_config_t cfg = {
         .baud_rate = baud,
         .data_bits = UART_DATA_8_BITS,
-        .parity = UART_PARITY_DISABLE,
-        .stop_bits = stop_bits,
+        .parity = even_parity ? UART_PARITY_EVEN : UART_PARITY_DISABLE,
+        .stop_bits = two_stop_bits ? UART_STOP_BITS_2 : UART_STOP_BITS_1,
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
         .source_clk = UART_SCLK_DEFAULT,
     };
 
     if (!uart_installed) {
         if (uart_driver_install(FP_UART_NUM, FP_UART_RX_BUF, 0, 0, NULL, 0) != ESP_OK) {
+            maintain_gp3_vcc_rail();
             restore_uart0_console_if_unused();
             return false;
         }
         uart_installed = true;
     }
     if (uart_param_config(FP_UART_NUM, &cfg) != ESP_OK) {
+        maintain_gp3_vcc_rail();
         restore_uart0_console_if_unused();
         return false;
     }
     if (uart_set_pin(FP_UART_NUM, tx_gpio, rx_gpio, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE) != ESP_OK) {
+        maintain_gp3_vcc_rail();
         restore_uart0_console_if_unused();
         return false;
     }
@@ -190,17 +212,61 @@ static bool configure_uart_channel(int tx_gpio, int rx_gpio, int baud, uart_stop
     (void)gpio_pullup_en((gpio_num_t)rx_gpio);
     cur_tx_gpio = tx_gpio;
     cur_rx_gpio = rx_gpio;
+    maintain_gp3_vcc_rail();
     restore_uart0_console_if_unused();
-    esp_rom_delay_us(500);
+    esp_rom_delay_us(300);
     (void)uart_flush_input(FP_UART_NUM);
+    has_bus_activity = false;
     return true;
 }
 
+static bool configure_uart_channel(int tx_gpio, int rx_gpio, int baud, uart_stop_bits_t stop_bits) {
+    return fp_uart_reconfig_raw(tx_gpio, rx_gpio, baud, false, stop_bits == UART_STOP_BITS_2);
+}
+
+int fp_uart_write_raw_fast(const uint8_t *buf, size_t len) {
+    if (!uart_installed || buf == NULL || len == 0) {
+        return -1;
+    }
+    int n = uart_write_bytes(FP_UART_NUM, (const char *)buf, len);
+    if (n < 0 || (size_t)n != len) {
+        return -1;
+    }
+    esp_err_t rc = uart_wait_tx_done(FP_UART_NUM, pdMS_TO_TICKS(100));
+    last_bus_activity_ms = esp_now_ms();
+    has_bus_activity = true;
+    return rc == ESP_OK ? 0 : -1;
+}
+
+int fp_uart_read_raw_fast(uint8_t *buf, size_t max_len, uint32_t timeout_ms) {
+    return esp_uart_read(NULL, buf, max_len, timeout_ms);
+}
+
+/* True if `pin` is externally driven 3.3V HIGH by the sensor against ESP32's internal pull-down. */
+static bool is_pin_driven_high_externally(int pin) {
+    if (pin < 0 || pin == FP_POWER_GLITCH_GPIO || pin == 43) {
+        return false;
+    }
+    esp_rom_gpio_connect_out_signal((uint32_t)pin, SIG_GPIO_OUT_IDX, false, false);
+    (void)gpio_reset_pin((gpio_num_t)pin);
+    (void)gpio_set_direction((gpio_num_t)pin, GPIO_MODE_INPUT);
+    (void)gpio_pullup_dis((gpio_num_t)pin);
+    (void)gpio_pulldown_en((gpio_num_t)pin);
+    esp_rom_delay_us(150);
+    int lvl = gpio_get_level((gpio_num_t)pin);
+    (void)gpio_pulldown_dis((gpio_num_t)pin);
+    (void)gpio_pullup_en((gpio_num_t)pin);
+    return lvl == 1;
+}
+
 static size_t detect_driven_high_pins(const int *pin_list, size_t n_pins, int *high_pins, size_t max_out) {
-    detach_pin(cur_tx_gpio);
-    detach_pin(cur_rx_gpio);
+    int prev_tx = cur_tx_gpio;
+    int prev_rx = cur_rx_gpio;
     cur_tx_gpio = -1;
     cur_rx_gpio = -1;
+    detach_pin(prev_tx);
+    detach_pin(prev_rx);
+    maintain_gp3_vcc_rail();
 
     for (size_t i = 0; i < n_pins; i++) {
         int pin = pin_list[i];
@@ -252,42 +318,44 @@ static bool uart_efuse_session(fp_session_t *out) {
     return true;
 }
 
-static bool probe_address_fast(uint32_t addr, uint32_t timeout_ms) {
-    const uint8_t zero_pwd[4] = { 0, 0, 0, 0 };
+/* Password-neutral HandShake probe (consumes ZERO VfyPwd anti-brute-force attempts!). */
+static bool probe_handshake_fast(uint32_t addr, uint32_t timeout_ms) {
     uint8_t code = 0xFF;
-    return fp_sensor_txn(&uart_transport, addr, FP_INS_VFY_PWD,
-                         zero_pwd, sizeof(zero_pwd), NULL, 0, NULL,
-                         &code, timeout_ms, false) == FP_SENSOR_OK;
+    if (fp_sensor_txn(&uart_transport, addr, FP_INS_HANDSHAKE,
+                      NULL, 0, NULL, 0, NULL, &code, timeout_ms, false) == FP_SENSOR_OK) {
+        if (fp_sensor_has_last_ack() && fp_sensor_last_ack_addr() != 0) {
+            s_sticky_ack_addr = fp_sensor_last_ack_addr();
+        }
+        return true;
+    }
+    return false;
 }
 
-static void unlock_module_at_address(uint32_t addr) {
+static bool probe_address_fast(uint32_t addr, uint32_t timeout_ms) {
+    if (probe_handshake_fast(addr, timeout_ms)) {
+        return true;
+    }
     const uint8_t zero_pwd[4] = { 0, 0, 0, 0 };
-    const uint8_t ff_pwd[4] = { 0xFF, 0xFF, 0xFF, 0xFF };
     uint8_t code = 0xFF;
-    fp_session_t tmp_s = { .address = addr, .password = { 0, 0, 0, 0 } };
-    (void)fp_sensor_cancel(&uart_transport, &tmp_s, &code);
-    fp_session_t ff_s = { .address = addr, .password = { 0xFF, 0xFF, 0xFF, 0xFF } };
-    if (fp_sensor_verify_password(&uart_transport, &ff_s, &code) == FP_SENSOR_OK && code == FP_CONF_OK) {
-        (void)fp_sensor_set_password(&uart_transport, addr, zero_pwd, &code);
+    if (fp_sensor_txn(&uart_transport, addr, FP_INS_VFY_PWD,
+                      zero_pwd, sizeof(zero_pwd), NULL, 0, NULL,
+                      &code, timeout_ms, false) == FP_SENSOR_OK) {
+        if (fp_sensor_has_last_ack() && fp_sensor_last_ack_addr() != 0) {
+            s_sticky_ack_addr = fp_sensor_last_ack_addr();
+        }
+        return true;
     }
-    else {
-        (void)fp_sensor_set_password(&uart_transport, addr, zero_pwd, &code);
-        (void)fp_sensor_set_password(&uart_transport, addr, ff_pwd, &code);
-        (void)fp_sensor_set_password(&uart_transport, addr, zero_pwd, &code);
-    }
-    if (addr != FP_FACTORY_ADDRESS) {
-        (void)fp_sensor_set_chip_address(&uart_transport, addr, FP_FACTORY_ADDRESS, &code);
-    }
-    if (fp_sensor_rest_setting(&uart_transport, addr, &code) == FP_SENSOR_OK && code == FP_CONF_OK) {
-        vTaskDelay(pdMS_TO_TICKS(80));
-    }
+    return false;
 }
 
 int fp_uart_init(void) {
+    maintain_gp3_vcc_rail();
+    vTaskDelay(pdMS_TO_TICKS(65));
     return configure_uart_channel(FP_UART_TX_GPIO, FP_UART_RX_GPIO, FP_UART_BAUD, UART_STOP_BITS_1) ? 0 : -1;
 }
 
 bool fp_uart_scan_pins(uint32_t paired_addr) {
+    maintain_gp3_vcc_rail();
     uint32_t up = esp_now_ms();
     if (up < FP_POWERUP_SETTLE_MS) {
         vTaskDelay(pdMS_TO_TICKS(FP_POWERUP_SETTLE_MS - up));
@@ -297,14 +365,16 @@ bool fp_uart_scan_pins(uint32_t paired_addr) {
         return false;
     }
 
+    /* Preserve any previously observed ChipAddr across re-scans! */
+    if (fp_sensor_has_last_ack() && fp_sensor_last_ack_addr() != 0) {
+        s_sticky_ack_addr = fp_sensor_last_ack_addr();
+    }
+    uint32_t prev_seen = s_sticky_ack_addr;
     fp_sensor_clear_last_ack();
 
     fp_session_t ef = { 0 };
     bool have_ef = uart_efuse_session(&ef);
 
-    /*
-     * TX=GPIO1, RX=GPIO2 (wiring diagram default) first, followed by swapped polarity & GP43/44/4/5:
-     */
     const fp_pin_pair_t pairs[] = {
         { FP_UART_TX_GPIO, FP_UART_RX_GPIO }, /* TX=GPIO1, RX=GPIO2 (diagram default!) */
         { FP_UART_RX_GPIO, FP_UART_TX_GPIO }, /* TX=GPIO2, RX=GPIO1 (swapped) */
@@ -314,11 +384,16 @@ bool fp_uart_scan_pins(uint32_t paired_addr) {
         { 5, 4 },
     };
     const fp_framing_t framings[] = {
-        { 57600, UART_STOP_BITS_1, "57600 8N1", 32 },
-        { 57600, UART_STOP_BITS_2, "57600 8N2", 30 },
+        { 57600, UART_STOP_BITS_1, "57600 8N1", 60 },
+        { 57600, UART_STOP_BITS_2, "57600 8N2", 45 },
     };
 
     for (size_t i = 0; i < sizeof(pairs) / sizeof(pairs[0]); i++) {
+        /* Never drive ESP32 push-pull TX onto a line externally driven 3.3V HIGH by R558-S TX! */
+        if (is_pin_driven_high_externally(pairs[i].tx_gpio) &&
+            !is_pin_driven_high_externally(pairs[i].rx_gpio)) {
+            continue;
+        }
         for (size_t f = 0; f < sizeof(framings) / sizeof(framings[0]); f++) {
             if (!configure_uart_channel(pairs[i].tx_gpio, pairs[i].rx_gpio, framings[f].baud, framings[f].stop_bits)) {
                 continue;
@@ -327,28 +402,28 @@ bool fp_uart_scan_pins(uint32_t paired_addr) {
                 const uint8_t wake = 0x00;
                 uart_write_bytes(FP_UART_NUM, (const char *)&wake, 1);
                 uart_wait_tx_done(FP_UART_NUM, pdMS_TO_TICKS(8));
-                vTaskDelay(pdMS_TO_TICKS(15));
+                vTaskDelay(pdMS_TO_TICKS(18));
                 uart_flush_input(FP_UART_NUM);
                 has_bus_activity = false;
             }
             bool ok = false;
-            if (i == 0 && f == 0) {
-                /* Try password-neutral HandShake (0x35) first so cold boot discovers ChipAddr before any wrong VfyPwd! */
-                uint8_t hs_code = 0xFF;
-                ok = fp_sensor_txn(&uart_transport, FP_FACTORY_ADDRESS, FP_INS_HANDSHAKE,
-                                   NULL, 0, NULL, 0, NULL, &hs_code, 25, false) == FP_SENSOR_OK;
+            if (prev_seen != 0 && prev_seen != FP_FACTORY_ADDRESS) {
+                ok = probe_handshake_fast(prev_seen, framings[f].timeout_ms);
+            }
+            if (!ok && paired_addr != 0 && paired_addr != FP_FACTORY_ADDRESS && paired_addr != prev_seen) {
+                ok = probe_handshake_fast(paired_addr, framings[f].timeout_ms);
             }
             if (!ok) {
-                ok = probe_address_fast(FP_FACTORY_ADDRESS, framings[f].timeout_ms);
+                ok = probe_handshake_fast(FP_FACTORY_ADDRESS, framings[f].timeout_ms);
             }
             if (!ok && f == 0) {
-                ok = probe_address_fast(FP_DEV_SHARED_ADDR, framings[f].timeout_ms);
+                ok = probe_handshake_fast(FP_DEV_SHARED_ADDR, 35);
             }
-            if (!ok && paired_addr != 0 && paired_addr != FP_FACTORY_ADDRESS && paired_addr != FP_DEV_SHARED_ADDR) {
-                ok = probe_address_fast(paired_addr, framings[f].timeout_ms);
+            if (!ok && f == 0 && have_ef && ef.address != paired_addr && ef.address != prev_seen) {
+                ok = probe_handshake_fast(ef.address, 35);
             }
-            if (!ok && f == 0 && have_ef && ef.address != paired_addr) {
-                ok = probe_address_fast(ef.address, framings[f].timeout_ms);
+            if (!ok && f == 0) {
+                ok = probe_address_fast(FP_FACTORY_ADDRESS, 40);
             }
             if (ok) {
                 snprintf(active_desc, sizeof(active_desc), "TX=GPIO%d, RX=GPIO%d (%s)",
@@ -361,10 +436,10 @@ bool fp_uart_scan_pins(uint32_t paired_addr) {
     int high_pins[6] = { 0 };
     size_t high_count = detect_driven_high_pins(diag_header_gpios, NUM_DIAG_GPIOS, high_pins, 6);
     if (high_count == 0) {
-        snprintf(active_desc, sizeof(active_desc), "DIAG: Alle Pins 0V (GP1..4,43,44 LOW) -> Strom/Kabel!");
+        snprintf(active_desc, sizeof(active_desc), "DIAG: Alle Pins 0V (GP1,2,4,43,44 LOW) -> Strom/Kabel!");
     }
     else if (high_count == 1) {
-        snprintf(active_desc, sizeof(active_desc), "DIAG: Sensor-TX auf GP%d=3.3V aktiv (0B Antwort)", high_pins[0]);
+        snprintf(active_desc, sizeof(active_desc), "DIAG: Sensor-TX auf GP%d=3.3V aktiv (USB 3s trennen / Unlock)", high_pins[0]);
     }
     else {
         snprintf(active_desc, sizeof(active_desc), "DIAG: 3.3V auf GP%d,GP%d aktiv (0B Antwort)", high_pins[0], high_pins[1]);
@@ -380,24 +455,26 @@ bool fp_uart_rescue_factory_reset(uint32_t hint_addr) {
         return false;
     }
 
-    uint32_t deadline = esp_now_ms() + 4500u; /* Strictly finish inside 4.5s — zero USB timeout ever! */
+    uint32_t deadline = esp_now_ms() + 3800u;
+    if (fp_sensor_has_last_ack() && fp_sensor_last_ack_addr() != 0) {
+        s_sticky_ack_addr = fp_sensor_last_ack_addr();
+    }
+    uint32_t prev_seen = s_sticky_ack_addr != 0 ? s_sticky_ack_addr : hint_addr;
     fp_sensor_clear_last_ack();
 
     const fp_pin_pair_t rescue_pairs[] = {
-        { FP_UART_TX_GPIO, FP_UART_RX_GPIO }, /* TX=GPIO1, RX=GPIO2 */
-        { FP_UART_RX_GPIO, FP_UART_TX_GPIO }, /* TX=GPIO2, RX=GPIO1 */
+        { FP_UART_TX_GPIO, FP_UART_RX_GPIO },
+        { FP_UART_RX_GPIO, FP_UART_TX_GPIO },
         { 43, 44 },
         { 44, 43 },
-        { 2, 3 },
-        { 3, 2 },
         { 4, 5 },
         { 5, 4 },
     };
     const fp_framing_t framings[] = {
-        { 57600, UART_STOP_BITS_1, "57600 8N1", 40 },
-        { 57600, UART_STOP_BITS_2, "57600 8N2", 40 },
-        { 115200, UART_STOP_BITS_1, "115200 8N1", 35 },
-        { 9600, UART_STOP_BITS_1, "9600 8N1", 50 },
+        { 57600, UART_STOP_BITS_1, "57600 8N1", 55 },
+        { 57600, UART_STOP_BITS_2, "57600 8N2", 45 },
+        { 115200, UART_STOP_BITS_1, "115200 8N1", 40 },
+        { 9600, UART_STOP_BITS_1, "9600 8N1", 55 },
     };
 
     fp_session_t ef = { 0 };
@@ -409,71 +486,83 @@ bool fp_uart_rescue_factory_reset(uint32_t hint_addr) {
         if (esp_now_ms() >= deadline) {
             break;
         }
+        if (is_pin_driven_high_externally(rescue_pairs[i].tx_gpio) &&
+            !is_pin_driven_high_externally(rescue_pairs[i].rx_gpio)) {
+            continue;
+        }
         for (size_t f = 0; f < sizeof(framings) / sizeof(framings[0]); f++) {
             if (esp_now_ms() >= deadline) {
                 break;
             }
-            if (f >= 2 && i >= 4) {
+            if (f >= 2 && i >= 2) {
                 break;
             }
             if (!configure_uart_channel(rescue_pairs[i].tx_gpio, rescue_pairs[i].rx_gpio,
                                         framings[f].baud, framings[f].stop_bits)) {
                 continue;
             }
-            if (f == 0) {
-                const uint8_t wake = 0x00;
-                uart_write_bytes(FP_UART_NUM, (const char *)&wake, 1);
-                uart_wait_tx_done(FP_UART_NUM, pdMS_TO_TICKS(8));
-                vTaskDelay(pdMS_TO_TICKS(15));
-                uart_flush_input(FP_UART_NUM);
-                has_bus_activity = false;
+            bool got = false;
+            if (prev_seen != 0 && prev_seen != FP_FACTORY_ADDRESS) {
+                got = probe_handshake_fast(prev_seen, framings[f].timeout_ms);
             }
-
-            uint8_t code = 0xFF;
-            if (fp_sensor_verify_password(&uart_transport, &dev_sh, &code) == FP_SENSOR_OK && code == FP_CONF_OK) {
-                (void)fp_sensor_empty(&uart_transport, &dev_sh, &code);
-                (void)fp_sensor_set_password(&uart_transport, dev_sh.address, zero_pwd, &code);
-                (void)fp_sensor_set_chip_address(&uart_transport, dev_sh.address, FP_FACTORY_ADDRESS, &code);
-                vTaskDelay(pdMS_TO_TICKS(50));
+            if (!got) {
+                got = probe_handshake_fast(FP_FACTORY_ADDRESS, framings[f].timeout_ms);
             }
-            if (have_ef && fp_sensor_verify_password(&uart_transport, &ef, &code) == FP_SENSOR_OK && code == FP_CONF_OK) {
-                (void)fp_sensor_empty(&uart_transport, &ef, &code);
-                (void)fp_sensor_set_password(&uart_transport, ef.address, zero_pwd, &code);
-                (void)fp_sensor_set_chip_address(&uart_transport, ef.address, FP_FACTORY_ADDRESS, &code);
-                vTaskDelay(pdMS_TO_TICKS(50));
+            if (!got && f == 0) {
+                got = probe_address_fast(FP_FACTORY_ADDRESS, 40);
             }
-
-            /* Probe factory address & capture any self-reported stored ChipAddr from the module's ACK header! */
-            (void)probe_address_fast(FP_FACTORY_ADDRESS, framings[f].timeout_ms);
-            if (fp_sensor_has_last_ack()) {
-                uint32_t seen_addr = fp_sensor_last_ack_addr();
-                unlock_module_at_address(seen_addr);
-                if (seen_addr != FP_FACTORY_ADDRESS) {
-                    unlock_module_at_address(FP_FACTORY_ADDRESS);
+            if (got) {
+                uint32_t seen = fp_sensor_has_last_ack() ? fp_sensor_last_ack_addr() : FP_FACTORY_ADDRESS;
+                uint8_t code = 0xFF;
+                if (fp_sensor_verify_password(&uart_transport, &dev_sh, &code) == FP_SENSOR_OK && code == FP_CONF_OK) {
+                    (void)fp_sensor_empty(&uart_transport, &dev_sh, &code);
+                    (void)fp_sensor_set_password(&uart_transport, dev_sh.address, zero_pwd, &code);
+                    (void)fp_sensor_set_chip_address(&uart_transport, dev_sh.address, FP_FACTORY_ADDRESS, &code);
+                    seen = FP_FACTORY_ADDRESS;
                 }
-                if (probe_address_fast(FP_FACTORY_ADDRESS, framings[f].timeout_ms) ||
-                    probe_address_fast(seen_addr, framings[f].timeout_ms)) {
-                    snprintf(active_desc, sizeof(active_desc),
-                             "TX=GPIO%d, RX=GPIO%d (%s) A=0x%08" PRIX32,
-                             rescue_pairs[i].tx_gpio, rescue_pairs[i].rx_gpio,
-                             framings[f].label, fp_sensor_last_ack_addr());
-                    return true;
+                else if (have_ef && fp_sensor_verify_password(&uart_transport, &ef, &code) == FP_SENSOR_OK && code == FP_CONF_OK) {
+                    (void)fp_sensor_empty(&uart_transport, &ef, &code);
+                    (void)fp_sensor_set_password(&uart_transport, ef.address, zero_pwd, &code);
+                    (void)fp_sensor_set_chip_address(&uart_transport, ef.address, FP_FACTORY_ADDRESS, &code);
+                    seen = FP_FACTORY_ADDRESS;
                 }
-            }
-
-            if (hint_addr != 0 && hint_addr != FP_FACTORY_ADDRESS) {
-                unlock_module_at_address(hint_addr);
-                if (probe_address_fast(FP_FACTORY_ADDRESS, framings[f].timeout_ms) ||
-                    probe_address_fast(hint_addr, framings[f].timeout_ms)) {
-                    snprintf(active_desc, sizeof(active_desc), "TX=GPIO%d, RX=GPIO%d (%s)",
-                             rescue_pairs[i].tx_gpio, rescue_pairs[i].rx_gpio, framings[f].label);
-                    return true;
+                else {
+                    (void)fp_sensor_set_password(&uart_transport, seen, zero_pwd, &code);
+                    if (seen != FP_FACTORY_ADDRESS && code == FP_CONF_OK) {
+                        (void)fp_sensor_set_chip_address(&uart_transport, seen, FP_FACTORY_ADDRESS, &code);
+                        seen = FP_FACTORY_ADDRESS;
+                    }
+                    if (fp_sensor_rest_setting(&uart_transport, seen, &code) == FP_SENSOR_OK && code == FP_CONF_OK) {
+                        vTaskDelay(pdMS_TO_TICKS(80));
+                        seen = FP_FACTORY_ADDRESS;
+                    }
                 }
+                s_sticky_ack_addr = seen;
+                snprintf(active_desc, sizeof(active_desc),
+                         "TX=GPIO%d, RX=GPIO%d (%s)",
+                         rescue_pairs[i].tx_gpio, rescue_pairs[i].rx_gpio, framings[f].label);
+                return true;
             }
         }
     }
 
-    return fp_uart_scan_pins(hint_addr);
+    return fp_uart_scan_pins(prev_seen);
+}
+
+uint32_t fp_uart_sticky_addr(void) {
+    return s_sticky_ack_addr;
+}
+
+void fp_uart_set_sticky_addr(uint32_t addr) {
+    s_sticky_ack_addr = addr;
+}
+
+int fp_uart_active_tx_gpio(void) {
+    return cur_tx_gpio;
+}
+
+int fp_uart_active_rx_gpio(void) {
+    return cur_rx_gpio;
 }
 
 const char *fp_uart_active_pins(void) {
@@ -500,12 +589,15 @@ const fp_transport_t *fp_uart_transport(void) {
 #include <arpa/inet.h>
 #include <errno.h>
 #include <poll.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 static int emu_fd = -1;
+static uint32_t emu_sticky_addr = 0;
+static char emu_desc[160] = "";
 
 static int emu_ensure_conn(void) {
     if (emu_fd >= 0) {
@@ -546,6 +638,9 @@ int fp_uart_init(void) {
 
 bool fp_uart_scan_pins(uint32_t paired_addr) {
     (void)paired_addr;
+    if (fp_sensor_has_last_ack() && fp_sensor_last_ack_addr() != 0) {
+        emu_sticky_addr = fp_sensor_last_ack_addr();
+    }
     return emu_ensure_conn() >= 0;
 }
 
@@ -553,12 +648,44 @@ bool fp_uart_rescue_factory_reset(uint32_t hint_addr) {
     return fp_uart_scan_pins(hint_addr);
 }
 
+uint32_t fp_uart_sticky_addr(void) {
+    return emu_sticky_addr;
+}
+
+void fp_uart_set_sticky_addr(uint32_t addr) {
+    emu_sticky_addr = addr;
+}
+
+int fp_uart_active_tx_gpio(void) {
+    return 1;
+}
+
+int fp_uart_active_rx_gpio(void) {
+    return 2;
+}
+
+bool fp_uart_reconfig_raw(int tx_gpio, int rx_gpio, int baud, bool even_parity, bool two_stop_bits) {
+    (void)tx_gpio;
+    (void)rx_gpio;
+    (void)baud;
+    (void)even_parity;
+    (void)two_stop_bits;
+    return emu_ensure_conn() >= 0;
+}
+
 const char *fp_uart_active_pins(void) {
+    if (emu_desc[0] != '\0') {
+        return emu_desc;
+    }
     return emu_fd >= 0 ? "TX=GPIO1, RX=GPIO2 (57600 8N1)" : "";
 }
 
 void fp_uart_set_diag(const char *msg) {
-    (void)msg;
+    if (msg == NULL) {
+        emu_desc[0] = '\0';
+        return;
+    }
+    snprintf(emu_desc, sizeof(emu_desc), "%s", msg);
 }
 
 static int emu_write(void *ctx, const uint8_t *data, size_t len) {
@@ -600,6 +727,14 @@ static int emu_read(void *ctx, uint8_t *data, size_t len, uint32_t timeout_ms) {
     return (int)r;
 }
 
+int fp_uart_write_raw_fast(const uint8_t *buf, size_t len) {
+    return emu_write(NULL, buf, len);
+}
+
+int fp_uart_read_raw_fast(uint8_t *buf, size_t max_len, uint32_t timeout_ms) {
+    return emu_read(NULL, buf, max_len, timeout_ms);
+}
+
 static void emu_flush(void *ctx) {
     (void)ctx;
     int fd = emu_ensure_conn();
@@ -630,6 +765,11 @@ const fp_transport_t *fp_uart_transport(void) {
 
 #else /* host or non-ESP builds without virtual sensor: no sensor attached */
 
+#include <stdio.h>
+
+static uint32_t host_sticky_addr = 0;
+static char host_desc[160] = "";
+
 int fp_uart_init(void) {
     return -1;
 }
@@ -644,12 +784,54 @@ bool fp_uart_rescue_factory_reset(uint32_t hint_addr) {
     return false;
 }
 
+uint32_t fp_uart_sticky_addr(void) {
+    return host_sticky_addr;
+}
+
+void fp_uart_set_sticky_addr(uint32_t addr) {
+    host_sticky_addr = addr;
+}
+
+int fp_uart_active_tx_gpio(void) {
+    return -1;
+}
+
+int fp_uart_active_rx_gpio(void) {
+    return -1;
+}
+
+bool fp_uart_reconfig_raw(int tx_gpio, int rx_gpio, int baud, bool even_parity, bool two_stop_bits) {
+    (void)tx_gpio;
+    (void)rx_gpio;
+    (void)baud;
+    (void)even_parity;
+    (void)two_stop_bits;
+    return false;
+}
+
+int fp_uart_write_raw_fast(const uint8_t *buf, size_t len) {
+    (void)buf;
+    (void)len;
+    return -1;
+}
+
+int fp_uart_read_raw_fast(uint8_t *buf, size_t max_len, uint32_t timeout_ms) {
+    (void)buf;
+    (void)max_len;
+    (void)timeout_ms;
+    return -1;
+}
+
 const char *fp_uart_active_pins(void) {
-    return "";
+    return host_desc;
 }
 
 void fp_uart_set_diag(const char *msg) {
-    (void)msg;
+    if (msg == NULL) {
+        host_desc[0] = '\0';
+        return;
+    }
+    snprintf(host_desc, sizeof(host_desc), "%s", msg);
 }
 
 static int no_write(void *ctx, const uint8_t *data, size_t len) {

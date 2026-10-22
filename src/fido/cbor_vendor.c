@@ -355,13 +355,23 @@ static int cbor_vendor_generic(uint8_t cmd, const uint8_t *data, size_t len) {
          *   0x08 probe             -> live UART multi-pin scan + LED ring flash + full status map {1..10}
          * Subcommands 0x02-0x07 need a PIN token (ACFG). No button: the sensor is the only interaction.
          */
-        if (vendorCmd == 0x01 || vendorCmd == 0x08 || vendorCmd == 0x09) {
+        if (vendorCmd == 0x01 || vendorCmd == 0x08 || vendorCmd == 0x09 || vendorCmd == 0x0A) {
             if (vendorCmd == 0x08) {
                 fp_probe();
             }
             else if (vendorCmd == 0x09) {
                 fp_result_t rres = fp_factory_reset_sensor();
                 if (rres == FP_ERR_ALREADY_PAIRED) {
+                    CBOR_ERROR(CTAP2_ERR_NOT_ALLOWED);
+                }
+            }
+            else if (vendorCmd == 0x0A) {
+                uint8_t unlock_pass = 0;
+                if (vendorParam.present == true && vendorParam.len >= 1) {
+                    unlock_pass = vendorParam.data[0];
+                }
+                fp_result_t ures = fp_unlock_sensor_pass(unlock_pass);
+                if (ures == FP_ERR_ALREADY_PAIRED) {
                     CBOR_ERROR(CTAP2_ERR_NOT_ALLOWED);
                 }
             }

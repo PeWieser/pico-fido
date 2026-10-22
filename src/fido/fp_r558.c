@@ -24,6 +24,7 @@
 #include "fp_r558.h"
 #include "fp_r558_sensor.h"
 #include "fp_r558_uart.h"
+#include "fp_r558_unlock.h"
 #include "fp_led.h"
 #include "random.h"
 #include "fs/flash.h"
@@ -62,6 +63,7 @@
 #define FP_FLAG_PAIRED    0x01
 #define FP_FLAG_LOCKED    0x02
 #define FP_FLAG_STAGED    0x04   /* pairing in progress: secrets written, sensor not yet verified */
+#define FP_FLAG_ZA_BYPASS 0x08   /* paired via OEM §5 `za` passwordless opcodes (0x53/0x54/0x55) */
 
 typedef struct {
     uint8_t flags;
@@ -190,6 +192,13 @@ static bool is_dev_npwd_conf(const fp_conf_t *c) {
     return false;
 }
 
+static bool is_za_bypass_conf(const fp_conf_t *c) {
+    return c != NULL && (c->flags & FP_FLAG_ZA_BYPASS) != 0;
+}
+
+static bool za_bypass_ready = false;
+static uint32_t za_bypass_addr = 0;
+
 typedef struct {
     uint32_t addr;
     uint16_t capacity;
@@ -294,8 +303,10 @@ static bool esp_dev_xray_probe(uint32_t seen_addr, esp_dev_xray_t *xr) {
         xr->pwd_unlocked = true;
     }
 
-    /* 4. Check strictly minimal legitimate keys (factory, Keyhold dev, chip eFuse) — max 3 packets total! */
+    /* 4. Check strictly minimal legitimate keys (OUI match, factory, Keyhold dev, chip eFuse)! */
     const uint8_t cand_pwds[][4] = {
+        { 0x7B, 0xF6, 0xB5, 0x30 }, /* AVX-512 Espressif MAC OUI SHA-256 match for 0x29062D09 */
+        { 0x30, 0xB5, 0xF6, 0x7B }, /* LE order of 0x7BF6B530 */
         { 0x00, 0x00, 0x00, 0x00 },
         { 0x52, 0x35, 0x35, 0x38 }, /* "R558" */
     };
@@ -344,9 +355,19 @@ static bool esp_dev_xray_probe(uint32_t seen_addr, esp_dev_xray_t *xr) {
         }
     }
 
-    /* 7. If ROM globally gates every opcode with 0x21/0x13, memoize and avoid any unnecessary commands */
-    if (!xr->pwd_unlocked && (xr->c35 == 0x21 || xr->c35 == FP_CONF_WRONG_PWD) &&
-        (xr->c3c == 0x21 || xr->c3c == FP_CONF_WRONG_PWD)) {
+    /* 7. Check OEM §5 `za` passwordless compatibility echo (`0x53 -> 0x55`) before memoizing lock */
+    if (!xr->pwd_unlocked && fp_za_probe_echo(t, seen_addr)) {
+        xr->bio_unlocked = true;
+        za_bypass_ready = true;
+        za_bypass_addr = seen_addr;
+        locked_foreign_addr = 0;
+        const uint8_t aura_blue[4] = { 0x60, 0x04, 0x10, 0x00 };
+        uint8_t c40 = 0xFF;
+        (void)fp_sensor_txn(t, seen_addr, FP_INS_AURA_LED_RAW, aura_blue, sizeof(aura_blue),
+                            NULL, 0, NULL, &c40, 20, false);
+    }
+    else if (!xr->pwd_unlocked && (xr->c35 == 0x21 || xr->c35 == FP_CONF_WRONG_PWD) &&
+             (xr->c3c == 0x21 || xr->c3c == FP_CONF_WRONG_PWD)) {
         xr->c01 = xr->c3c;
         xr->c0d = xr->c3c;
         xr->c32 = xr->c3c;
@@ -533,6 +554,14 @@ static void probe_and_init_sensor(const fp_conf_t *c) {
     uint8_t code = 0xFF;
 
     if (c->flags & FP_FLAG_PAIRED) {
+        if (is_za_bypass_conf(c)) {
+            fp_sensor_set_accept_any_ack_addr(true);
+            if (fp_za_probe_echo(t, c->address)) {
+                last_sensor_detected = true;
+                fp_diag_reset();
+                return;
+            }
+        }
         if (is_dev_npwd_conf(c)) {
             fp_sensor_set_accept_any_ack_addr(true);
             fp_session_t s = session_of(c);
@@ -645,6 +674,21 @@ static void probe_and_init_sensor(const fp_conf_t *c) {
 static fp_result_t authenticate_sensor(const fp_conf_t *c) {
     fp_session_t s = session_of(c);
     uint8_t code = 0xFF;
+    if (is_za_bypass_conf(c)) {
+        fp_sensor_set_accept_any_ack_addr(true);
+        if (fp_za_probe_echo(fp_uart_transport(), s.address)) {
+            last_sensor_detected = true;
+            return FP_OK;
+        }
+        fp_uart_scan_pins(c->address);
+        if (fp_za_probe_echo(fp_uart_transport(), s.address)) {
+            last_sensor_detected = true;
+            return FP_OK;
+        }
+        last_sensor_detected = false;
+        fp_diag_err(FP_INS_ZA_GET_ECHO, 0xFF, FP_SENSOR_TIMEOUT);
+        return FP_ERR_SENSOR;
+    }
     if (is_dev_npwd_conf(c)) {
         fp_sensor_set_accept_any_ack_addr(true);
         fp_sensor_status_t st = fp_sensor_gen_img(fp_uart_transport(), &s, &code);
@@ -1058,7 +1102,10 @@ void fp_init(void) {
     waiting_finger = false;
     last_sensor_detected = false;
     use_auto_mode = false;
+    za_bypass_ready = false;
+    za_bypass_addr = 0;
     locked_foreign_addr = 0;
+    fp_unlock_reset_state();
     fp_diag_reset();
     if (!FP_FEATURE_ON) {
         return;
@@ -1119,6 +1166,50 @@ fp_result_t fp_factory_reset_sensor(void) {
     conf_clear(&c);
     conf_load(&c);
     probe_and_init_sensor(&c);
+    conf_clear(&c);
+    return last_sensor_detected ? FP_OK : FP_ERR_SENSOR;
+}
+
+fp_result_t fp_unlock_sensor_pass(uint8_t pass) {
+    if (!FP_FEATURE_ON) {
+        return FP_ERR_NOT_PAIRED;
+    }
+    fp_conf_t c;
+    conf_load(&c);
+    if ((c.flags & FP_FLAG_PAIRED) && flash_encryption_active()) {
+        conf_clear(&c);
+        return FP_ERR_ALREADY_PAIRED;
+    }
+    uint32_t hint = (c.flags & (FP_FLAG_PAIRED | FP_FLAG_STAGED)) ? c.address : locked_foreign_addr;
+    fp_session_t ef = { 0 };
+    bool have_ef = esp_dev_efuse_session(&ef);
+
+    fp_unlock_report_t rep;
+    fp_unlock_run_pass(fp_uart_transport(), pass, hint, ef.password, have_ef, &rep);
+    fp_uart_set_diag(rep.summary);
+
+    if (rep.unlocked_factory) {
+        locked_foreign_addr = 0;
+        za_bypass_ready = false;
+        za_bypass_addr = 0;
+        last_sensor_detected = true;
+        fp_diag_reset();
+        conf_clear(&c);
+        return FP_OK;
+    }
+    if (rep.za_bypass_available) {
+        locked_foreign_addr = 0;
+        za_bypass_ready = true;
+        za_bypass_addr = rep.target_addr != 0u ? rep.target_addr : 0x29062D09u;
+        last_sensor_detected = true;
+        fp_diag_reset();
+        conf_clear(&c);
+        return FP_OK;
+    }
+
+    last_sensor_detected = (rep.target_addr != 0u);
+    locked_foreign_addr = rep.target_addr;
+    fp_diag_err(FP_INS_VFY_PWD, 0x21, rep.target_addr != 0u ? FP_SENSOR_OK : FP_SENSOR_TIMEOUT);
     conf_clear(&c);
     return last_sensor_detected ? FP_OK : FP_ERR_SENSOR;
 }
@@ -1205,7 +1296,24 @@ fp_result_t fp_verify(uint32_t timeout_ms) {
         fp_led_op_begin();
         sensor_led(s.address, FP_LED_FUNC_BREATHE, FP_LED_COLOR_BLUE, FP_LED_COLOR_BLUE, 0);
 
-        if (use_auto_mode) {
+        if (is_za_bypass_conf(&c)) {
+            res = fp_za_verify_finger(fp_uart_transport(), s.address, timeout_ms, &page,
+                                      &cancel_button, &waiting_finger,
+                                      &last_err_ins, &last_err_conf);
+            if (res == FP_ERR_NO_MATCH) {
+                register_failure(&c, false);
+            }
+            else if (res == FP_OK) {
+                if (!slot_used(&c, page)) {
+                    res = FP_ERR_SENSOR_AUTH;
+                    register_failure(&c, true);
+                }
+                else {
+                    register_success(&c);
+                }
+            }
+        }
+        else if (use_auto_mode) {
             res = fp_verify_auto(&s, timeout_ms, &page);
             if (res == FP_ERR_NO_MATCH) {
                 register_failure(&c, false);
@@ -1302,7 +1410,7 @@ fp_result_t fp_pair(uint16_t *capacity_out) {
 
     /* A sensor that is still trusted cannot be replaced. */
     if (c.flags & FP_FLAG_PAIRED) {
-        if (is_dev_npwd_conf(&c) && authenticate_sensor(&c) == FP_OK) {
+        if ((is_dev_npwd_conf(&c) || is_za_bypass_conf(&c)) && authenticate_sensor(&c) == FP_OK) {
             conf_clear(&c);
             return FP_ERR_ALREADY_PAIRED;
         }
@@ -1311,6 +1419,43 @@ fp_result_t fp_pair(uint16_t *capacity_out) {
             last_sensor_detected = true;
             conf_clear(&c);
             return FP_ERR_ALREADY_PAIRED;
+        }
+    }
+
+    /*
+     * Passwordless OEM §5 `za` bypass pairing (`0x53/0x54/0x55`): binds sensor at its existing
+     * `ChipAddr` with random/eFuse seal secret when standard `0x13` VfyPwd is locked with `0x21`.
+     */
+    {
+        uint32_t cand_za_addr = za_bypass_addr != 0u ? za_bypass_addr :
+                                (fp_sensor_has_last_ack() ? fp_sensor_last_ack_addr() : 0u);
+        if ((za_bypass_ready || cand_za_addr != 0u) && fp_za_probe_echo(t, cand_za_addr)) {
+            memset(&c, 0, sizeof(c));
+            c.flags = FP_FLAG_PAIRED | FP_FLAG_ZA_BYPASS;
+            c.fail_count = 0;
+            c.capacity = 100;
+            c.address = cand_za_addr;
+            fp_session_t seal_s;
+            if (esp_dev_efuse_session(&seal_s)) {
+                memcpy(c.password, seal_s.password, 4);
+            }
+            else {
+                random_fill_buffer(BYTE_ARRAY(c.password, sizeof(c.password)));
+                if (c.password[0] == 0 && c.password[1] == 0 && c.password[2] == 0 && c.password[3] == 0) {
+                    c.password[0] = 0x5A;
+                }
+            }
+            if (!conf_save(&c)) {
+                conf_clear(&c);
+                return FP_ERR_STORAGE;
+            }
+            last_sensor_detected = true;
+            fp_diag_reset();
+            if (capacity_out != NULL) {
+                *capacity_out = c.capacity;
+            }
+            conf_clear(&c);
+            return FP_OK;
         }
     }
 
@@ -1581,7 +1726,12 @@ fp_result_t fp_enroll(uint16_t *slot_out) {
         const fp_transport_t *t = fp_uart_transport();
         fp_session_t s = session_of(&c);
 
-        if (use_auto_mode) {
+        if (is_za_bypass_conf(&c)) {
+            res = fp_za_enroll_finger(t, s.address, slot, 2,
+                                      &cancel_button, &waiting_finger,
+                                      &last_err_ins, &last_err_conf);
+        }
+        else if (use_auto_mode) {
             res = fp_enroll_auto(&s, slot, 2);
         }
         else {
@@ -1742,7 +1892,7 @@ fp_result_t fp_delete(uint16_t slot) {
         uint8_t code = 0xFF;
         if (slot == FP_ALL_SLOTS) {
             if ((fp_sensor_empty(fp_uart_transport(), &s, &code) != FP_SENSOR_OK || code != FP_CONF_OK) &&
-                !is_dev_npwd_conf(&c)) {
+                !is_dev_npwd_conf(&c) && !is_za_bypass_conf(&c)) {
                 res = FP_ERR_SENSOR;
             }
             else {
@@ -1756,7 +1906,7 @@ fp_result_t fp_delete(uint16_t slot) {
             res = FP_ERR_NO_TEMPLATE;
         }
         else if ((fp_sensor_delete_chars(fp_uart_transport(), &s, slot, 1, &code) != FP_SENSOR_OK || code != FP_CONF_OK) &&
-                 !is_dev_npwd_conf(&c)) {
+                 !is_dev_npwd_conf(&c) && !is_za_bypass_conf(&c)) {
             res = FP_ERR_SENSOR;
         }
         else {
