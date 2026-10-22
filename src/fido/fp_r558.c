@@ -164,6 +164,23 @@ static bool esp_dev_efuse_session(fp_session_t *out) {
 #endif
 }
 
+static bool esp_dev_shared_session(fp_session_t *out) {
+#if defined(ESP_PLATFORM)
+    if (flash_encryption_active()) {
+        return false;
+    }
+    out->address = 0x5049434Fu; /* "PICO" */
+    out->password[0] = 0x52;    /* 'R' */
+    out->password[1] = 0x35;    /* '5' */
+    out->password[2] = 0x35;    /* '5' */
+    out->password[3] = 0x38;    /* '8' */
+    return true;
+#else
+    (void)out;
+    return false;
+#endif
+}
+
 static volatile bool waiting_finger = false;
 
 static void ensure_fp_conf_file(void) {
@@ -334,6 +351,22 @@ static void probe_and_init_sensor(const fp_conf_t *c) {
             fp_diag_err(FP_INS_VFY_PWD, code, FP_SENSOR_OK);
         }
         return;
+    }
+
+    fp_session_t dev_sh;
+    if (esp_dev_shared_session(&dev_sh)) {
+        fp_sensor_status_t dst = fp_sensor_verify_password(t, &dev_sh, &code);
+        if (dst == FP_SENSOR_OK) {
+            last_sensor_detected = true;
+            if (code == FP_CONF_OK) {
+                fp_diag_reset();
+                sensor_led(dev_sh.address, FP_LED_FUNC_FLASH, FP_LED_COLOR_BLUE, FP_LED_COLOR_BLUE, 2);
+            }
+            else {
+                fp_diag_err(FP_INS_VFY_PWD, code, FP_SENSOR_OK);
+            }
+            return;
+        }
     }
 
     fp_session_t ef;
@@ -804,6 +837,8 @@ fp_result_t fp_factory_reset_sensor(void) {
             (void)fp_sensor_set_password(fp_uart_transport(), s.address, zero_pwd, &code);
             (void)fp_sensor_set_chip_address(fp_uart_transport(), s.address, FP_FACTORY_ADDRESS, &code);
         }
+        memset(&c, 0, sizeof(c));
+        (void)conf_save(&c);
     }
     (void)fp_uart_rescue_factory_reset(hint);
     conf_clear(&c);
@@ -1025,26 +1060,35 @@ fp_result_t fp_pair(uint16_t *capacity_out) {
 
     if (!resumed && !password_set_already) {
         /*
-         * Check whether this R558-S module was already bound to THIS physical ESP32-S3 board's eFuse MAC
-         * prior to an ESP32 flash erase. If so, seamlessly re-adopt the board's own sensor!
+         * Check whether this R558-S module already holds universal dev-mode credentials ("PICO"/"R558")
+         * or this physical ESP32-S3 board's eFuse MAC credentials from before a flash erase.
          */
-        fp_session_t ef;
-        if (esp_dev_efuse_session(&ef) &&
-            fp_sensor_verify_password(t, &ef, &code) == FP_SENSOR_OK && code == FP_CONF_OK) {
-            fp_sysparam_t ef_sp;
-            if (fp_sensor_read_sysparam(t, ef.address, &ef_sp, &code) == FP_SENSOR_OK &&
-                code == FP_CONF_OK && ef_sp.capacity > 0) {
-                last_sensor_detected = true;
-                memset(&c, 0, sizeof(c));
-                c.flags = FP_FLAG_STAGED;
-                c.capacity = ef_sp.capacity > FP_TEMPLATE_MAX ? FP_TEMPLATE_MAX : ef_sp.capacity;
-                memcpy(c.password, ef.password, 4);
-                c.address = ef.address;
-                if (!conf_save(&c)) {
-                    conf_clear(&c);
-                    return FP_ERR_STORAGE;
+        fp_session_t known[2];
+        size_t known_n = 0;
+        if (esp_dev_shared_session(&known[known_n])) {
+            known_n++;
+        }
+        if (esp_dev_efuse_session(&known[known_n])) {
+            known_n++;
+        }
+        for (size_t k = 0; k < known_n; k++) {
+            if (fp_sensor_verify_password(t, &known[k], &code) == FP_SENSOR_OK && code == FP_CONF_OK) {
+                fp_sysparam_t ef_sp;
+                if (fp_sensor_read_sysparam(t, known[k].address, &ef_sp, &code) == FP_SENSOR_OK &&
+                    code == FP_CONF_OK && ef_sp.capacity > 0) {
+                    last_sensor_detected = true;
+                    memset(&c, 0, sizeof(c));
+                    c.flags = FP_FLAG_STAGED;
+                    c.capacity = ef_sp.capacity > FP_TEMPLATE_MAX ? FP_TEMPLATE_MAX : ef_sp.capacity;
+                    memcpy(c.password, known[k].password, 4);
+                    c.address = known[k].address;
+                    if (!conf_save(&c)) {
+                        conf_clear(&c);
+                        return FP_ERR_STORAGE;
+                    }
+                    resumed = true;
+                    break;
                 }
-                resumed = true;
             }
         }
     }
@@ -1064,6 +1108,19 @@ fp_result_t fp_pair(uint16_t *capacity_out) {
         }
         last_sensor_detected = true;
         if (code != FP_CONF_OK) {
+            /* Some factory R558-S batches ship with 0xFFFFFFFF password or accept direct SetPwd(0) in dev mode. */
+            fp_session_t dev_chk;
+            if (esp_dev_shared_session(&dev_chk)) {
+                const uint8_t zero_pwd[4] = { 0, 0, 0, 0 };
+                fp_session_t ff_s = { .address = FP_FACTORY_ADDRESS, .password = { 0xFF, 0xFF, 0xFF, 0xFF } };
+                if ((fp_sensor_verify_password(t, &ff_s, &code) == FP_SENSOR_OK && code == FP_CONF_OK) ||
+                    (fp_sensor_set_password(t, FP_FACTORY_ADDRESS, zero_pwd, &code) == FP_SENSOR_OK && code == FP_CONF_OK)) {
+                    (void)fp_sensor_set_password(t, FP_FACTORY_ADDRESS, zero_pwd, &code);
+                    (void)fp_sensor_verify_password(t, &factory, &code);
+                }
+            }
+        }
+        if (code != FP_CONF_OK) {
             fp_diag_err(FP_INS_VFY_PWD, code, FP_SENSOR_OK);
             conf_clear(&c);
             return FP_ERR_NOT_FACTORY;
@@ -1082,11 +1139,11 @@ fp_result_t fp_pair(uint16_t *capacity_out) {
 
         uint8_t new_pwd[4];
         uint32_t addr = 0;
-        fp_session_t ef_bind;
-        if (esp_dev_efuse_session(&ef_bind)) {
-            /* Hardware eFuse-bound pairing credentials in dev mode survive full ESP32-S3 flash erases. */
-            memcpy(new_pwd, ef_bind.password, 4);
-            addr = ef_bind.address;
+        fp_session_t dev_bind;
+        if (esp_dev_shared_session(&dev_bind)) {
+            /* Universal dev-mode pairing credentials survive flash erases and board swaps while remaining restorable. */
+            memcpy(new_pwd, dev_bind.password, 4);
+            addr = dev_bind.address;
         }
         else {
             uint8_t new_addr[4];
