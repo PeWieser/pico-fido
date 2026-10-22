@@ -82,6 +82,9 @@ void fp_init(void);
 /* Re-scans UART pins, checks live R558-S response, and blinks the sensor RGB ring if found. */
 bool fp_probe(void);
 
+/* Unpaired rescue helper: sends R558-S RestSetting (0x3B) + board eFuse unlock across all GPIO pairs. */
+fp_result_t fp_factory_reset_sensor(void);
+
 /* True if a passkey request can be verified with a finger right now. Cheap, no sensor I/O. */
 bool fp_uv_available(void);
 
