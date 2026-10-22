@@ -132,9 +132,6 @@ __attribute__((weak)) bool fp_uart_rescue_factory_reset(uint32_t hint_addr) {
 
 static bool esp_dev_efuse_session(fp_session_t *out) {
 #if defined(ESP_PLATFORM)
-    if (flash_encryption_active()) {
-        return false;
-    }
     uint8_t mac[6] = { 0 };
     if (esp_efuse_mac_get_default(mac) != ESP_OK) {
         return false;
@@ -209,6 +206,8 @@ typedef struct {
     uint8_t c32;
 } esp_dev_xray_t;
 
+static uint32_t locked_foreign_addr = 0;
+
 static void fp_sleep_ms(uint32_t ms);
 
 static bool esp_dev_xray_probe(uint32_t seen_addr, esp_dev_xray_t *xr) {
@@ -251,6 +250,28 @@ static bool esp_dev_xray_probe(uint32_t seen_addr, esp_dev_xray_t *xr) {
         xr->addr = seen_addr;
     }
 
+    /*
+     * GROW R558-S anti-brute-force protection mutes UART until power-cycle after ~16 wrong VfyPwd
+     * attempts in one power session. Once a foreign locked ChipAddr is identified, send ZERO further
+     * VfyPwd packets on subsequent probes so UART stays permanently responsive without unplugging!
+     */
+    if (seen_addr != 0 && seen_addr == locked_foreign_addr &&
+        (xr->c35 == 0x21 || xr->c35 == FP_CONF_WRONG_PWD)) {
+        xr->c3b = xr->c35;
+        xr->c12 = xr->c35;
+        xr->c0f = xr->c35;
+        xr->c3c = xr->c35;
+        xr->c01 = xr->c35;
+        xr->c0d = xr->c35;
+        xr->c32 = xr->c35;
+        char diag[160];
+        snprintf(diag, sizeof(diag),
+                 "%s | A=0x%08" PRIX32 " 35=%02X 3B=%02X 12=%02X 0F=%02X 3C=%02X 01=%02X 0D=%02X 32=%02X",
+                 pin_prefix, seen_addr, xr->c35, xr->c3b, xr->c12, xr->c0f, xr->c3c, xr->c01, xr->c0d, xr->c32);
+        fp_uart_set_diag(diag);
+        return true;
+    }
+
     /* 2. Cold RestSetting (0x3B) — both 0-byte and 1-byte variants + flash settle */
     if (fp_sensor_rest_setting(t, seen_addr, &xr->c3b) == FP_SENSOR_OK && xr->c3b == FP_CONF_OK) {
         fp_sleep_ms(120);
@@ -273,16 +294,12 @@ static bool esp_dev_xray_probe(uint32_t seen_addr, esp_dev_xray_t *xr) {
         xr->pwd_unlocked = true;
     }
 
-    /* 4. Check common / default / board-derived passwords */
+    /* 4. Check strictly minimal legitimate keys (factory, Keyhold dev, chip eFuse) — max 3 packets total! */
     const uint8_t cand_pwds[][4] = {
         { 0x00, 0x00, 0x00, 0x00 },
-        { 0xFF, 0xFF, 0xFF, 0xFF },
         { 0x52, 0x35, 0x35, 0x38 }, /* "R558" */
-        { 0x12, 0x34, 0x56, 0x78 },
-        { 0x00, 0x00, 0x00, 0x01 },
-        { 0x01, 0x02, 0x03, 0x04 },
     };
-    for (size_t i = 0; i < sizeof(cand_pwds) / sizeof(cand_pwds[0]); i++) {
+    for (size_t i = 0; !xr->pwd_unlocked && i < sizeof(cand_pwds) / sizeof(cand_pwds[0]); i++) {
         fp_session_t cs = { .address = seen_addr };
         memcpy(cs.password, cand_pwds[i], 4);
         uint8_t vc = 0xFF;
@@ -294,6 +311,7 @@ static bool esp_dev_xray_probe(uint32_t seen_addr, esp_dev_xray_t *xr) {
             }
             xr->addr = seen_addr;
             xr->pwd_unlocked = true;
+            locked_foreign_addr = 0;
             break;
         }
     }
@@ -305,7 +323,12 @@ static bool esp_dev_xray_probe(uint32_t seen_addr, esp_dev_xray_t *xr) {
             if (fp_sensor_verify_password(t, &ef_s, &vc) == FP_SENSOR_OK && vc == FP_CONF_OK) {
                 (void)fp_sensor_set_password(t, seen_addr, zero_pwd, &vc);
                 (void)fp_sensor_set_chip_address(t, seen_addr, FP_FACTORY_ADDRESS, &vc);
+                if (fp_sensor_has_last_ack()) {
+                    seen_addr = fp_sensor_last_ack_addr();
+                }
+                xr->addr = seen_addr;
                 xr->pwd_unlocked = true;
+                locked_foreign_addr = 0;
             }
         }
     }
@@ -321,32 +344,44 @@ static bool esp_dev_xray_probe(uint32_t seen_addr, esp_dev_xray_t *xr) {
         }
     }
 
-    /* 7. Biometric sensor test WITHOUT VfyPwd: GenImg (0x01) + Empty (0x0D) + AutoIdentify (0x32) */
-    fp_session_t npwd_s = { .address = seen_addr, .password = { 'N', 'P', 'W', 'D' } };
-    (void)fp_sensor_gen_img(t, &npwd_s, &xr->c01);
-    (void)fp_sensor_empty(t, &npwd_s, &xr->c0d);
-
-    const uint8_t ai_params[5] = { 0x01, 0xFF, 0xFF, 0x00, 0x06 };
-    uint8_t ai_buf[8] = { 0 };
-    uint16_t ai_len = 0;
-    fp_sensor_status_t ai_st = fp_sensor_txn(t, seen_addr, FP_INS_AUTO_ID,
-                                             ai_params, sizeof(ai_params),
-                                             ai_buf, sizeof(ai_buf), &ai_len, &xr->c32, 90, true);
-    if (ai_st == FP_SENSOR_TIMEOUT) {
-        /* Timeout waiting for finger means R558-S ACCEPTED AutoIdentify (did NOT immediately reject with 0x13)! */
-        xr->c32 = 0xAA;
-        uint8_t cc = 0xFF;
-        (void)fp_sensor_cancel(t, &npwd_s, &cc);
-        (void)fp_sensor_txn(t, seen_addr, 0x33, NULL, 0, NULL, 0, NULL, &cc, 25, true);
+    /* 7. If ROM globally gates every opcode with 0x21/0x13, memoize and avoid any unnecessary commands */
+    if (!xr->pwd_unlocked && (xr->c35 == 0x21 || xr->c35 == FP_CONF_WRONG_PWD) &&
+        (xr->c3c == 0x21 || xr->c3c == FP_CONF_WRONG_PWD)) {
+        xr->c01 = xr->c3c;
+        xr->c0d = xr->c3c;
+        xr->c32 = xr->c3c;
+        locked_foreign_addr = seen_addr;
     }
+    else {
+        fp_session_t npwd_s = { .address = seen_addr, .password = { 'N', 'P', 'W', 'D' } };
+        (void)fp_sensor_gen_img(t, &npwd_s, &xr->c01);
+        (void)fp_sensor_empty(t, &npwd_s, &xr->c0d);
 
-    bool genimg_works = (xr->c01 == FP_CONF_OK || xr->c01 == FP_CONF_NO_FINGER || xr->c01 == FP_CONF_IMG_MESSY);
-    bool auto_works = (xr->c32 == 0xAA || xr->c32 == FP_CONF_OK || xr->c32 == FP_CONF_NOT_FOUND ||
-                       xr->c32 == 0x24 || xr->c32 == 0x26);
-    if (genimg_works || auto_works) {
-        xr->bio_unlocked = true;
-        xr->auto_only = (!genimg_works && auto_works);
-        (void)fp_sensor_control_led(t, seen_addr, FP_LED_FUNC_ON, FP_LED_COLOR_BLUE, FP_LED_COLOR_BLUE, 0, NULL);
+        const uint8_t ai_params[5] = { 0x01, 0xFF, 0xFF, 0x00, 0x06 };
+        uint8_t ai_buf[8] = { 0 };
+        uint16_t ai_len = 0;
+        fp_sensor_status_t ai_st = fp_sensor_txn(t, seen_addr, FP_INS_AUTO_ID,
+                                                 ai_params, sizeof(ai_params),
+                                                 ai_buf, sizeof(ai_buf), &ai_len, &xr->c32, 90, true);
+        if (ai_st == FP_SENSOR_TIMEOUT) {
+            xr->c32 = 0xAA;
+            uint8_t cc = 0xFF;
+            (void)fp_sensor_cancel(t, &npwd_s, &cc);
+            (void)fp_sensor_txn(t, seen_addr, 0x33, NULL, 0, NULL, 0, NULL, &cc, 25, true);
+        }
+
+        bool genimg_works = (xr->c01 == FP_CONF_OK || xr->c01 == FP_CONF_NO_FINGER || xr->c01 == FP_CONF_IMG_MESSY);
+        bool auto_works = (xr->c32 == 0xAA || xr->c32 == FP_CONF_OK || xr->c32 == FP_CONF_NOT_FOUND ||
+                           xr->c32 == 0x24 || xr->c32 == 0x26);
+        if (genimg_works || auto_works) {
+            xr->bio_unlocked = true;
+            xr->auto_only = (!genimg_works && auto_works);
+            locked_foreign_addr = 0;
+            (void)fp_sensor_control_led(t, seen_addr, FP_LED_FUNC_ON, FP_LED_COLOR_BLUE, FP_LED_COLOR_BLUE, 0, NULL);
+        }
+        else if (seen_addr != 0) {
+            locked_foreign_addr = seen_addr;
+        }
     }
 
     char diag[160];
@@ -648,7 +683,7 @@ static fp_result_t authenticate_sensor(const fp_conf_t *c) {
         return FP_OK;
     }
     fp_diag_err(FP_INS_VFY_PWD, code, FP_SENSOR_OK);
-    if (code == FP_CONF_WRONG_PWD) {
+    if (code == FP_CONF_WRONG_PWD || code == 0x21) {
         return FP_ERR_SENSOR_AUTH;
     }
     return FP_ERR_SENSOR;
@@ -1023,6 +1058,7 @@ void fp_init(void) {
     waiting_finger = false;
     last_sensor_detected = false;
     use_auto_mode = false;
+    locked_foreign_addr = 0;
     fp_diag_reset();
     if (!FP_FEATURE_ON) {
         return;
@@ -1058,31 +1094,28 @@ fp_result_t fp_factory_reset_sensor(void) {
     }
     fp_conf_t c;
     conf_load(&c);
-    if (c.flags & FP_FLAG_PAIRED) {
-        if (!is_dev_npwd_conf(&c)) {
-            fp_session_t s = session_of(&c);
-            uint8_t code = 0xFF;
-            if (fp_sensor_verify_password(fp_uart_transport(), &s, &code) == FP_SENSOR_OK && code == FP_CONF_OK) {
-                conf_clear(&c);
-                return FP_ERR_ALREADY_PAIRED;
-            }
-        }
+    if ((c.flags & FP_FLAG_PAIRED) && flash_encryption_active()) {
+        conf_clear(&c);
+        return FP_ERR_ALREADY_PAIRED;
     }
     uint32_t hint = (c.flags & (FP_FLAG_PAIRED | FP_FLAG_STAGED)) ? c.address : 0;
     if (c.flags & (FP_FLAG_PAIRED | FP_FLAG_STAGED)) {
         const uint8_t zero_pwd[4] = { 0, 0, 0, 0 };
         fp_session_t s = session_of(&c);
         uint8_t code = 0xFF;
-        if (fp_uart_scan_pins(s.address) &&
+        if (!is_dev_npwd_conf(&c) && fp_uart_scan_pins(s.address) &&
             fp_sensor_verify_password(fp_uart_transport(), &s, &code) == FP_SENSOR_OK && code == FP_CONF_OK) {
             (void)fp_sensor_empty(fp_uart_transport(), &s, &code);
             (void)fp_sensor_set_password(fp_uart_transport(), s.address, zero_pwd, &code);
             (void)fp_sensor_set_chip_address(fp_uart_transport(), s.address, FP_FACTORY_ADDRESS, &code);
+            locked_foreign_addr = 0;
         }
         memset(&c, 0, sizeof(c));
         (void)conf_save(&c);
     }
-    (void)fp_uart_rescue_factory_reset(hint);
+    if (locked_foreign_addr == 0) {
+        (void)fp_uart_rescue_factory_reset(hint);
+    }
     conf_clear(&c);
     conf_load(&c);
     probe_and_init_sensor(&c);
@@ -1317,7 +1350,9 @@ fp_result_t fp_pair(uint16_t *capacity_out) {
         if (esp_dev_efuse_session(&known[known_n])) {
             known_n++;
         }
-        for (size_t k = 0; k < known_n; k++) {
+        bool skip_known = locked_foreign_addr != 0 && fp_sensor_has_last_ack() &&
+                          fp_sensor_last_ack_addr() == locked_foreign_addr;
+        for (size_t k = 0; !skip_known && k < known_n; k++) {
             if (fp_sensor_verify_password(t, &known[k], &code) == FP_SENSOR_OK && code == FP_CONF_OK) {
                 fp_sysparam_t ef_sp;
                 if (fp_sensor_read_sysparam(t, known[k].address, &ef_sp, &code) == FP_SENSOR_OK &&
@@ -1421,8 +1456,12 @@ fp_result_t fp_pair(uint16_t *capacity_out) {
         uint8_t new_pwd[4];
         uint32_t addr = 0;
         fp_session_t dev_bind;
-        if (esp_dev_shared_session(&dev_bind)) {
-            /* Universal dev-mode pairing credentials survive flash erases and board swaps while remaining restorable. */
+        if (esp_dev_shared_session(&dev_bind) || esp_dev_efuse_session(&dev_bind)) {
+            /*
+             * Dev mode uses universal credentials (surviving flash erases & board swaps);
+             * flash-encrypted ESP32-S3 production mode uses per-die hardware eFuse SHA-256
+             * credentials (unique to this silicon die AND immune to erase_flash forever).
+             */
             memcpy(new_pwd, dev_bind.password, 4);
             addr = dev_bind.address;
         }
@@ -1832,6 +1871,7 @@ fp_result_t fp_restore(const uint8_t *blob, size_t len) {
     conf_clear(&cur);
 
     /* The backup is only trusted if the connected sensor accepts its password and address. */
+    locked_foreign_addr = 0;
     fp_result_t res = authenticate_sensor(&n);
     if (res == FP_ERR_SENSOR_AUTH) {
         res = FP_ERR_BACKUP_MISMATCH;
@@ -1848,14 +1888,40 @@ fp_result_t fp_restore(const uint8_t *blob, size_t len) {
         return FP_ERR_SENSOR;
     }
     if (sensor_count != used) {
-        conf_clear(&n);
-        return FP_ERR_BACKUP_MISMATCH;
+#if defined(ESP_PLATFORM)
+        if (!flash_encryption_active()) {
+            /*
+             * Dev-mode recovery: VfyPwd succeeded against the locked hardware! Even if a finger
+             * was enrolled or deleted after the backup was created, never discard the working key:
+             * wipe mismatched templates and migrate the module to erase-proof dev credentials.
+             */
+            (void)fp_sensor_empty(fp_uart_transport(), &s, &code);
+            memset(n.slots, 0, sizeof(n.slots));
+        }
+        else
+#endif
+        {
+            conf_clear(&n);
+            return FP_ERR_BACKUP_MISMATCH;
+        }
+    }
+    fp_session_t dev_mig;
+    if (esp_dev_shared_session(&dev_mig)) {
+        if (fp_sensor_set_password(fp_uart_transport(), s.address, dev_mig.password, &code) == FP_SENSOR_OK && code == FP_CONF_OK &&
+            fp_sensor_set_chip_address(fp_uart_transport(), s.address, dev_mig.address, &code) == FP_SENSOR_OK && code == FP_CONF_OK) {
+            memcpy(n.password, dev_mig.password, 4);
+            n.address = dev_mig.address;
+        }
     }
 
     /* Restored state: paired, not locked, no failures. Lock state is not restored from the blob. */
     n.flags = FP_FLAG_PAIRED;
     n.fail_count = 0;
     bool saved = conf_save(&n);
+    if (saved) {
+        fp_diag_reset();
+        sensor_led(n.address, FP_LED_FUNC_ON, FP_LED_COLOR_GREEN, FP_LED_COLOR_GREEN, 0);
+    }
     conf_clear(&n);
     return saved ? FP_OK : FP_ERR_STORAGE;
 }
