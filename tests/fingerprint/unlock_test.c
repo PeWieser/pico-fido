@@ -37,6 +37,7 @@ typedef struct {
     uint16_t za_match_page;
     uint32_t wrong_vfy_strikes;
     bool uart_muted;
+    bool flash_baud_corrupted;
 
     /* Raw TX/RX buffers for ZFM framing + split-packet calibration */
     uint8_t rx_to_host[1024];
@@ -258,7 +259,7 @@ static void mock_power_cycle_gp3(void *ctx, uint32_t off_ms, uint32_t settle_ms)
     (void)settle_ms;
     g_sim.authenticated = false;
     g_sim.wrong_vfy_strikes = 0;
-    g_sim.uart_muted = false;
+    g_sim.uart_muted = g_sim.flash_baud_corrupted;
     g_sim.split_len = 0;
     g_sim.split_reset = false;
 }
@@ -269,13 +270,15 @@ static void mock_glitch_pulse(void *ctx, uint32_t delay_us, uint32_t width_cycle
     if (width_cycles >= g_sim.crit_threshold) {
         g_sim.split_reset = true;
     }
-    /* If pulse fires inside target boot ParaTableFlag window at ~92..105% of crit_threshold: factory reset! */
+    /* If pulse fires inside target boot ParaTableFlag window at ~90..108% of crit_threshold: factory reset! */
     if (g_sim.allow_gp3_glitch &&
         delay_us >= g_sim.glitch_delay_min_us && delay_us <= g_sim.glitch_delay_max_us &&
         width_cycles >= (g_sim.crit_threshold * 90u) / 100u &&
         width_cycles <= (g_sim.crit_threshold * 108u) / 100u) {
         memset(g_sim.password, 0, 4);
         g_sim.chip_addr = FP_FACTORY_ADDRESS;
+        g_sim.flash_baud_corrupted = false;
+        g_sim.uart_muted = false;
     }
 }
 
@@ -461,7 +464,34 @@ int main(void) {
                          NULL, 0, NULL, 0, NULL, &post_conf, 40, false) == FP_SENSOR_OK);
     printf("  [OK] Stage 7:  Full 24-pass Dual-Rail sweep -> 0 VfyPwd strikes, auto-unmute, UART live!\n");
 
+    /* 8. Dead-UART / Corrupted Flash BaudRate Recovery (`CAL=645c` preserved + ResetDefaultPara)! */
+    sim_reset(0x29062D09u, unknown_pwd);
+    g_sim.allow_gp3_glitch = true;
+    g_sim.crit_threshold = 645u;
+    g_sim.glitch_delay_min_us = 3400u;
+    g_sim.glitch_delay_max_us = 4200u;
+    g_sim.flash_baud_corrupted = true;
+    g_sim.uart_muted = true; /* Remains completely dead even after cold power-cycle! */
+    fp_unlock_set_hal(&g_mock_hal, NULL);
+    fp_unlock_run_pass(&g_sim_transport, 0, 0x29062D09u, NULL, false, &rep);
+    assert(rep.gp3_power_capable == true);
+    assert(strstr(rep.summary, "LIVE=NO") != NULL);
+    fp_unlock_run_pass(&g_sim_transport, 1, 0x29062D09u, NULL, false, &rep);
+    assert(rep.crit_cycles == 645u);
+    bool dead_uart_recovered = false;
+    for (uint8_t p = 2; p <= 8; p++) {
+        fp_unlock_run_pass(&g_sim_transport, p, 0x29062D09u, NULL, false, &rep);
+        if (rep.unlocked_factory) {
+            dead_uart_recovered = true;
+            break;
+        }
+    }
+    assert(dead_uart_recovered == true);
+    assert(g_sim.chip_addr == FP_FACTORY_ADDRESS);
+    assert(g_sim.uart_muted == false);
+    printf("  [OK] Stage 8:  Dead-UART / corrupted ParaTable recovery via 645c silicon landmark sweep!\n");
+
     fp_unlock_set_hal(NULL, NULL);
-    printf("ALL 7 R558-S UNLOCK & BYPASS SUITES PASSED!\n");
+    printf("ALL 8 R558-S UNLOCK & BYPASS SUITES PASSED!\n");
     return 0;
 }

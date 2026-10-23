@@ -353,6 +353,56 @@ static bool probe_address_fast(uint32_t addr, uint32_t timeout_ms) {
     return false;
 }
 
+static uint8_t s_burst_buf[1152];
+
+/*
+ * Pipelined 96-Address NOR-Flash Bit/Byte-Corruption Discovery Burst:
+ * Sends HandShake (0x35) frames back-to-back in ONE streaming burst covering:
+ *  - All 16 NOR-Flash 0xFF byte-mask combinations of `seed` (`0x29062D09`)
+ *  - All 16 0x00 byte-mask combinations
+ *  - All 32 single-bit flips of `seed` & all 32 single-bit flips of `0xFFFFFFFF`
+ * Wrong-address packets are silently ignored in < 20 us; the matching address replies
+ * immediately with its exact 4-byte `DeviceAddress` inside bytes [2..5] of the ACK frame!
+ */
+static bool probe_corrupted_addr_burst(uint32_t seed) {
+    uint32_t base = (seed != 0u && seed != FP_FACTORY_ADDRESS) ? seed : 0x29062D09u;
+    size_t pos = 0;
+    const uint8_t hs = FP_INS_HANDSHAKE;
+
+    for (unsigned m = 0; m < 16u && pos + 24u <= sizeof(s_burst_buf); m++) {
+        uint32_t mask = ((m & 1u) ? 0x000000FFu : 0u) |
+                        ((m & 2u) ? 0x0000FF00u : 0u) |
+                        ((m & 4u) ? 0x00FF0000u : 0u) |
+                        ((m & 8u) ? 0xFF000000u : 0u);
+        pos += fp_sensor_encode_packet(s_burst_buf + pos, 16u, base | mask, FP_PID_COMMAND, &hs, 1u);
+        pos += fp_sensor_encode_packet(s_burst_buf + pos, 16u, base & ~mask, FP_PID_COMMAND, &hs, 1u);
+    }
+    for (unsigned b = 0; b < 32u && pos + 24u <= sizeof(s_burst_buf); b++) {
+        pos += fp_sensor_encode_packet(s_burst_buf + pos, 16u, base ^ (1u << b), FP_PID_COMMAND, &hs, 1u);
+        pos += fp_sensor_encode_packet(s_burst_buf + pos, 16u, FP_FACTORY_ADDRESS ^ (1u << b), FP_PID_COMMAND, &hs, 1u);
+    }
+
+    (void)uart_flush_input(FP_UART_NUM);
+    if (fp_uart_write_raw_fast(s_burst_buf, pos) != 0) {
+        return false;
+    }
+    uint8_t rx[64];
+    int got = fp_uart_read_raw_fast(rx, sizeof(rx), 35u);
+    if (got >= 10) {
+        for (int i = 0; i + 9 < got; i++) {
+            if (rx[i] == 0xEF && rx[i + 1] == 0x01 && rx[i + 6] == FP_PID_ACK) {
+                uint32_t found = ((uint32_t)rx[i + 2] << 24) |
+                                 ((uint32_t)rx[i + 3] << 16) |
+                                 ((uint32_t)rx[i + 4] << 8) |
+                                 (uint32_t)rx[i + 5];
+                s_sticky_ack_addr = found;
+                return probe_handshake_fast(found, 35u);
+            }
+        }
+    }
+    return false;
+}
+
 int fp_uart_init(void) {
     maintain_gp3_vcc_rail();
     vTaskDelay(pdMS_TO_TICKS(65));
@@ -387,13 +437,34 @@ bool fp_uart_scan_pins(uint32_t paired_addr) {
         { 44, 43 },                           /* TX=GPIO44, RX=GPIO43 */
     };
     const fp_framing_t framings[] = {
-        { 57600, UART_STOP_BITS_1, "57600 8N1", 60 },
-        { 57600, UART_STOP_BITS_2, "57600 8N2", 45 },
+        { 57600,  UART_STOP_BITS_1, "57600 8N1",  55 },
+        { 57600,  UART_STOP_BITS_2, "57600 8N2",  45 },
+        { 115200, UART_STOP_BITS_1, "115200 8N1", 32 },
+        { 9600,   UART_STOP_BITS_1, "9600 8N1",   55 },
+        { 38400,  UART_STOP_BITS_1, "38400 8N1",  35 },
+        { 19200,  UART_STOP_BITS_1, "19200 8N1",  45 },
+        { 28800,  UART_STOP_BITS_1, "28800 8N1",  40 },
+        { 48000,  UART_STOP_BITS_1, "48000 8N1",  35 },
+        { 67200,  UART_STOP_BITS_1, "67200 8N1",  32 },
+        { 76800,  UART_STOP_BITS_1, "76800 8N1",  32 },
+        { 86400,  UART_STOP_BITS_1, "86400 8N1",  30 },
+        { 96000,  UART_STOP_BITS_1, "96000 8N1",  30 },
+        { 105600, UART_STOP_BITS_1, "105600 8N1", 30 },
+        { 128000, UART_STOP_BITS_1, "128000 8N1", 28 },
+        { 230400, UART_STOP_BITS_1, "230400 8N1", 25 },
+        { 256000, UART_STOP_BITS_1, "256000 8N1", 25 },
+        { 460800, UART_STOP_BITS_1, "460800 8N1", 22 },
+        { 921600, UART_STOP_BITS_1, "921600 8N1", 22 },
+        { 4800,   UART_STOP_BITS_1, "4800 8N1",   70 },
+        { 2400,   UART_STOP_BITS_1, "2400 8N1",   95 },
+        { 1465,   UART_STOP_BITS_1, "1465 8N1",   115 },
+        { 1099,   UART_STOP_BITS_1, "1099 8N1",   130 },
+        { 1648,   UART_STOP_BITS_1, "1648 8N1",   110 },
     };
 
     for (unsigned cycle_try = 0; cycle_try < 2u; cycle_try++) {
         if (cycle_try == 1u) {
-            fp_uart_hard_power_cycle(80, 290);
+            fp_uart_hard_power_cycle(85, 130);
         }
         for (size_t i = 0; i < sizeof(pairs) / sizeof(pairs[0]); i++) {
             /* Never drive ESP32 push-pull TX onto a line externally driven 3.3V HIGH by R558-S TX! */
@@ -402,16 +473,15 @@ bool fp_uart_scan_pins(uint32_t paired_addr) {
                 continue;
             }
             for (size_t f = 0; f < sizeof(framings) / sizeof(framings[0]); f++) {
-                if (!configure_uart_channel(pairs[i].tx_gpio, pairs[i].rx_gpio, framings[f].baud, framings[f].stop_bits)) {
+                /* Run full 23-baud + 96-address recovery sweep on primary GP1/GP2 after power-cycle! */
+                if (f >= 6u && (i >= 2u || cycle_try == 0u)) {
                     continue;
                 }
-                if (f == 0) {
-                    const uint8_t wake = 0x00;
-                    uart_write_bytes(FP_UART_NUM, (const char *)&wake, 1);
-                    uart_wait_tx_done(FP_UART_NUM, pdMS_TO_TICKS(8));
-                    vTaskDelay(pdMS_TO_TICKS(18));
-                    uart_flush_input(FP_UART_NUM);
-                    has_bus_activity = false;
+                if (f >= 2u && i >= 2u && cycle_try == 0u) {
+                    continue;
+                }
+                if (!configure_uart_channel(pairs[i].tx_gpio, pairs[i].rx_gpio, framings[f].baud, framings[f].stop_bits)) {
+                    continue;
                 }
                 bool ok = false;
                 if (prev_seen != 0 && prev_seen != FP_FACTORY_ADDRESS) {
@@ -432,7 +502,29 @@ bool fp_uart_scan_pins(uint32_t paired_addr) {
                 if (!ok && f == 0) {
                     ok = probe_address_fast(FP_FACTORY_ADDRESS, 40);
                 }
+                if (!ok && cycle_try == 1u && i < 2u && (f == 0u || f == 2u || f == 3u)) {
+                    ok = probe_corrupted_addr_burst(paired_addr != 0u ? paired_addr : prev_seen);
+                }
                 if (ok) {
+                    /* If glitch/factory reset left the sensor on a non-57600 baud (e.g. 9600/115200),
+                     * normalize BaudRate back to 57600 (WriteReg 0x0E reg=4 val=6) automatically! */
+                    if (framings[f].baud != FP_UART_BAUD) {
+                        uint32_t live_a = fp_sensor_has_last_ack() ? fp_sensor_last_ack_addr() : FP_FACTORY_ADDRESS;
+                        const uint8_t set_57600[2] = { 0x04, 0x06 }; /* Reg 4 = BaudRate, 6 * 9600 = 57600 */
+                        uint8_t wc = 0xFF;
+                        if (fp_sensor_txn(fp_uart_transport(), live_a, 0x0Eu, set_57600, 2,
+                                          NULL, 0, NULL, &wc, 80, true) == FP_SENSOR_OK && wc == FP_CONF_OK) {
+                            vTaskDelay(pdMS_TO_TICKS(40));
+                            fp_uart_hard_power_cycle(75, 120);
+                            if (configure_uart_channel(pairs[i].tx_gpio, pairs[i].rx_gpio, FP_UART_BAUD, UART_STOP_BITS_1) &&
+                                probe_handshake_fast(live_a, 60)) {
+                                snprintf(active_desc, sizeof(active_desc), "TX=GPIO%d, RX=GPIO%d (57600 8N1<-%d)",
+                                         pairs[i].tx_gpio, pairs[i].rx_gpio, framings[f].baud);
+                                return true;
+                            }
+                            (void)configure_uart_channel(pairs[i].tx_gpio, pairs[i].rx_gpio, framings[f].baud, framings[f].stop_bits);
+                        }
+                    }
                     snprintf(active_desc, sizeof(active_desc), "TX=GPIO%d, RX=GPIO%d (%s)",
                              pairs[i].tx_gpio, pairs[i].rx_gpio, framings[f].label);
                     return true;
@@ -462,6 +554,10 @@ void fp_uart_hard_power_cycle(uint32_t off_ms, uint32_t boot_wait_ms) {
     int tx = cur_tx_gpio >= 0 ? cur_tx_gpio : FP_UART_TX_GPIO;
     int rx = cur_rx_gpio >= 0 ? cur_rx_gpio : FP_UART_RX_GPIO;
 
+    /* Pre-configure UART1 at 57600 8N1 BEFORE power-down so U1TXD_OUT_IDX is already idle HIGH (1)
+     * and we NEVER call gpio_reset_pin(tx) during the R558-S 0..48.5 ms ROM bootloader window! */
+    (void)configure_uart_channel(tx, rx, FP_UART_BAUD, UART_STOP_BITS_1);
+
     esp_rom_gpio_connect_out_signal((uint32_t)tx, SIG_GPIO_OUT_IDX, false, false);
     esp_rom_gpio_connect_out_signal((uint32_t)rx, SIG_GPIO_OUT_IDX, false, false);
     (void)gpio_set_direction((gpio_num_t)tx, GPIO_MODE_OUTPUT);
@@ -483,15 +579,19 @@ void fp_uart_hard_power_cycle(uint32_t off_ms, uint32_t boot_wait_ms) {
         vTaskDelay(pdMS_TO_TICKS(off_ms));
     }
 
+    /* Keep TX solid 3.30 V HIGH from t = 0.000 us through the entire 48.5 ms ROM bootloader window! */
     (void)gpio_pulldown_dis((gpio_num_t)rx);
+    (void)gpio_pullup_en((gpio_num_t)rx);
     (void)gpio_set_level((gpio_num_t)tx, 1);
     (void)gpio_set_level((gpio_num_t)FP_POWER_GLITCH_GPIO, 1);
     (void)gpio_set_level((gpio_num_t)FP_POWER_MAIN_GPIO, 1);
-    (void)configure_uart_channel(tx, rx, FP_UART_BAUD, UART_STOP_BITS_1);
+    esp_rom_gpio_connect_out_signal((uint32_t)tx, U1TXD_OUT_IDX, false, false);
+    (void)uart_set_pin(FP_UART_NUM, UART_PIN_NO_CHANGE, rx, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
 
-    if (boot_wait_ms > 0u) {
-        vTaskDelay(pdMS_TO_TICKS(boot_wait_ms));
-    }
+    uint32_t wait_ms = boot_wait_ms >= 90u ? boot_wait_ms : 90u;
+    vTaskDelay(pdMS_TO_TICKS(wait_ms));
+    (void)uart_flush_input(FP_UART_NUM);
+    has_bus_activity = false;
 }
 
 bool fp_uart_rescue_factory_reset(uint32_t hint_addr) {

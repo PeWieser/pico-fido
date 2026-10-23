@@ -11,7 +11,7 @@ name: "PlatformIO build (ESP32-S3)"
 
 on:
   push:
-    branches: [ "arena/**", "main" ]
+    branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
   workflow_dispatch:
@@ -221,17 +221,6 @@ jobs:
           } > report.md 2>/dev/null
           wc -l report.md
           cat report.md >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Post commit comment with the result
-        if: always() && github.event_name == 'push'
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          SHA: ${{ github.sha }}
-        run: |
-          gh api --method POST "repos/${REPO}/commits/${SHA}/comments" -F body=@report.md > /dev/null \
-            && echo "comment posted" || echo "could not post comment"
 
       - name: Upload logs
         if: always()

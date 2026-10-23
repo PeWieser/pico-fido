@@ -2,7 +2,7 @@ name: "Emulation and test"
 
 on:
   push:
-    branches: [ "main", "development", "eddsa", "arena/**" ]
+    branches: [ "main", "development", "eddsa" ]
   pull_request:
     branches: [ "main", "development", "eddsa" ]
   schedule:
