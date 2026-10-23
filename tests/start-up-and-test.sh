@@ -5,6 +5,7 @@ sleep 2
 rm -f memory.flash
 cp -R tests/docker/fido2/* /usr/local/lib/python3.11/dist-packages/fido2/hid
 ./build_in_docker/pico_fido > /dev/null &
+sleep 2
 if [ -n "${PICO_FIDO_VAULT_ENROLLMENT_JSON:-}" ] || [ -n "${PICO_FIDO_VAULT_ENROLLMENT:-}" ]; then
     pytest tests
 else
