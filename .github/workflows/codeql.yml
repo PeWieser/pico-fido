@@ -21,6 +21,10 @@ on:
     - cron: '23 5 * * 4'
   workflow_dispatch:
 
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   analyze:
     name: Analyze
@@ -70,7 +74,8 @@ jobs:
     #   If the Autobuild fails above, remove it and uncomment the following three lines.
     #   modify them (or add more) to build your code if your project, please refer to the EXAMPLE below for guidance.
 
-    - run: |
+    - if: matrix.language == 'cpp'
+      run: |
        echo "Run, Build Application using script"
        ./workflows/autobuild.sh ${{ matrix.mode }}
 

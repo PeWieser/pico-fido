@@ -1,18 +1,17 @@
 #!/bin/bash
 
-git submodule update --init --recursive
+git submodule update --init --recursive --depth 1
 sudo apt update
 
 if [[ $1 == "pico" ]]; then
 sudo apt install -y cmake gcc-arm-none-eabi libnewlib-arm-none-eabi libstdc++-arm-none-eabi-newlib
-git clone https://github.com/raspberrypi/pico-sdk
+git clone --depth 1 --branch 2.1.1 https://github.com/raspberrypi/pico-sdk
 cd pico-sdk
-git checkout tags/2.1.1
-git submodule update --init
+git submodule update --init --depth 1
 cd ..
-git clone https://github.com/raspberrypi/picotool
+git clone --depth 1 https://github.com/raspberrypi/picotool
 cd picotool
-git submodule update --init
+git submodule update --init --depth 1
 mkdir build
 cd build
 cmake -DPICO_SDK_PATH=../../pico-sdk ..
