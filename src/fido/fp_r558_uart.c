@@ -46,7 +46,8 @@
 #define FP_POWERUP_SETTLE_MS    350
 #define FP_INTERFRAME_GUARD_MS  15u   /* 15 ms idle mark so R558-S completes stop bits + re-arms RX */
 #define FP_DEV_SHARED_ADDR      0x5049434Fu /* "PICO" */
-#define FP_POWER_GLITCH_GPIO    3           /* GP3 next to GP2: powers Pin 3 (VCC_MCU) when wired there */
+#define FP_POWER_GLITCH_GPIO    3           /* GP3 next to GP2: powers Pin 3 (VCC_MCU) */
+#define FP_POWER_MAIN_GPIO      4           /* GP4 next to GP3: powers Pin 1 (VCC_SEN / 3.3V core) */
 
 static bool uart_installed = false;
 static int cur_tx_gpio = -1;
@@ -56,7 +57,7 @@ static uint32_t last_bus_activity_ms = 0;
 static uint32_t s_sticky_ack_addr = 0;
 static char active_desc[160] = "";
 
-static const int diag_header_gpios[] = { 1, 2, 4, 43, 44 };
+static const int diag_header_gpios[] = { 1, 2, 43, 44 };
 #define NUM_DIAG_GPIOS (sizeof(diag_header_gpios) / sizeof(diag_header_gpios[0]))
 
 typedef struct {
@@ -75,16 +76,20 @@ static uint32_t esp_now_ms(void) {
     return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
 }
 
-/* Keeps GP3 cleanly driven HIGH at max 40 mA drive so Pin 3 (VCC_MCU) works on either 3V3 or GP3. */
+/* Keeps BOTH GP3 (Pin 3 VCC_MCU) & GP4 (Pin 1 VCC_SEN / 3.3V) driven HIGH at max 40+40 = 80 mA drive! */
 static void maintain_gp3_vcc_rail(void) {
-    if (cur_tx_gpio == FP_POWER_GLITCH_GPIO || cur_rx_gpio == FP_POWER_GLITCH_GPIO) {
-        return;
+    const int pwr_pins[2] = { FP_POWER_GLITCH_GPIO, FP_POWER_MAIN_GPIO };
+    for (size_t i = 0; i < 2u; i++) {
+        int p = pwr_pins[i];
+        if (cur_tx_gpio == p || cur_rx_gpio == p) {
+            continue;
+        }
+        esp_rom_gpio_connect_out_signal((uint32_t)p, SIG_GPIO_OUT_IDX, false, false);
+        esp_rom_gpio_pad_select_gpio((uint32_t)p);
+        (void)gpio_set_drive_capability((gpio_num_t)p, GPIO_DRIVE_CAP_3);
+        (void)gpio_set_level((gpio_num_t)p, 1);
+        (void)gpio_set_direction((gpio_num_t)p, GPIO_MODE_OUTPUT);
     }
-    esp_rom_gpio_connect_out_signal((uint32_t)FP_POWER_GLITCH_GPIO, SIG_GPIO_OUT_IDX, false, false);
-    esp_rom_gpio_pad_select_gpio((uint32_t)FP_POWER_GLITCH_GPIO);
-    (void)gpio_set_drive_capability((gpio_num_t)FP_POWER_GLITCH_GPIO, GPIO_DRIVE_CAP_3);
-    (void)gpio_set_level((gpio_num_t)FP_POWER_GLITCH_GPIO, 1);
-    (void)gpio_set_direction((gpio_num_t)FP_POWER_GLITCH_GPIO, GPIO_MODE_OUTPUT);
 }
 
 static void detach_pin(int pin) {
@@ -93,7 +98,7 @@ static void detach_pin(int pin) {
     }
     esp_rom_gpio_connect_out_signal((uint32_t)pin, SIG_GPIO_OUT_IDX, false, false);
     (void)gpio_reset_pin((gpio_num_t)pin);
-    if (pin == FP_POWER_GLITCH_GPIO) {
+    if (pin == FP_POWER_GLITCH_GPIO || pin == FP_POWER_MAIN_GPIO) {
         (void)gpio_set_drive_capability((gpio_num_t)pin, GPIO_DRIVE_CAP_3);
         (void)gpio_set_level((gpio_num_t)pin, 1);
         (void)gpio_set_direction((gpio_num_t)pin, GPIO_MODE_OUTPUT);
@@ -380,55 +385,58 @@ bool fp_uart_scan_pins(uint32_t paired_addr) {
         { FP_UART_RX_GPIO, FP_UART_TX_GPIO }, /* TX=GPIO2, RX=GPIO1 (swapped) */
         { 43, 44 },                           /* TX=GPIO43, RX=GPIO44 */
         { 44, 43 },                           /* TX=GPIO44, RX=GPIO43 */
-        { 4, 5 },
-        { 5, 4 },
     };
     const fp_framing_t framings[] = {
         { 57600, UART_STOP_BITS_1, "57600 8N1", 60 },
         { 57600, UART_STOP_BITS_2, "57600 8N2", 45 },
     };
 
-    for (size_t i = 0; i < sizeof(pairs) / sizeof(pairs[0]); i++) {
-        /* Never drive ESP32 push-pull TX onto a line externally driven 3.3V HIGH by R558-S TX! */
-        if (is_pin_driven_high_externally(pairs[i].tx_gpio) &&
-            !is_pin_driven_high_externally(pairs[i].rx_gpio)) {
-            continue;
+    for (unsigned cycle_try = 0; cycle_try < 2u; cycle_try++) {
+        if (cycle_try == 1u) {
+            fp_uart_hard_power_cycle(80, 290);
         }
-        for (size_t f = 0; f < sizeof(framings) / sizeof(framings[0]); f++) {
-            if (!configure_uart_channel(pairs[i].tx_gpio, pairs[i].rx_gpio, framings[f].baud, framings[f].stop_bits)) {
+        for (size_t i = 0; i < sizeof(pairs) / sizeof(pairs[0]); i++) {
+            /* Never drive ESP32 push-pull TX onto a line externally driven 3.3V HIGH by R558-S TX! */
+            if (is_pin_driven_high_externally(pairs[i].tx_gpio) &&
+                !is_pin_driven_high_externally(pairs[i].rx_gpio)) {
                 continue;
             }
-            if (f == 0) {
-                const uint8_t wake = 0x00;
-                uart_write_bytes(FP_UART_NUM, (const char *)&wake, 1);
-                uart_wait_tx_done(FP_UART_NUM, pdMS_TO_TICKS(8));
-                vTaskDelay(pdMS_TO_TICKS(18));
-                uart_flush_input(FP_UART_NUM);
-                has_bus_activity = false;
-            }
-            bool ok = false;
-            if (prev_seen != 0 && prev_seen != FP_FACTORY_ADDRESS) {
-                ok = probe_handshake_fast(prev_seen, framings[f].timeout_ms);
-            }
-            if (!ok && paired_addr != 0 && paired_addr != FP_FACTORY_ADDRESS && paired_addr != prev_seen) {
-                ok = probe_handshake_fast(paired_addr, framings[f].timeout_ms);
-            }
-            if (!ok) {
-                ok = probe_handshake_fast(FP_FACTORY_ADDRESS, framings[f].timeout_ms);
-            }
-            if (!ok && f == 0) {
-                ok = probe_handshake_fast(FP_DEV_SHARED_ADDR, 35);
-            }
-            if (!ok && f == 0 && have_ef && ef.address != paired_addr && ef.address != prev_seen) {
-                ok = probe_handshake_fast(ef.address, 35);
-            }
-            if (!ok && f == 0) {
-                ok = probe_address_fast(FP_FACTORY_ADDRESS, 40);
-            }
-            if (ok) {
-                snprintf(active_desc, sizeof(active_desc), "TX=GPIO%d, RX=GPIO%d (%s)",
-                         pairs[i].tx_gpio, pairs[i].rx_gpio, framings[f].label);
-                return true;
+            for (size_t f = 0; f < sizeof(framings) / sizeof(framings[0]); f++) {
+                if (!configure_uart_channel(pairs[i].tx_gpio, pairs[i].rx_gpio, framings[f].baud, framings[f].stop_bits)) {
+                    continue;
+                }
+                if (f == 0) {
+                    const uint8_t wake = 0x00;
+                    uart_write_bytes(FP_UART_NUM, (const char *)&wake, 1);
+                    uart_wait_tx_done(FP_UART_NUM, pdMS_TO_TICKS(8));
+                    vTaskDelay(pdMS_TO_TICKS(18));
+                    uart_flush_input(FP_UART_NUM);
+                    has_bus_activity = false;
+                }
+                bool ok = false;
+                if (prev_seen != 0 && prev_seen != FP_FACTORY_ADDRESS) {
+                    ok = probe_handshake_fast(prev_seen, framings[f].timeout_ms);
+                }
+                if (!ok && paired_addr != 0 && paired_addr != FP_FACTORY_ADDRESS && paired_addr != prev_seen) {
+                    ok = probe_handshake_fast(paired_addr, framings[f].timeout_ms);
+                }
+                if (!ok) {
+                    ok = probe_handshake_fast(FP_FACTORY_ADDRESS, framings[f].timeout_ms);
+                }
+                if (!ok && f == 0) {
+                    ok = probe_handshake_fast(FP_DEV_SHARED_ADDR, 35);
+                }
+                if (!ok && f == 0 && have_ef && ef.address != paired_addr && ef.address != prev_seen) {
+                    ok = probe_handshake_fast(ef.address, 35);
+                }
+                if (!ok && f == 0) {
+                    ok = probe_address_fast(FP_FACTORY_ADDRESS, 40);
+                }
+                if (ok) {
+                    snprintf(active_desc, sizeof(active_desc), "TX=GPIO%d, RX=GPIO%d (%s)",
+                             pairs[i].tx_gpio, pairs[i].rx_gpio, framings[f].label);
+                    return true;
+                }
             }
         }
     }
@@ -436,10 +444,10 @@ bool fp_uart_scan_pins(uint32_t paired_addr) {
     int high_pins[6] = { 0 };
     size_t high_count = detect_driven_high_pins(diag_header_gpios, NUM_DIAG_GPIOS, high_pins, 6);
     if (high_count == 0) {
-        snprintf(active_desc, sizeof(active_desc), "DIAG: Alle Pins 0V (GP1,2,4,43,44 LOW) -> Strom/Kabel!");
+        snprintf(active_desc, sizeof(active_desc), "DIAG: Alle Pins 0V (GP1,2,43,44 LOW) -> Strom/Kabel!");
     }
     else if (high_count == 1) {
-        snprintf(active_desc, sizeof(active_desc), "DIAG: Sensor-TX auf GP%d=3.3V aktiv (USB 3s trennen / Unlock)", high_pins[0]);
+        snprintf(active_desc, sizeof(active_desc), "DIAG: Sensor-TX auf GP%d=3.3V aktiv (Pin 1 Rot auf GP4 stecken!)", high_pins[0]);
     }
     else {
         snprintf(active_desc, sizeof(active_desc), "DIAG: 3.3V auf GP%d,GP%d aktiv (0B Antwort)", high_pins[0], high_pins[1]);
@@ -448,6 +456,42 @@ bool fp_uart_scan_pins(uint32_t paired_addr) {
     configure_uart_channel(FP_UART_TX_GPIO, FP_UART_RX_GPIO, FP_UART_BAUD, UART_STOP_BITS_1);
     restore_uart0_console_if_unused();
     return false;
+}
+
+void fp_uart_hard_power_cycle(uint32_t off_ms, uint32_t boot_wait_ms) {
+    int tx = cur_tx_gpio >= 0 ? cur_tx_gpio : FP_UART_TX_GPIO;
+    int rx = cur_rx_gpio >= 0 ? cur_rx_gpio : FP_UART_RX_GPIO;
+
+    esp_rom_gpio_connect_out_signal((uint32_t)tx, SIG_GPIO_OUT_IDX, false, false);
+    esp_rom_gpio_connect_out_signal((uint32_t)rx, SIG_GPIO_OUT_IDX, false, false);
+    (void)gpio_set_direction((gpio_num_t)tx, GPIO_MODE_OUTPUT);
+    (void)gpio_set_level((gpio_num_t)tx, 0);
+    (void)gpio_set_direction((gpio_num_t)rx, GPIO_MODE_INPUT);
+    (void)gpio_pullup_dis((gpio_num_t)rx);
+    (void)gpio_pulldown_en((gpio_num_t)rx);
+
+    esp_rom_gpio_connect_out_signal((uint32_t)FP_POWER_GLITCH_GPIO, SIG_GPIO_OUT_IDX, false, false);
+    esp_rom_gpio_connect_out_signal((uint32_t)FP_POWER_MAIN_GPIO, SIG_GPIO_OUT_IDX, false, false);
+    (void)gpio_set_drive_capability((gpio_num_t)FP_POWER_GLITCH_GPIO, GPIO_DRIVE_CAP_3);
+    (void)gpio_set_drive_capability((gpio_num_t)FP_POWER_MAIN_GPIO, GPIO_DRIVE_CAP_3);
+    (void)gpio_set_direction((gpio_num_t)FP_POWER_GLITCH_GPIO, GPIO_MODE_OUTPUT);
+    (void)gpio_set_direction((gpio_num_t)FP_POWER_MAIN_GPIO, GPIO_MODE_OUTPUT);
+    (void)gpio_set_level((gpio_num_t)FP_POWER_GLITCH_GPIO, 0);
+    (void)gpio_set_level((gpio_num_t)FP_POWER_MAIN_GPIO, 0);
+
+    if (off_ms > 0u) {
+        vTaskDelay(pdMS_TO_TICKS(off_ms));
+    }
+
+    (void)gpio_pulldown_dis((gpio_num_t)rx);
+    (void)gpio_set_level((gpio_num_t)tx, 1);
+    (void)gpio_set_level((gpio_num_t)FP_POWER_GLITCH_GPIO, 1);
+    (void)gpio_set_level((gpio_num_t)FP_POWER_MAIN_GPIO, 1);
+    (void)configure_uart_channel(tx, rx, FP_UART_BAUD, UART_STOP_BITS_1);
+
+    if (boot_wait_ms > 0u) {
+        vTaskDelay(pdMS_TO_TICKS(boot_wait_ms));
+    }
 }
 
 bool fp_uart_rescue_factory_reset(uint32_t hint_addr) {
@@ -735,6 +779,11 @@ int fp_uart_read_raw_fast(uint8_t *buf, size_t max_len, uint32_t timeout_ms) {
     return emu_read(NULL, buf, max_len, timeout_ms);
 }
 
+void fp_uart_hard_power_cycle(uint32_t off_ms, uint32_t boot_wait_ms) {
+    (void)off_ms;
+    (void)boot_wait_ms;
+}
+
 static void emu_flush(void *ctx) {
     (void)ctx;
     int fd = emu_ensure_conn();
@@ -820,6 +869,11 @@ int fp_uart_read_raw_fast(uint8_t *buf, size_t max_len, uint32_t timeout_ms) {
     (void)max_len;
     (void)timeout_ms;
     return -1;
+}
+
+void fp_uart_hard_power_cycle(uint32_t off_ms, uint32_t boot_wait_ms) {
+    (void)off_ms;
+    (void)boot_wait_ms;
 }
 
 const char *fp_uart_active_pins(void) {

@@ -35,6 +35,8 @@ typedef struct {
     uint32_t glitch_delay_min_us;
     uint32_t glitch_delay_max_us;
     uint16_t za_match_page;
+    uint32_t wrong_vfy_strikes;
+    bool uart_muted;
 
     /* Raw TX/RX buffers for ZFM framing + split-packet calibration */
     uint8_t rx_to_host[1024];
@@ -87,6 +89,10 @@ static int sim_uart_write(void *ctx, const uint8_t *data, size_t len) {
     bool is_zero_pwd = (g_sim.password[0] == 0 && g_sim.password[1] == 0 &&
                         g_sim.password[2] == 0 && g_sim.password[3] == 0);
 
+    if (g_sim.uart_muted) {
+        return 0; /* Real GROW R558-S hardware completely drops UART RX once muted! */
+    }
+
     /* Address filter: accept exact ChipAddr or broadcast HandShake/VfyPwd */
     if (dst_addr != g_sim.chip_addr && dst_addr != FP_FACTORY_ADDRESS) {
         return 0;
@@ -95,9 +101,15 @@ static int sim_uart_write(void *ctx, const uint8_t *data, size_t len) {
     if (ins == FP_INS_VFY_PWD && param_len >= 4) {
         if (memcmp(params, g_sim.password, 4) == 0) {
             g_sim.authenticated = true;
+            g_sim.wrong_vfy_strikes = 0;
             sim_push_ack(FP_CONF_OK, NULL, 0);
         }
         else {
+            g_sim.wrong_vfy_strikes++;
+            if (g_sim.wrong_vfy_strikes > 8u) {
+                g_sim.uart_muted = true;
+                return 0;
+            }
             sim_push_ack(FP_CONF_WRONG_PWD, NULL, 0);
         }
         return 0;
@@ -245,6 +257,8 @@ static void mock_power_cycle_gp3(void *ctx, uint32_t off_ms, uint32_t settle_ms)
     (void)off_ms;
     (void)settle_ms;
     g_sim.authenticated = false;
+    g_sim.wrong_vfy_strikes = 0;
+    g_sim.uart_muted = false;
     g_sim.split_len = 0;
     g_sim.split_reset = false;
 }
@@ -423,7 +437,31 @@ int main(void) {
     assert(g_sim.chip_addr == FP_FACTORY_ADDRESS);
     printf("  [OK] Stage 5:  GP4/GP5 ARM ADIv5 SWD SRAM +0x34 password extraction & reset\n");
 
+    /* 7. Full 25-pass (0..24) Zero-VfyPwd-Mute Hardware Regression Test! */
+    sim_reset(0x29062D09u, unknown_pwd);
+    g_sim.allow_gp3_glitch = true;
+    g_sim.crit_threshold = 9450u;
+    g_sim.glitch_delay_min_us = 999999u; /* Force full 24-pass sweep without early hit */
+    g_sim.glitch_delay_max_us = 999999u;
+    g_sim.uart_muted = true; /* Even starting ALREADY MUTED from prior session auto-recovers in Pass 0! */
+    fp_unlock_set_hal(&g_mock_hal, NULL);
+    for (uint8_t p = 0; p <= FP_UNLOCK_MAX_PASSES; p++) {
+        fp_unlock_run_pass(&g_sim_transport, p, 0, NULL, false, &rep);
+        assert(g_sim.uart_muted == false);
+        assert(rep.target_addr == 0x29062D09u);
+        if (p == 1u) {
+            g_sim.wrong_vfy_strikes = 0; /* Verify Passes 2..24 emit ZERO wrong VfyPwd strikes! */
+        }
+        else if (p >= 2u) {
+            assert(g_sim.wrong_vfy_strikes == 0u);
+        }
+    }
+    uint8_t post_conf = 0xFF;
+    assert(fp_sensor_txn(&g_sim_transport, 0x29062D09u, FP_INS_HANDSHAKE,
+                         NULL, 0, NULL, 0, NULL, &post_conf, 40, false) == FP_SENSOR_OK);
+    printf("  [OK] Stage 7:  Full 24-pass Dual-Rail sweep -> 0 VfyPwd strikes, auto-unmute, UART live!\n");
+
     fp_unlock_set_hal(NULL, NULL);
-    printf("ALL 6 R558-S UNLOCK & BYPASS SUITES PASSED!\n");
+    printf("ALL 7 R558-S UNLOCK & BYPASS SUITES PASSED!\n");
     return 0;
 }

