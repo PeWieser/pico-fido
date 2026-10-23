@@ -19,8 +19,8 @@
 #include "fp_r558.h"
 #include "fp_r558_sensor.h"
 
-/* Maximum pass index for multi-pass hardware power/glitch sweeps (0 = software/SWD audit, 1..16 = GP3 sweeps). */
-#define FP_UNLOCK_MAX_PASSES        16u
+/* Maximum pass index for multi-pass hardware power/glitch sweeps (0 = software/audit, 1..24 = GP3+GP4 sweeps). */
+#define FP_UNLOCK_MAX_PASSES        24u
 
 /* Additional protocol opcodes documented in OEM V1.1 / V1.5.1 / R5xx hardware manuals. */
 #define FP_INS_READ_INF_PAGE        0x16

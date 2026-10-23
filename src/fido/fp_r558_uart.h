@@ -58,6 +58,9 @@ bool fp_uart_reconfig_raw(int tx_gpio, int rx_gpio, int baud, bool even_parity, 
 int fp_uart_write_raw_fast(const uint8_t *buf, size_t len);
 int fp_uart_read_raw_fast(uint8_t *buf, size_t max_len, uint32_t timeout_ms);
 
+/* Hard power-cycles dual sensor supply rails GP3 (Pin 3) + GP4 (Pin 1) to clear any RAM mute/lockup. */
+void fp_uart_hard_power_cycle(uint32_t off_ms, uint32_t boot_wait_ms);
+
 /* Transport bound to the UART. On builds without UART it always reports an I/O error. */
 const fp_transport_t *fp_uart_transport(void);
 
