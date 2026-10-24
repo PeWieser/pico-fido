@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pico FIDO · R558-S Sensor-Rettung</title>
+<meta name="description" content="Passwortgesperrten GROW R558-S Fingerabdrucksensor wieder nutzbar machen: WebHID-Recovery, MAC-Ableitungsprüfung und lokale Flash-Dump-Analyse.">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>Pico FIDO · R558-S Sensor-Rettung</h1>
+  <p class="sub">Dein ESP32-S3-Schlüssel antwortet, aber der Fingerabdrucksensor bleibt dunkel und meldet
+  <code>0x21</code>? Dann wartet das Modul auf sein (verlorenes) Passwort. Diese Seite führt dich durch alle
+  Rettungswege – <strong>alles läuft lokal in deinem Browser</strong>, es wird nichts hochgeladen.</p>
+</header>
+
+<section class="warn">
+  <h2>⚠️ Browser-Voraussetzung (wichtig, einmalig)</h2>
+  <p>Chrome/Edge sperren WebHID für FIDO-Geräte (Usage Page <code>0xF1D0</code>). Ohne die folgende
+  Startoption erscheint dein Schlüssel <strong>gar nicht</strong> in der Geräteauswahl – das ist die
+  häufigste Ursache für „Webapp findet nichts“:</p>
+  <details>
+    <summary>Browser mit entsperrter HID-Liste starten (Befehle anzeigen)</summary>
+    <p><strong>Windows (Chrome):</strong></p>
+    <pre>"C:\Program Files\Google\Chrome\Application\chrome.exe" --disable-hid-blocklist</pre>
+    <p><strong>macOS (Chrome):</strong></p>
+    <pre>open -a "Google Chrome" --args --disable-hid-blocklist</pre>
+    <p><strong>Linux:</strong></p>
+    <pre>google-chrome --disable-hid-blocklist</pre>
+    <p>Die Seite muss über <code>https://</code> (GitHub Pages) oder <code>http://localhost</code> laufen.
+    Firefox/Safari können kein WebHID. USB-Kabel muss ein Datenkabel sein.</p>
+  </details>
+</section>
+
+<section id="step-connect">
+  <h2>Schritt 1 · Verbinden &amp; Status</h2>
+  <p>Schlüssel per USB anschließen, dann verbinden. Aus der Telemetrie-Zeile liest du die beobachtete
+  Chip-Adresse (<code>A=0x…</code>) für Schritt 3/4 ab.</p>
+  <div class="row">
+    <button id="connectBtn" class="primary">🔌 Gerät verbinden</button>
+    <button id="statusBtn">Status neu lesen</button>
+    <button id="probeBtn">Probe (Pin-Scan)</button>
+  </div>
+  <table class="kv"><tbody id="statusTable"><tr><td>Noch kein Status gelesen.</td></tr></tbody></table>
+</section>
+
+<section id="step-recover">
+  <h2>Schritt 2 · Sensor wiederherstellen (Recover 0x0B)</h2>
+  <p>Die Firmware probiert ihre <strong>Wiederherstellungs-Leiter</strong> (nur <code>VfyPwd</code>, nichts wird
+  gelöscht): gespeicherte Zugangsdaten → aus der eFuse-MAC dieses Boards abgeleitet →
+  <strong>Flash-Archäologie</strong> (alte <code>EF_FP_CONF</code>-Kopien im eigenen Flash – der Weg für
+  Zufallspasswörter aus Builds&nbsp;&lt;&nbsp;47) → Dev-Zugangsdaten → deine Kandidaten → Werkseinstellung.</p>
+  <p><strong>Vorher:</strong> Gerät 10&nbsp;s vom USB trennen, wieder anstecken und Recover als
+  <em>erste</em> Aktion ausführen (das Modul kann seine UART nach zu vielen Fehlversuchen bis zum
+  nächsten Stromzyklus stummschalten).</p>
+  <label for="candidateHex">Eigene Passwort-Kandidaten (optional, Hex, je 4 Byte = 8 Zeichen, ohne Leerzeichen aneinander):</label>
+  <input id="candidateHex" type="text" spellcheck="false" autocomplete="off" placeholder="z. B. aus Schritt 3 oder 4 übernehmen">
+  <div class="row">
+    <button id="recoverBtn" class="primary">🛟 Sensor wiederherstellen</button>
+  </div>
+  <p class="hint">Erfolg erkennst du an <code>Recover gefunden = true</code> und der Quelle
+  (<code>stored</code> / <code>derived</code> / <code>flash</code> / <code>shared</code> / <code>user</code> /
+  <code>factory</code>). Danach in der Haupt-Verwaltung <strong>pairen</strong>, Finger anlernen und sofort ein
+  Sensor-Backup erstellen.</p>
+</section>
+
+<section id="step-mac">
+  <h2>Schritt 3 · MAC-Ableitung prüfen</h2>
+  <p>Seit Build 47 gilt: Passwort+Adresse = <code>SHA-256("pico-fido-r558-efuse-bind-v1" ‖ eFuse-MAC)</code>.
+  Lies die MAC deines ESP32-S3 aus (<code>esptool --port &lt;PORT&gt; read_mac</code>, Board im Download-Modus:
+  BOOT halten → RESET drücken → BOOT loslassen) und prüfe hier, ob sie zur beobachteten Chip-Adresse passt.
+  <strong>Kein Treffer</strong> (wie bei Zufallspasswörtern vor Build 47) heißt: weiter mit Schritt 4.</p>
+  <label for="macInput">ESP32S3 eFuse-MAC:</label>
+  <input id="macInput" type="text" spellcheck="false" autocomplete="off" placeholder="24:0A:C4:12:34:56">
+  <label for="observedAddr">Beobachtete Chip-Adresse (aus Schritt 1, <code>A=0x…</code>):</label>
+  <input id="observedAddr" type="text" spellcheck="false" autocomplete="off" placeholder="29062D09">
+  <div class="row"><button id="macBtn">Ableitung berechnen &amp; vergleichen</button></div>
+  <p id="macResult" class="result"></p>
+  <p class="hint">Wurde der Sensor evtl. an einem <em>anderen</em> ESP32-Board (Build ≥ 47) gekoppelt, hilft die
+  Offline-Gesamtsuche über alle Espressif-MACs am PC: <code>tools/r558_mac_search.c</code> (siehe Anleitung).</p>
+</section>
+
+<section id="step-dump">
+  <h2>Schritt 4 · Flash-Dump analysieren (lokal)</h2>
+  <p>Erstelle einen <strong>vollständigen</strong> Flash-Dump deines Schlüssels (Download-Modus, siehe Schritt 3):</p>
+  <pre>esptool --chip esp32s3 --port &lt;PORT&gt; read_flash 0 0x400000 esp32_dump.bin</pre>
+  <p>Wähle die Datei hier aus – sie wird <strong>nur in diesem Tab</strong> durchsucht (EF_FP_CONF-Reste in
+  Journal-/Redo-Sektoren und alten Partitionen). Gefundene Kandidaten kannst du direkt in Schritt 2 testen.</p>
+  <label for="dumpMode">Dump-Typ:</label>
+  <select id="dumpMode">
+    <option value="esp32">ESP32-S3 Flash-Dump (4 MB)</option>
+    <option value="sensor">R558-S Sensor-SPI-Flash-Dump (Experten, per Clip ausgelesen)</option>
+  </select>
+  <label for="dumpFile">Dump-Datei (.bin):</label>
+  <input id="dumpFile" type="file" accept=".bin,application/octet-stream">
+  <table class="kv">
+    <thead><tr><th>Konfidenz</th><th>Passwort</th><th>Adresse</th><th>Quelle</th><th>Offset</th></tr></thead>
+    <tbody id="candidateTable"><tr><td colspan="5">Noch keine Analyse.</td></tr></tbody>
+  </table>
+  <div class="row" id="dumpActions" hidden>
+    <button id="useCandidatesBtn" class="primary">Kandidaten in Schritt 2 übernehmen</button>
+    <button id="downloadJsonBtn">Als JSON speichern</button>
+  </div>
+  <p class="hint">🔐 Gefundene Passwörter sind echte Zugangsdaten – nicht öffentlich posten, JSON sicher aufbewahren.</p>
+</section>
+
+<section id="guide">
+  <h2>Anleitung &amp; Hintergründe</h2>
+  <ol>
+    <li><strong>Neueste Firmware</strong> flashen (unten), Gerät warmlaufen lassen.</li>
+    <li><strong>Schritt 1–2:</strong> Status + Recover. Quelle notieren.</li>
+    <li><strong>Schritt 3:</strong> Eigene MAC prüfen (selbes Board?) – sonst PC-Gesamtsuche.</li>
+    <li><strong>Schritt 4:</strong> Flash-Dump-Forensik (der Hauptweg für alte Zufallspasswörter).</li>
+    <li><strong>Direkt am Sensor (PC, USB-TTL 3,3 V):</strong> <code>tools/r558_uart_recover.py</code> – inkl.
+    ReadINFpage-Test und optionalem Werks-Reset des Moduls nach erfolgreichem Entsperren.</li>
+    <li><strong>Letzte Wege &amp; Ehrlichkeit:</strong> Sensor-SPI-Flash per Clip auslesen (Passwort in der
+    Parametertabelle), GROW-Support oder Modultausch. Ein echtes Zufallspasswort aus der Hardware-RNG ist
+    rechnerisch nicht zurückholbar – steht so in der ausführlichen Anleitung.</li>
+  </ol>
+  <p>Ausführlich, mit Verkabelung, esptool-Befehlen für Windows/macOS/Linux und Fehlerbildern:
+  <a href="https://github.com/PeWieser/pico-fido/blob/main/docs/fingerprint/R558_RETTUNG_ANLEITUNG.md" rel="noopener">R558_RETTUNG_ANLEITUNG.md</a>
+  · Technik: <a href="https://github.com/PeWieser/pico-fido/blob/main/docs/fingerprint/R558_WIEDERHERSTELLUNG.md" rel="noopener">R558_WIEDERHERSTELLUNG.md</a></p>
+</section>
+
+<section id="firmware">
+  <h2>Aktuelle Firmware</h2>
+  <p>Beide Images sind Komplett-Images ab Adresse <code>0x0</code> (Flashen nur auf Chips ohne aktive
+  Flash-Verschlüsselung per WebSerial/esptool; Details in der Anleitung).</p>
+  <div id="releases">Lade Releases …</div>
+</section>
+
+<section>
+  <h2>Protokoll</h2>
+  <div id="log" class="log" aria-live="polite"></div>
+</section>
+
+<footer>
+  <p>Pico FIDO (PeWieser-Fork) · Quellcode &amp; Tools:
+  <a href="https://github.com/PeWieser/pico-fido" rel="noopener">github.com/PeWieser/pico-fido</a> ·
+  Diese Seite speichert nichts und lädt nichts hoch.</p>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>

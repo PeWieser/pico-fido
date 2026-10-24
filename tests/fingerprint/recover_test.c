@@ -254,8 +254,71 @@ static void test_bounds_and_empty(void) {
     CHECK(rep.attempts == FP_RECOVER_MAX_CANDIDATES, "the ladder is hard bounded");
 }
 
+static void put_conf(uint8_t *dst, uint8_t flags, const uint8_t pwd[4], uint32_t addr, uint16_t cap) {
+    memset(dst, 0, 46);
+    dst[0] = 0x01; dst[1] = flags; dst[2] = 0; dst[3] = 0;
+    memcpy(dst + 4, pwd, 4);
+    dst[8] = (uint8_t)(addr >> 24); dst[9] = (uint8_t)(addr >> 16);
+    dst[10] = (uint8_t)(addr >> 8); dst[11] = (uint8_t)addr;
+    dst[12] = (uint8_t)(cap >> 8); dst[13] = (uint8_t)cap;
+}
+
+static void put_backup(uint8_t *dst, const uint8_t pwd[4], uint32_t addr, uint16_t cap) {
+    memset(dst, 0, 43);
+    dst[0] = 0x01;
+    memcpy(dst + 1, pwd, 4);
+    dst[5] = (uint8_t)(addr >> 24); dst[6] = (uint8_t)(addr >> 16);
+    dst[7] = (uint8_t)(addr >> 8); dst[8] = (uint8_t)addr;
+    dst[9] = (uint8_t)(cap >> 8); dst[10] = (uint8_t)cap;
+}
+
+static void test_scan_image_finds_remnants(void) {
+    /* Synthetic "part0": erased flash (0xFF), junk, one EF_FP_CONF remnant, one backup remnant,
+       one look-alike with invalid flags and one with capacity 0. Only the two real ones count. */
+    static uint8_t img[8192];
+    memset(img, 0xFF, sizeof(img));
+    const uint8_t pwd_a[4] = { 0xDE, 0xAD, 0xBE, 0xEF };
+    const uint8_t pwd_b[4] = { 0x01, 0x23, 0x45, 0x67 };
+    const uint8_t pwd_x[4] = { 0x11, 0x22, 0x33, 0x44 };
+    put_conf(img + 1000, 0x40, pwd_x, 0x29062D09u, 100);      /* invalid flag bit: reject */
+    put_conf(img + 2000, 0x01, pwd_x, 0x29062D09u, 0);        /* capacity 0: reject */
+    put_conf(img + 3000, 0x01, pwd_a, 0x29062D09u, 100);      /* valid conf remnant */
+    put_backup(img + 5000, pwd_b, 0x0BADF00Du, 100);          /* valid backup remnant */
+    put_conf(img + 7000, 0x05, pwd_a, 0x29062D09u, 100);      /* duplicate pair: dedup */
+
+    fp_recover_candidate_t list[FP_RECOVER_MAX_CANDIDATES];
+    size_t n = fp_recover_scan_image(img, sizeof(img), list, 0, FP_RECOVER_MAX_CANDIDATES);
+    CHECK(n == 2, "flash scan: exactly the two valid remnants are found");
+    if (n >= 1) {
+        CHECK(list[0].source == FP_RECOVER_SRC_FLASH && list[0].address == 0x29062D09u &&
+              memcmp(list[0].password, pwd_a, 4) == 0, "flash scan: conf remnant first, in image order");
+    }
+    if (n >= 2) {
+        CHECK(list[1].source == FP_RECOVER_SRC_FLASH && list[1].address == 0x0BADF00Du &&
+              memcmp(list[1].password, pwd_b, 4) == 0, "flash scan: backup remnant second");
+    }
+    CHECK(strcmp(fp_recover_source_name(FP_RECOVER_SRC_FLASH), "flash") == 0,
+          "flash scan: source name is \"flash\"");
+
+    /* The scanned candidate must actually unlock a module locked with the remnant password. */
+    sim_t sim;
+    sim_init(&sim, pwd_a, 0x29062D09u);
+    fp_transport_t t = make_transport(&sim);
+    fp_recover_report_t rep;
+    CHECK(fp_recover_run(&t, list, n, &rep) && rep.source == FP_RECOVER_SRC_FLASH,
+          "flash scan: remnant candidate verifies against the locked module");
+    CHECK(sim.non_vfy_writes == 0, "flash scan: still only VfyPwd on the wire");
+
+    /* Bounds: tiny/empty images and a full list are safe. */
+    CHECK(fp_recover_scan_image(img, 10, list, 0, FP_RECOVER_MAX_CANDIDATES) == 0,
+          "flash scan: image shorter than one record yields nothing");
+    CHECK(fp_recover_scan_image(NULL, sizeof(img), list, 3, FP_RECOVER_MAX_CANDIDATES) == 3,
+          "flash scan: NULL image is a no-op");
+}
+
 int main(void) {
     test_candidate_list();
+    test_scan_image_finds_remnants();
     test_finds_stored_at_first_position();
     test_finds_derived_after_wrong_stored();
     test_finds_password_at_factory_address();

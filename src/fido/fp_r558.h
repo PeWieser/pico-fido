@@ -91,12 +91,14 @@ fp_result_t fp_factory_reset_sensor(void);
 /*
  * Recovery ladder for a module that asks for its password (0x21/0x13 on every instruction).
  *
- * Tries, in order: stored EF_FP_CONF credentials, credentials re-derived from this die, development
- * credentials, 4-byte candidates supplied by the owner (`user_passwords`, len must be a multiple of
- * 4) and finally the factory password. Each password is tried at the stored, the last observed and
- * the factory address. Non-destructive: only VfyPwd (0x13) is sent. On success the verified
- * credentials are stored as STAGED, so a following fp_pair() resumes without touching the module
- * password again. `out` (optional) receives the full report including a one-line telemetry summary.
+ * Tries exact (password, address) pairs first, in order: stored EF_FP_CONF credentials, credentials
+ * re-derived from this die, EF_FP_CONF/backup remnants found by scanning the raw "part0" partition
+ * (the only stage that can resurrect a pre-build-47 random password), development credentials,
+ * 4-byte candidates supplied by the owner (`user_passwords`, len must be a multiple of 4) and the
+ * factory password; remaining budget is filled with address variants. Non-destructive: only
+ * VfyPwd (0x13) is sent. On success the verified credentials are stored as STAGED, so a following
+ * fp_pair() resumes without touching the module password again. `out` (optional) receives the
+ * full report including a one-line telemetry summary.
  */
 fp_result_t fp_recover_sensor(const uint8_t *user_passwords, size_t user_password_len,
                               fp_recover_report_t *out);

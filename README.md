@@ -1,6 +1,14 @@
 # Pico FIDO
 This project transforms your Raspberry Pi Pico or ESP32 microcontroller into an integrated FIDO Passkey, functioning like a standard USB Passkey for authentication.
 
+> **Fork note (PeWieser): ESP32-S3 Super Mini + GROW R558-S fingerprint sensor.**
+> Sensor locked by a lost (random) module password? See the rescue guide
+> [`R558_RETTUNG_ANLEITUNG.md`](docs/fingerprint/R558_RETTUNG_ANLEITUNG.md) (German, step-by-step),
+> the browser recovery page in [`website/`](website/) (GitHub Pages; WebHID recovery `0x0B`,
+> MAC-derivation check, local flash-dump forensics), and the PC tools in
+> [`tools/`](tools/) (`r558_flash_forensics.py`, `r558_uart_recover.py`, `r558_mac_search.c`).
+> Technical background: [`R558_WIEDERHERSTELLUNG.md`](docs/fingerprint/R558_WIEDERHERSTELLUNG.md).
+
 If you are looking for a OpenPGP + Fido, see: https://github.com/polhenarejos/pico-fido2. Available through [PicoKey App](https://www.picokeys.com/picokeyapp/ "PicoKey App").
 
 ## Features

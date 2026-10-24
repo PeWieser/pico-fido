@@ -5,9 +5,11 @@
 > **Symptom:** Der LED-Ring bleibt dunkel, jede Anweisung wird mit `0x21` beantwortet, Pairing
 > scheitert mit einem Kommunikationsfehler.
 > **Kurzfassung:** Es gibt jetzt einen nicht-destruktiven Wiederherstellungspfad im Gerät
-> (Vendor-Befehl `0x0B`, 5 Stufen). Er stellt den Sensor wieder her, solange das Passwort auf *irgendeine*
-> Weise reproduzierbar ist – das ist bei allen seit Build 47 gepaarten Modulen der Fall, weil das
-> Passwort aus der eFuse-MAC des ESP32-S3 abgeleitet und nicht mehr zufällig gewählt wird.
+> (Vendor-Befehl `0x0B`, seit Oktober 2026 mit **Flash-Stufe**). Er stellt den Sensor wieder her,
+> solange das Passwort *irgendwie* beschaffbar ist: reproduzierbar (seit Build 47 aus der
+> eFuse-MAC abgeleitet) **oder** als Klartext-Rest im ESP32-Flash erhalten (der Fall für
+> Zufallspasswörter vor Build 47, z. B. die Sperre bei `A=0x29062D09` – siehe korrigiertes §2.2).
+> Praxis-Anleitung: `docs/fingerprint/R558_RETTUNG_ANLEITUNG.md`, Rettungs-Website: `website/`.
 
 ---
 
@@ -76,15 +78,27 @@ Jedes Passwort wird an **drei** Adressen probiert: gespeicherte Adresse, zuletzt
 und Werkadresse `0xFFFFFFFF`. Grund: Wenn `SetChipAddr (0x15)` verloren ging, ist das Passwort gesetzt,
 die Adresse steht aber wieder auf Werkseinstellung – ein Fall, den die alte Firmware nicht abdeckte.
 
-### 2.2 Warum das bei deinem Modul greifen kann
+### 2.2 Warum das bei deinem Modul greifen kann – **korrigiert (Oktober 2026)**
 
-Beobachtet wurde `A=0x29062D09`. Das ist die Adresse, die `esp_dev_efuse_session()` aus der MAC
-ableitet. Wenn das so ist, ist das zugehörige Passwort `SHA-256(…)[0..3]` **auf demselben Gerät
-jederzeit neu berechenbar** – Stufe 2 der Leiter. Das wurde bisher nie versucht: die vorhandene
-„Unlock“-Engine hat ausschließlich gegen Glitches, ISP-Leaks und `za`-Opcodes gearbeitet, nie gegen die
-eigene Ableitung.
+> **Die früher hier stehende Behauptung ist falsch und wird hiermit ersetzt.** Dort hieß es,
+> `A=0x29062D09` sei „die Adresse, die `esp_dev_efuse_session()` aus der MAC ableitet“.
+> Das stimmt nicht:
+>
+> - Eine Vollsuche über **alle 297 Espressif-OUIs × 2²⁴ NIC-Teile** (≈ 4,98 Mrd. SHA-256,
+>   `tools/r558_mac_search.c`, Selbsttest + Crosscheck gegen `hashlib`) fand **keine einzige**
+>   MAC, die die Adresse `0x29062D09` ableitet – weder auf diesem Board noch auf irgendeinem anderen.
+> - Damit steht fest: Das konkrete Modul wurde **vor Build 47** mit dem damaligen
+>   `random_fill_buffer()`-Pfad gekoppelt (Passwort **und** Adresse aus der Hardware-RNG).
+>   Auch der früher in der Firmware eingebettete Kandidat `0x7BF6B530` („AVX-512 OUI-Match“)
+>   war haltlos und wurde entfernt.
+>
+> Für dieses Modul ist deshalb **nicht Stufe 2 (`derived`), sondern Stufe 3 (`flash`)** der Weg:
+> Das Zufallspasswort stand im Klartext in `EF_FP_CONF`; das Dateisystem bewahrt beim
+> Überschreiben/Löschen physische Alt-Kopien (Journal/Redo, frühere Sektorinhalte), solange der
+> Chip nicht per `erase_flash` gelöscht wurde. Details: `R558_RETTUNG_ANLEITUNG.md` (Wege A–E).
 
-Falls die Konfiguration dagegen intakt ist und nur die Verifikation scheitert, greift Stufe 1.
+Falls die Konfiguration dagegen intakt ist und nur die Verifikation scheitert, greift Stufe 1,
+bei Build-≥-47-Pairings auf demselben Board Stufe 2.
 
 ### 2.3 Grenzen (ehrlich)
 
@@ -106,9 +120,14 @@ Falls die Konfiguration dagegen intakt ist und nur die Verifikation scheitert, g
 Vendor-Befehl `CTAP_VENDOR_CBOR` (`0xC1`), Nutzlast `0x09` + CBOR-Map:
 
 ```text
-{ 1: 11 }                                   # 0x0B recover, ohne Kandidaten
-{ 1: 11, 2: h'A1B2C3D4' }                   # zusätzlich ein 4-Byte-Kandidat (Vielfache von 4)
+{ 1: 11 }                                   # 0x0B recover, ohne Kandidaten  →  Daten: 09 A1 01 0B
+{ 1: 11, 2: { 1: h'A1B2C3D4' } }            # Schlüssel 2 ist eine MAP {1: bytes}! (Kandidaten à 4 Byte verkettet)
+                                            # → Daten: 09 A2 01 0B 02 A1 01 44 A1 B2 C3 D4
 ```
+
+> **Achtung, frühere Fassung war falsch:** Dort stand `{1: 11, 2: h'…'}` (Byte-String direkt unter
+> Schlüssel 2). `cbor_vendor.c` erwartet aber wie bei allen Unterbefehlen Schlüssel 2 als **Map**
+> `{1: bytes}`. Mit der alten Form wurden Besitzer-Kandidaten still ignoriert.
 
 Kein PIN-Token nötig (wie bei `0x09` Reset und `0x0A` Unlock-Pass): Die Leiter kann nur Zugang
 *wiederherstellen*, den das Gerät ohnehin ableiten kann. Sie zeigt kein Passwort an und schwächt die
@@ -120,7 +139,7 @@ Antwort: die bekannte Status-Map, erweitert um
 |---|---|
 | `0x0A` | Telemetrie-Zeile, z. B. `recover: OK src=derived A=29062D09 try=3/11` |
 | `0x0E` | `true`, wenn ein Kandidat geprüft werden konnte |
-| `0x0F` | Quelle: `stored`, `derived`, `shared`, `user`, `factory` oder `none` |
+| `0x0F` | Quelle: `stored`, `derived`, `flash`, `shared`, `user`, `factory` oder `none` |
 
 Bei Erfolg werden die geprüften Zugangsdaten als `STAGED` gespeichert. Ein anschließendes
 `{1: 2}` (`pair`) setzt den Vorgang an seinen Endprüfungen fort, **ohne** `SetPwd`/`SetChipAddr` erneut

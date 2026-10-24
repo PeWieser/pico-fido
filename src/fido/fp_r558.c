@@ -39,6 +39,7 @@
 #if defined(ESP_PLATFORM)
 #include "esp_flash_encrypt.h"
 #include "esp_mac.h"
+#include "esp_partition.h"
 #endif
 
 #if defined(ESP_PLATFORM)
@@ -48,7 +49,11 @@
 #endif
 
 /* ------------------------------------------------------------------------- */
-/* Persistent configuration (EF_FP_CONF, encrypted by the object store).     */
+/* Persistent configuration (EF_FP_CONF).                                    */
+/* Stored as a plain transparent EF in the "part0" key-storage partition: it */
+/* is only protected at rest when ESP32 flash encryption is active (R1). The */
+/* recovery ladder's flash stage (fp_recover_scan_image) relies on - and the */
+/* threat model in R558_PLAN.md accounts for - exactly this layout.          */
 /* ------------------------------------------------------------------------- */
 
 #if defined(ENABLE_R558_FINGERPRINT)
@@ -304,10 +309,13 @@ static bool esp_dev_xray_probe(uint32_t seen_addr, esp_dev_xray_t *xr) {
         xr->pwd_unlocked = true;
     }
 
-    /* 4. Check strictly minimal legitimate keys (OUI match, factory, Keyhold dev, chip eFuse)! */
+    /* 4. Check strictly minimal legitimate keys (factory, dev, chip eFuse-derived).
+     * NOTE: an earlier revision hard-coded 0x7BF6B530 as an alleged "AVX-512 OUI match"
+     * for chip address 0x29062D09. A full offline search over all 297 Espressif OUIs x
+     * 2^24 (tools/r558_mac_search.c, ~4.98G hashes, 2026-10) proves NO Espressif MAC
+     * derives address 0x29062D09 at all: that credential pair comes from the pre-Build-47
+     * random generator and no such embedded candidate can exist. Removed. */
     const uint8_t cand_pwds[][4] = {
-        { 0x7B, 0xF6, 0xB5, 0x30 }, /* AVX-512 Espressif MAC OUI SHA-256 match for 0x29062D09 */
-        { 0x30, 0xB5, 0xF6, 0x7B }, /* LE order of 0x7BF6B530 */
         { 0x00, 0x00, 0x00, 0x00 },
         { 0x52, 0x35, 0x35, 0x38 }, /* "R558" */
     };
@@ -377,7 +385,15 @@ static bool esp_dev_xray_probe(uint32_t seen_addr, esp_dev_xray_t *xr) {
     else {
         fp_session_t npwd_s = { .address = seen_addr, .password = { 'N', 'P', 'W', 'D' } };
         (void)fp_sensor_gen_img(t, &npwd_s, &xr->c01);
-        (void)fp_sensor_empty(t, &npwd_s, &xr->c0d);
+        /*
+         * Non-destructive reachability probe only: TemplateNum (0x1D). This used to send Empty
+         * (0x0D), which *deletes every template* on a module that is currently password-verified
+         * or passwordless - a status probe must never erase the sensor library.
+         */
+        {
+            uint16_t tpl_count = 0;
+            (void)fp_sensor_template_num(t, &npwd_s, &tpl_count, &xr->c0d);
+        }
 
         const uint8_t ai_params[5] = { 0x01, 0xFF, 0xFF, 0x00, 0x06 };
         uint8_t ai_buf[8] = { 0 };
@@ -1141,11 +1157,41 @@ bool fp_probe(void) {
 /* ------------------------------------------------------------------------- */
 
 /*
- * Builds the ordered candidate list. Priority is meaningful: the stored credentials are tried first
- * (cheapest and most likely), then everything this die can re-derive, then owner-supplied values,
- * then the factory default. Every password is also tried at the last observed address and at the
- * factory address, because a lost SetChipAddr (0x15) leaves the password in place while the address
- * falls back to 0xFFFFFFFF.
+ * Flash archaeology: scans this device's own "part0" key-storage partition for EF_FP_CONF /
+ * backup-blob remnants (journal and redo sectors of the pico-keys-sdk flash layer, stale records
+ * from older layouts). On an unencrypted device the records are plaintext; with flash encryption
+ * the memory-mapped view is decrypted by hardware, so the scan works the same. Read-only.
+ */
+static size_t scan_own_flash_candidates(fp_recover_candidate_t *list, size_t count, size_t cap) {
+#if defined(ESP_PLATFORM)
+    const esp_partition_t *part = esp_partition_find_first((esp_partition_type_t)0x40,
+                                                           (esp_partition_subtype_t)0x1, "part0");
+    if (part == NULL) {
+        return count;
+    }
+    const void *ptr = NULL;
+    esp_partition_mmap_handle_t handle = 0;
+    if (esp_partition_mmap(part, 0, part->size, ESP_PARTITION_MMAP_DATA, &ptr, &handle) != ESP_OK ||
+        ptr == NULL) {
+        return count;
+    }
+    size_t n = fp_recover_scan_image((const uint8_t *)ptr, part->size, list, count, cap);
+    esp_partition_munmap(handle);
+    return n;
+#else
+    (void)list;
+    (void)cap;
+    return count;
+#endif
+}
+
+/*
+ * Builds the ordered candidate list. Priority is meaningful - the module may mute its UART after
+ * too many wrong VfyPwd in one power session, and the ladder is capped at
+ * FP_RECOVER_MAX_CANDIDATES, so exact (password, address) pairs are all queued first:
+ * stored, die-derived, flash remnants, shared dev credentials, owner candidates at the primary
+ * address, factory. Only then are the remaining slots filled with address variants (a lost
+ * SetChipAddr (0x15) leaves the password set while the address falls back to 0xFFFFFFFF).
  */
 static size_t build_recovery_candidates(fp_recover_candidate_t *list, size_t cap,
                                         const fp_conf_t *c, uint32_t hint,
@@ -1172,37 +1218,65 @@ static size_t build_recovery_candidates(fp_recover_candidate_t *list, size_t cap
         }
     }
     addrs[n_addrs++] = FP_FACTORY_ADDRESS;
+    const uint32_t primary_addr = n_addrs > 0 ? addrs[0] : FP_FACTORY_ADDRESS;
 
-    /* 1. Exactly what the authenticator has stored. */
+    /* --- Phase A: exact pairs, most likely first. --- */
+
+    /* A1. Exactly what the authenticator has stored. */
     if (c != NULL && (c->flags & (FP_FLAG_PAIRED | FP_FLAG_STAGED)) && c->address != 0u) {
         n = fp_recover_add_candidate(list, n, cap, FP_RECOVER_SRC_STORED, c->address, c->password);
     }
 
-    /* 2. Re-derive from this ESP32-S3 die. Survives a FIDO reset, an erase_flash and a conf loss. */
+    /* A2. Re-derived from this ESP32-S3 die. Survives a FIDO reset, an erase_flash and a conf loss. */
     fp_session_t derived;
-    if (esp_dev_efuse_session(&derived)) {
+    bool have_derived = esp_dev_efuse_session(&derived);
+    if (have_derived) {
         n = fp_recover_add_candidate(list, n, cap, FP_RECOVER_SRC_DERIVED, derived.address, derived.password);
+    }
+
+    /* A3. Flash remnants in part0 (only stage that can resurrect a pre-build-47 random password). */
+    {
+        size_t flash_cap = cap > 5u ? cap - 4u : cap; /* keep room for A4-A6 */
+        n = scan_own_flash_candidates(list, n, flash_cap);
+    }
+
+    /* A4. Fixed development credentials (only usable when flash encryption is off). */
+    fp_session_t shared;
+    bool have_shared = esp_dev_shared_session(&shared);
+    if (have_shared) {
+        n = fp_recover_add_candidate(list, n, cap, FP_RECOVER_SRC_SHARED, shared.address, shared.password);
+    }
+
+    /* A5. Owner-supplied 4-byte candidates at the primary (stored/observed) address. */
+    if (user_pwds != NULL) {
+        for (size_t off = 0; off + 4u <= user_password_len && n < cap; off += 4u) {
+            n = fp_recover_add_candidate(list, n, cap, FP_RECOVER_SRC_USER,
+                                         primary_addr, user_pwds + off);
+        }
+    }
+
+    /* A6. Factory state: password 0x00000000 at 0xFFFFFFFF. Covers "SetPwd never landed". */
+    {
+        const uint8_t zero_pwd[4] = { 0, 0, 0, 0 };
+        n = fp_recover_add_candidate(list, n, cap, FP_RECOVER_SRC_FACTORY,
+                                     FP_FACTORY_ADDRESS, zero_pwd);
+    }
+
+    /* --- Phase B: address variants fill whatever budget is left. --- */
+    if (have_derived) {
         n = fp_recover_add_password_variants(list, n, cap, FP_RECOVER_SRC_DERIVED, derived.password,
                                              addrs, n_addrs);
     }
-
-    /* 3. Fixed development credentials (only usable when flash encryption is off). */
-    fp_session_t shared;
-    if (esp_dev_shared_session(&shared)) {
-        n = fp_recover_add_candidate(list, n, cap, FP_RECOVER_SRC_SHARED, shared.address, shared.password);
+    if (have_shared) {
         n = fp_recover_add_password_variants(list, n, cap, FP_RECOVER_SRC_SHARED, shared.password,
                                              addrs, n_addrs);
     }
-
-    /* 4. 4-byte candidates the owner supplied (old notes, previous backup, custom password). */
     if (user_pwds != NULL) {
         for (size_t off = 0; off + 4u <= user_password_len && n < cap; off += 4u) {
             n = fp_recover_add_password_variants(list, n, cap, FP_RECOVER_SRC_USER, user_pwds + off,
                                                  addrs, n_addrs);
         }
     }
-
-    /* 5. Factory state: password 0x00000000. Covers "SetPwd never landed". */
     {
         const uint8_t zero_pwd[4] = { 0, 0, 0, 0 };
         n = fp_recover_add_password_variants(list, n, cap, FP_RECOVER_SRC_FACTORY, zero_pwd,

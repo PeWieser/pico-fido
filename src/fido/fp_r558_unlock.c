@@ -1757,14 +1757,14 @@ void fp_unlock_run_pass(const fp_transport_t *t, uint8_t pass, uint32_t hint_add
             }
         }
 
-        /* Curated high-probability passwords (AVX-512 OUI match 0x7BF6B530 first!). */
+        /* Curated high-probability passwords. (An earlier revision claimed an
+         * "AVX-512 OUI match 0x7BF6B530" for address 0x29062D09; a full offline search
+         * over all Espressif OUIs proves no MAC derives that address - removed.) */
         if (live) {
             uint8_t addr_be[4], addr_le[4];
             wr_be32(addr_be, addr);
             wr_le32(addr_le, addr);
-            uint8_t cands[8][4] = {
-                { 0x7B, 0xF6, 0xB5, 0x30 }, /* Exact AVX-512 Espressif MAC OUI SHA-256 hit for 0x29062D09 */
-                { 0x30, 0xB5, 0xF6, 0x7B }, /* LE order of 0x7BF6B530 */
+            uint8_t cands[][4] = {
                 { addr_be[0], addr_be[1], addr_be[2], addr_be[3] },
                 { addr_le[0], addr_le[1], addr_le[2], addr_le[3] },
                 { 0x00, 0x00, 0x00, 0x00 },
@@ -1773,9 +1773,9 @@ void fp_unlock_run_pass(const fp_transport_t *t, uint8_t pass, uint32_t hint_add
                 { 0x12, 0x34, 0x56, 0x78 },
             };
             if (has_efuse_pwd) {
-                memcpy(cands[7], efuse_pwd, 4);
+                memcpy(cands[(sizeof(cands) / sizeof(cands[0])) - 1u], efuse_pwd, 4);
             }
-            for (size_t i = 0; i < 8u && vfy_budget > 0u; i++) {
+            for (size_t i = 0; i < (sizeof(cands) / sizeof(cands[0])) && vfy_budget > 0u; i++) {
                 vfy_budget--;
                 if (try_unlock_password(t, &addr, cands[i], out)) {
                     snprintf(out->summary, sizeof(out->summary),
