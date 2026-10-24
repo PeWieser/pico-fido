@@ -440,11 +440,11 @@ int main(void) {
     assert(g_sim.chip_addr == FP_FACTORY_ADDRESS);
     printf("  [OK] Stage 5:  GP4/GP5 ARM ADIv5 SWD SRAM +0x34 password extraction & reset\n");
 
-    /* 7. Full 25-pass (0..24) Zero-VfyPwd-Mute Hardware Regression Test! */
+    /* 7. Full 33-pass (0..32) Zero-VfyPwd-Mute Hardware Regression Test! */
     sim_reset(0x29062D09u, unknown_pwd);
     g_sim.allow_gp3_glitch = true;
     g_sim.crit_threshold = 9450u;
-    g_sim.glitch_delay_min_us = 999999u; /* Force full 24-pass sweep without early hit */
+    g_sim.glitch_delay_min_us = 999999u; /* Force full 32-pass sweep without early hit */
     g_sim.glitch_delay_max_us = 999999u;
     g_sim.uart_muted = true; /* Even starting ALREADY MUTED from prior session auto-recovers in Pass 0! */
     fp_unlock_set_hal(&g_mock_hal, NULL);
@@ -453,7 +453,7 @@ int main(void) {
         assert(g_sim.uart_muted == false);
         assert(rep.target_addr == 0x29062D09u);
         if (p == 1u) {
-            g_sim.wrong_vfy_strikes = 0; /* Verify Passes 2..24 emit ZERO wrong VfyPwd strikes! */
+            g_sim.wrong_vfy_strikes = 0; /* Verify Passes 2..32 emit ZERO wrong VfyPwd strikes! */
         }
         else if (p >= 2u) {
             assert(g_sim.wrong_vfy_strikes == 0u);
@@ -462,7 +462,7 @@ int main(void) {
     uint8_t post_conf = 0xFF;
     assert(fp_sensor_txn(&g_sim_transport, 0x29062D09u, FP_INS_HANDSHAKE,
                          NULL, 0, NULL, 0, NULL, &post_conf, 40, false) == FP_SENSOR_OK);
-    printf("  [OK] Stage 7:  Full 24-pass Dual-Rail sweep -> 0 VfyPwd strikes, auto-unmute, UART live!\n");
+    printf("  [OK] Stage 7:  Full 32-pass Dual-Rail sweep -> 0 VfyPwd strikes, auto-unmute, UART live!\n");
 
     /* 8. Dead-UART / Corrupted Flash BaudRate Recovery (`CAL=645c` preserved + ResetDefaultPara)! */
     sim_reset(0x29062D09u, unknown_pwd);
