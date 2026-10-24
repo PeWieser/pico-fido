@@ -34,6 +34,8 @@ const char *fp_recover_source_name(fp_recover_source_t src) {
             return "user";
         case FP_RECOVER_SRC_FACTORY:
             return "factory";
+        case FP_RECOVER_SRC_FLASH:
+            return "flash";
         default:
             return "none";
     }
@@ -67,6 +69,56 @@ size_t fp_recover_add_password_variants(fp_recover_candidate_t *list, size_t cou
     }
     for (size_t i = 0; i < address_count && count < cap; i++) {
         count = fp_recover_add_candidate(list, count, cap, source, addresses[i], password);
+    }
+    return count;
+}
+
+static uint16_t rd_be16(const uint8_t *p) {
+    return (uint16_t)(((uint16_t)p[0] << 8) | p[1]);
+}
+
+static uint32_t rd_be32(const uint8_t *p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+}
+
+static bool pwd_plausible(const uint8_t pwd[4]) {
+    /* Reject erased flash (0xFFFFFFFF) and the zero password (covered by the factory stage). */
+    return !(pwd[0] == 0xFF && pwd[1] == 0xFF && pwd[2] == 0xFF && pwd[3] == 0xFF) &&
+           !(pwd[0] == 0 && pwd[1] == 0 && pwd[2] == 0 && pwd[3] == 0);
+}
+
+size_t fp_recover_scan_image(const uint8_t *img, size_t img_len,
+                             fp_recover_candidate_t *list, size_t count, size_t cap) {
+    if (img == NULL || list == NULL || img_len < 46u) {
+        return count;
+    }
+    /* Known EF_FP_CONF flag bits: PAIRED|LOCKED|STAGED|ZA_BYPASS (see fp_r558.c). */
+    const uint8_t known_flags = 0x01u | 0x02u | 0x04u | 0x08u;
+    for (size_t off = 0; off + 46u <= img_len && count < cap; off++) {
+        const uint8_t *p = img + off;
+        if (p[0] != 0x01u) {
+            continue;
+        }
+        /* Layout A: EF_FP_CONF payload (46 bytes). */
+        if (p[3] == 0x00u && p[1] != 0u && (p[1] & (uint8_t)~known_flags) == 0u) {
+            uint16_t capacity = rd_be16(p + 12);
+            uint32_t addr = rd_be32(p + 8);
+            if (capacity >= 1u && capacity <= 512u && addr != 0u && pwd_plausible(p + 4)) {
+                count = fp_recover_add_candidate(list, count, cap, FP_RECOVER_SRC_FLASH,
+                                                 addr, p + 4);
+                continue;
+            }
+        }
+        /* Layout B: backup blob (43 bytes, needs bytes up to +10 only for the signature). */
+        if (off + 43u <= img_len) {
+            uint16_t capacity = rd_be16(p + 9);
+            uint32_t addr = rd_be32(p + 5);
+            if (capacity >= 1u && capacity <= 512u && addr != 0u &&
+                addr != FP_FACTORY_ADDRESS && pwd_plausible(p + 1)) {
+                count = fp_recover_add_candidate(list, count, cap, FP_RECOVER_SRC_FLASH,
+                                                 addr, p + 1);
+            }
+        }
     }
     return count;
 }

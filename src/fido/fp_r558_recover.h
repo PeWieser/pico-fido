@@ -28,9 +28,15 @@
  *
  *   1. FP_RECOVER_SRC_STORED   - what is stored in EF_FP_CONF (survives reboots, resets of the sensor)
  *   2. FP_RECOVER_SRC_DERIVED  - re-derived from this ESP32-S3 die (SHA-256 over eFuse MAC + domain)
- *   3. FP_RECOVER_SRC_SHARED   - fixed development credentials ("R558" @ "PICO")
- *   4. FP_RECOVER_SRC_USER     - 4-byte candidates supplied by the owner (e.g. from an old note/backup)
- *   5. FP_RECOVER_SRC_FACTORY  - factory default 0x00000000 @ 0xFFFFFFFF
+ *   3. FP_RECOVER_SRC_FLASH    - EF_FP_CONF / backup-blob remnants found by scanning a raw flash
+ *                                image (journal/redo sectors, stale records). This is the stage that
+ *                                can resurrect a module paired before build 47 with a random
+ *                                password: the password itself is unrecoverable by computation,
+ *                                but a plaintext copy may still sit in the ESP32 key-storage
+ *                                partition (part0). See fp_recover_scan_image().
+ *   4. FP_RECOVER_SRC_SHARED   - fixed development credentials ("R558" @ "PICO")
+ *   5. FP_RECOVER_SRC_USER     - 4-byte candidates supplied by the owner (e.g. from an old note/backup)
+ *   6. FP_RECOVER_SRC_FACTORY  - factory default 0x00000000 @ 0xFFFFFFFF
  *
  * Each password is tried at every plausible address (stored address, last observed address, factory
  * address), because a lost SetChipAddr (0x15) leaves the password set but the address at the factory
@@ -59,6 +65,7 @@ typedef enum {
     FP_RECOVER_SRC_SHARED = 3,   /* fixed development-mode credentials */
     FP_RECOVER_SRC_USER = 4,     /* candidate supplied by the owner/webapp */
     FP_RECOVER_SRC_FACTORY = 5,  /* factory default 0x00000000 @ 0xFFFFFFFF */
+    FP_RECOVER_SRC_FLASH = 6,    /* remnant found by scanning a raw flash image (part0 archaeology) */
 } fp_recover_source_t;
 
 typedef struct {
@@ -88,11 +95,28 @@ size_t fp_recover_add_password_variants(fp_recover_candidate_t *list, size_t cou
                                         fp_recover_source_t source, const uint8_t password[4],
                                         const uint32_t *addresses, size_t address_count);
 
+/*
+ * Scans a raw flash image (e.g. the memory-mapped ESP32 "part0" key-storage partition, or a host
+ * flash dump) for remnants of the two plaintext layouts that ever contained the sensor password:
+ *
+ *   EF_FP_CONF payload (46 bytes, see conf_serialize() in fp_r558.c):
+ *     [0]=0x01 version, [1]=flags (known bits only, non-zero), [2]=fail count, [3]=0x00,
+ *     [4..7]=password, [8..11]=chip address (BE), [12..13]=capacity (BE, 1..512), [14..45]=slots
+ *   Backup blob (43 bytes, see fp_backup()):
+ *     [0]=0x01 version, [1..4]=password, [5..8]=chip address (BE), [9..10]=capacity (BE, 1..512)
+ *
+ * Every distinct (password, address) pair is appended with source FP_RECOVER_SRC_FLASH in image
+ * order. The signature is strict enough that random flash content does not produce false hits in
+ * practice; the final proof is always VfyPwd. Returns the new candidate count. Read-only.
+ */
+size_t fp_recover_scan_image(const uint8_t *img, size_t img_len,
+                             fp_recover_candidate_t *list, size_t count, size_t cap);
+
 /* Runs the ladder. Bounded, non-destructive, safe to call repeatedly. */
 bool fp_recover_run(const fp_transport_t *t, const fp_recover_candidate_t *list, size_t count,
                     fp_recover_report_t *out);
 
-/* Stable identifier for telemetry/UI ("stored", "derived", "shared", "user", "factory", "none"). */
+/* Stable identifier for telemetry/UI ("stored", "derived", "flash", "shared", "user", "factory", "none"). */
 const char *fp_recover_source_name(fp_recover_source_t src);
 
 #endif /* FP_R558_RECOVER_H_ */
