@@ -25,6 +25,7 @@
 #include "fp_r558_sensor.h"
 #include "fp_r558_uart.h"
 #include "fp_r558_unlock.h"
+#include "fp_r558_recover.h"
 #include "fp_led.h"
 #include "random.h"
 #include "fs/flash.h"
@@ -1135,6 +1136,146 @@ bool fp_probe(void) {
     return last_sensor_detected;
 }
 
+/* ------------------------------------------------------------------------- */
+/* Recovery ladder: make a password-locked module usable again.               */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * Builds the ordered candidate list. Priority is meaningful: the stored credentials are tried first
+ * (cheapest and most likely), then everything this die can re-derive, then owner-supplied values,
+ * then the factory default. Every password is also tried at the last observed address and at the
+ * factory address, because a lost SetChipAddr (0x15) leaves the password in place while the address
+ * falls back to 0xFFFFFFFF.
+ */
+static size_t build_recovery_candidates(fp_recover_candidate_t *list, size_t cap,
+                                        const fp_conf_t *c, uint32_t hint,
+                                        const uint8_t *user_pwds, size_t user_password_len) {
+    if (list == NULL || cap == 0u) {
+        return 0;
+    }
+    size_t n = 0;
+    uint32_t addrs[4];
+    size_t n_addrs = 0;
+
+    if (c != NULL && c->address != 0u) {
+        addrs[n_addrs++] = c->address;
+    }
+    if (hint != 0u) {
+        bool dup = false;
+        for (size_t i = 0; i < n_addrs; i++) {
+            if (addrs[i] == hint) {
+                dup = true;
+            }
+        }
+        if (!dup) {
+            addrs[n_addrs++] = hint;
+        }
+    }
+    addrs[n_addrs++] = FP_FACTORY_ADDRESS;
+
+    /* 1. Exactly what the authenticator has stored. */
+    if (c != NULL && (c->flags & (FP_FLAG_PAIRED | FP_FLAG_STAGED)) && c->address != 0u) {
+        n = fp_recover_add_candidate(list, n, cap, FP_RECOVER_SRC_STORED, c->address, c->password);
+    }
+
+    /* 2. Re-derive from this ESP32-S3 die. Survives a FIDO reset, an erase_flash and a conf loss. */
+    fp_session_t derived;
+    if (esp_dev_efuse_session(&derived)) {
+        n = fp_recover_add_candidate(list, n, cap, FP_RECOVER_SRC_DERIVED, derived.address, derived.password);
+        n = fp_recover_add_password_variants(list, n, cap, FP_RECOVER_SRC_DERIVED, derived.password,
+                                             addrs, n_addrs);
+    }
+
+    /* 3. Fixed development credentials (only usable when flash encryption is off). */
+    fp_session_t shared;
+    if (esp_dev_shared_session(&shared)) {
+        n = fp_recover_add_candidate(list, n, cap, FP_RECOVER_SRC_SHARED, shared.address, shared.password);
+        n = fp_recover_add_password_variants(list, n, cap, FP_RECOVER_SRC_SHARED, shared.password,
+                                             addrs, n_addrs);
+    }
+
+    /* 4. 4-byte candidates the owner supplied (old notes, previous backup, custom password). */
+    if (user_pwds != NULL) {
+        for (size_t off = 0; off + 4u <= user_password_len && n < cap; off += 4u) {
+            n = fp_recover_add_password_variants(list, n, cap, FP_RECOVER_SRC_USER, user_pwds + off,
+                                                 addrs, n_addrs);
+        }
+    }
+
+    /* 5. Factory state: password 0x00000000. Covers "SetPwd never landed". */
+    {
+        const uint8_t zero_pwd[4] = { 0, 0, 0, 0 };
+        n = fp_recover_add_password_variants(list, n, cap, FP_RECOVER_SRC_FACTORY, zero_pwd,
+                                             addrs, n_addrs);
+    }
+    return n;
+}
+
+fp_result_t fp_recover_sensor(const uint8_t *user_passwords, size_t user_password_len,
+                              fp_recover_report_t *out) {
+    if (!FP_FEATURE_ON) {
+        return FP_ERR_NOT_PAIRED;
+    }
+    fp_conf_t c;
+    conf_load(&c);
+
+    uint32_t hint = fp_uart_sticky_addr();
+    if (hint == 0u && fp_sensor_has_last_ack()) {
+        hint = fp_sensor_last_ack_addr();
+    }
+    fp_uart_scan_pins((c.flags & (FP_FLAG_PAIRED | FP_FLAG_STAGED)) ? c.address : hint);
+
+    fp_recover_candidate_t list[FP_RECOVER_MAX_CANDIDATES];
+    fp_recover_report_t local;
+    fp_recover_report_t *rep = out != NULL ? out : &local;
+    size_t n = build_recovery_candidates(list, FP_RECOVER_MAX_CANDIDATES, &c, hint,
+                                         user_passwords, user_password_len);
+    bool ok = fp_recover_run(fp_uart_transport(), list, n, rep);
+    mbedtls_platform_zeroize(list, sizeof(list));
+
+    last_sensor_detected = rep->sensor_present;
+    fp_uart_set_diag(rep->summary);
+
+    if (!ok) {
+        conf_clear(&c);
+        return rep->sensor_present ? FP_ERR_SENSOR_AUTH : FP_ERR_SENSOR;
+    }
+
+    /*
+     * The credentials verified, so the module is ours again. Store them as STAGED: the pairing flow
+     * then resumes at its final checks instead of touching SetPwd/SetChipAddr again (which would
+     * risk losing the module a second time).
+     */
+    uint16_t capacity = c.capacity;
+    fp_session_t s;
+    s.address = rep->address;
+    memcpy(s.password, rep->password, 4);
+    uint8_t code = 0xFF;
+    fp_sysparam_t sp;
+    if (fp_sensor_read_sysparam(fp_uart_transport(), s.address, &sp, &code) == FP_SENSOR_OK &&
+        code == FP_CONF_OK && sp.capacity > 0) {
+        capacity = sp.capacity > FP_TEMPLATE_MAX ? FP_TEMPLATE_MAX : sp.capacity;
+    }
+    if (capacity == 0) {
+        capacity = 100;
+    }
+
+    memset(&c, 0, sizeof(c));
+    c.flags = FP_FLAG_STAGED;
+    c.fail_count = 0;
+    c.capacity = capacity;
+    memcpy(c.password, rep->password, 4);
+    c.address = rep->address;
+    bool saved = conf_save(&c);
+    conf_clear(&c);
+    if (!saved) {
+        return FP_ERR_STORAGE;
+    }
+    last_sensor_detected = true;
+    fp_diag_reset();
+    return FP_OK;
+}
+
 fp_result_t fp_factory_reset_sensor(void) {
     if (!FP_FEATURE_ON) {
         return FP_ERR_NOT_PAIRED;
@@ -1145,6 +1286,27 @@ fp_result_t fp_factory_reset_sensor(void) {
         conf_clear(&c);
         return FP_ERR_ALREADY_PAIRED;
     }
+
+    /*
+     * A reset is impossible without a verified session: RestSetting (0x3B) and SetPwd (0x12) are
+     * answered with 0x21 while the module password is unverified. If the stored password no longer
+     * matches, run the recovery ladder first so a locked module can still be reset.
+     */
+    if ((c.flags & (FP_FLAG_PAIRED | FP_FLAG_STAGED)) && !is_dev_npwd_conf(&c) && !is_za_bypass_conf(&c)) {
+        fp_session_t probe;
+        probe.address = c.address;
+        memcpy(probe.password, c.password, 4);
+        uint8_t vcode = 0xFF;
+        if (fp_sensor_verify_password(fp_uart_transport(), &probe, &vcode) != FP_SENSOR_OK ||
+            vcode != FP_CONF_OK) {
+            fp_recover_report_t rep;
+            if (fp_recover_sensor(NULL, 0, &rep) == FP_OK) {
+                conf_clear(&c);
+                conf_load(&c);
+            }
+        }
+    }
+
     uint32_t hint = (c.flags & (FP_FLAG_PAIRED | FP_FLAG_STAGED)) ? c.address : 0;
     if (c.flags & (FP_FLAG_PAIRED | FP_FLAG_STAGED)) {
         const uint8_t zero_pwd[4] = { 0, 0, 0, 0 };
@@ -1611,6 +1773,17 @@ fp_result_t fp_pair(uint16_t *capacity_out) {
             addr = dev_bind.address;
         }
         else {
+            /*
+             * Product rule: never write a password into a module that no code path can reproduce.
+             * A random password lives only in this device's flash; if that flash is erased, the
+             * module is bricked - which is exactly how modules got locked before. On a real device
+             * one of the two derivations above always succeeds, so this branch is host/emulation
+             * only and the random fallback cannot reach a field unit.
+             */
+#if defined(ESP_PLATFORM)
+            conf_clear(&c);
+            return FP_ERR_NOT_SECURE;
+#else
             uint8_t new_addr[4];
             do {
                 random_fill_buffer(BYTE_ARRAY(new_pwd, sizeof(new_pwd)));
@@ -1619,6 +1792,7 @@ fp_result_t fp_pair(uint16_t *capacity_out) {
                 random_fill_buffer(BYTE_ARRAY(new_addr, sizeof(new_addr)));
                 addr = ((uint32_t)new_addr[0] << 24) | ((uint32_t)new_addr[1] << 16) | ((uint32_t)new_addr[2] << 8) | new_addr[3];
             } while (addr == 0 || addr == FP_FACTORY_ADDRESS);
+#endif
         }
 
         /* Stage the secrets before the sensor is changed. */

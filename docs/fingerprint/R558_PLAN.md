@@ -7,6 +7,10 @@ ESP32-S3 Super Mini. Es ist der Stand der Umsetzung im Branch `arena/c392330f-pi
 simulierten Modul). Ein ESP-IDF-Build und ein Test mit echter Hardware sind **noch nicht erfolgt**.
 Siehe Abschnitt 9.
 
+**Passwortsperre / Wiederherstellung:** Wie ein Modul, das nach `0x21` fragt, wieder benutzbar gemacht
+wird, steht in `docs/fingerprint/R558_WIEDERHERSTELLUNG.md` (nicht-destruktive 5-Stufen-Leiter,
+Vendor-Befehl `0x0B`). Abschnitt 4.1 unten ist entsprechend aktualisiert.
+
 ---
 
 ## 1. Anforderungen (aus der Aufgabe)
@@ -114,10 +118,13 @@ fp_led.c:  Ring-Treiber auf NeoPixel-Basis, überschreibt led_driver (nur ESP mi
 
 1. **Die PIN ist die Wurzel des Vertrauens.** Pairing, Enrollment, Löschen und Entsperren verlangen ein PIN-Token
    mit der Berechtigung `authenticatorConfig` (ACFG). Ohne gesetzte PIN ist kein Pairing möglich.
-2. **Pairing setzt ein zufälliges Passwort und eine zufällige Adresse** im Sensor (4 Byte je). Beides wird in
-   `EF_FP_CONF` (0x1104) im Flash-Datenbereich gespeichert. **Der Schutz im Ruhezustand hängt an der
-   ESP32-Flash-Verschlüsselung.** Der Objektspeicher des SDK verschlüsselt diese Datei nicht selbst; das habe ich
-   im Quelltext nicht gefunden (siehe R1).
+2. **Pairing setzt ein Passwort und eine Adresse** im Sensor (4 Byte je), beides wird in `EF_FP_CONF` (0x1104)
+   im Flash-Datenbereich gespeichert. Das Passwort ist **deterministisch aus dieser MCU abgeleitet**, nicht
+   zufällig: `SHA-256("pico-fido-r558-efuse-bind-v1" ‖ eFuse-MAC)` im Produktionsmodus, `"R558"` im
+   Entwicklungsmodus. Damit ist es nach einem `erase_flash` reproduzierbar und ein Modul kann nicht mehr
+   unwiederbringlich gesperrt werden (`random_fill_buffer()` wird auf echter Hardware nicht mehr verwendet).
+   **Der Schutz im Ruhezustand hängt an der ESP32-Flash-Verschlüsselung.** Der Objektspeicher des SDK
+   verschlüsselt diese Datei nicht selbst; das habe ich im Quelltext nicht gefunden (siehe R1).
 3. **Vor jeder Verifikation** wird das gespeicherte Passwort an der gespeicherten Adresse geprüft (`VfyPwd`).
 
 ### 4.2 Was passiert bei einem Sensortausch
@@ -154,10 +161,11 @@ UV-Zugriff.** Dafür braucht man die PIN.
 - **R3-Status (umgesetzt):** Die Webapp kann die Sensor-Konfiguration sichern (Vendor-Befehl `0x06`, 43-Byte-Blob)
   und nach einem FIDO-Reset wiederherstellen (`0x07`). Der Restore prüft, dass der Sensor Passwort und Adresse
   akzeptiert und die Template-Anzahl stimmt. Details: `docs/fingerprint/PIN_UND_BACKUP.md`.
-- **R3 – FIDO-Reset (Ausgangslage).** Ein Reset des Authenticators löscht `EF_FP_CONF`. Der Sensor behält aber das alte Passwort
-  und die Adresse. Ein Wiederverwenden desselben Sensors erfordert dann ein Zurücksetzen des Sensors auf Werks-
-  einstellung (Flash löschen, Befehl `RestSetting 0x3B` laut Datenblatt; ob er ohne Passwort funktioniert, ist noch zu prüfen). Ein neuer Sensor geht
-  sofort.
+- **R3 – FIDO-Reset.** Ein Reset des Authenticators löscht `EF_FP_CONF`. Der Sensor behält aber das alte Passwort
+  und die Adresse. Weil das Passwort aus der eFuse-MAC dieser MCU abgeleitet ist, findet `fp_recover_sensor()`
+  (`0x0B recover`, siehe `R558_WIEDERHERSTELLUNG.md`) es ohne Zutun wieder; das Pairing wird danach fortgesetzt.
+  `RestSetting 0x3B` hilft dabei **nicht** – es ist selbst passwortgeschützt (Handbuch V1.1) und wird ohne
+  verifiziertes Passwort mit `0x21` beantwortet. Ein neuer Sensor geht sofort.
 - **R4 – Kein Tastendruck.** Pairing, Enrollment, Löschen und Entsperren verlangen nur das PIN-Token. Der
   Fingerabdrucksensor ist die einzige Interaktion am Gerät. Die Vendor-Befehle 0x02–0x05 prüfen bewusst
   keinen `up_btn`. Die Sicherheit beruht auf PIN plus Sensorbindung (Abschnitt 4.1).
@@ -217,6 +225,8 @@ Vollständige Beschreibung inkl. PIN-Protokoll: `docs/fingerprint/WEBAPP_PROMPT.
 |---|---|
 | `tests/fingerprint/run_r558_sensor_test.sh` – Paketschicht gegen simuliertes Modul (Vektor aus Datenblatt, Junk-Bytes, Prüfsummenfehler, falsche Adresse, Timeout) | bestanden |
 | `tests/fingerprint/run_r558_engine_test.sh` – Engine (Pairing, Enrollment, Verifikation, Sperre, Sensortausch, Manipulation, unbekanntes Template, unterbrochenes Pairing, Nicht-Werkszustand, Löschen) | bestanden (40 Prüfungen) |
+| `tests/fingerprint/run_r558_recover_test.sh` – Wiederherstellungs-Leiter gegen simuliertes, passwortgesperrtes Modul (Stufenreihenfolge, Adressvarianten, nur `VfyPwd` auf der Leitung, stille Leitung, Obergrenze) | bestanden (32 Prüfungen) |
+| `tests/fingerprint/recover_test.c` – benötigt **keinen** Emulations-Build, nur `gcc` | bestanden |
 | Emulations-Build (`cmake -DENABLE_EMULATION=1`), vorhandene C-Tests `fido_*_test` | bestanden |
 | Emulations-Build, Gesamtbinary `pico_fido` | **nicht baubar** in dieser Umgebung (fehlende Bibliothek `tss2`, nur Linux-OTP). Vorbestehend, unabhängig von dieser Änderung. |
 | `pytest`-Suite (`tests/`) | nicht ausgeführt, benötigt das Gesamtbinary |

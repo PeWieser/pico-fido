@@ -169,6 +169,7 @@ list(APPEND SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/src/fido/fp_r558_sensor.c
     ${CMAKE_CURRENT_LIST_DIR}/src/fido/fp_r558_uart.c
     ${CMAKE_CURRENT_LIST_DIR}/src/fido/fp_r558_unlock.c
+    ${CMAKE_CURRENT_LIST_DIR}/src/fido/fp_r558_recover.c
     ${CMAKE_CURRENT_LIST_DIR}/src/fido/fp_r558.c
     ${CMAKE_CURRENT_LIST_DIR}/src/fido/fp_led.c
     ${CMAKE_CURRENT_LIST_DIR}/src/fido/fp_init.c

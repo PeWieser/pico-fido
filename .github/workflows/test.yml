@@ -34,11 +34,12 @@ jobs:
           cmake -S . -B /tmp/emu_build -DENABLE_EMULATION=1 -DENABLE_R558_FINGERPRINT=1
           cmake --build /tmp/emu_build -j"$(nproc)"
           ctest --test-dir /tmp/emu_build --output-on-failure
-      - name: Run R558 UART packet, engine & full-stack CTAP 2.1 cold-boot suites
+      - name: Run R558 UART packet, recovery-ladder, engine & full-stack CTAP 2.1 cold-boot suites
         run: |
           SITE_PKGS=$(/tmp/venv/bin/python3 -c 'import site; print(site.getsitepackages()[0])')
           cp -R tests/docker/fido2/* "$SITE_PKGS/fido2/hid/"
           ./tests/fingerprint/run_r558_sensor_test.sh
+          ./tests/fingerprint/run_r558_recover_test.sh
           PICO_FIDO_EMU_BUILD=/tmp/emu_build ./tests/fingerprint/run_r558_engine_test.sh
           /tmp/venv/bin/python3 ./tests/fingerprint/verify_full_stack_ctap.py /tmp/emu_build/pico_fido
 
