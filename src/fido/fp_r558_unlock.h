@@ -19,8 +19,8 @@
 #include "fp_r558.h"
 #include "fp_r558_sensor.h"
 
-/* Maximum pass index for multi-pass hardware power/glitch sweeps (0 = software/audit, 1..24 = GP3+GP4 sweeps). */
-#define FP_UNLOCK_MAX_PASSES        24u
+/* Maximum pass index for multi-pass hardware power/glitch sweeps (0 = software/audit, 1..32 = GP3+GP4 sweeps). */
+#define FP_UNLOCK_MAX_PASSES        32u
 
 /* Additional protocol opcodes documented in OEM V1.1 / V1.5.1 / R5xx hardware manuals. */
 #define FP_INS_READ_INF_PAGE        0x16
@@ -80,7 +80,7 @@ void fp_unlock_set_hal(const fp_unlock_hal_t *hal, void *ctx);
 void fp_unlock_reset_state(void);
 
 /*
- * Executes one bounded recovery pass (`pass` = 0..16, max ~2.2 s so USB & WDT never time out)
+ * Executes one bounded recovery pass (`pass` = 0..32, max ~2.2 s so USB & WDT never time out)
  * against a password-locked GROW R558-S sensor using `t` and optional board `efuse_pwd`.
  */
 void fp_unlock_run_pass(const fp_transport_t *t, uint8_t pass, uint32_t hint_addr,
