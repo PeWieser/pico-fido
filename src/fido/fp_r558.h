@@ -18,8 +18,10 @@
  *
  * Security model (summary, see docs/fingerprint/R558_PLAN.md for the full discussion):
  *  - A sensor is only trusted after pairing. Pairing needs the device PIN (authenticatorConfig permission)
- *    and sets a random 4-byte module password and a random 4-byte module address. Both are stored in the
- *    encrypted object store (MKEK), never in plain flash.
+ *    and sets a 4-byte module password and a 4-byte module address. Both are derived deterministically from
+ *    this MCU (SHA-256 over the eFuse MAC in production, fixed development credentials in dev mode), so a
+ *    lost flash cannot lock a module forever; they are stored in the encrypted object store (MKEK), never
+ *    in plain flash. See fp_r558_recover.h for the recovery ladder.
  *  - Before every verification the stored password is checked at the stored address. A replacement
  *    sensor is factory-fresh (address 0xFFFFFFFF, no password) and cannot answer, so it is rejected.
  *  - A module that answers at our address with a wrong password is treated as tampering and locks UV.
@@ -34,6 +36,7 @@
 #include <stdint.h>
 
 #include "fp_r558_config.h"
+#include "fp_r558_recover.h"
 
 #define FP_ALL_SLOTS 0xFFFFu
 
@@ -84,6 +87,19 @@ bool fp_probe(void);
 
 /* Unpaired rescue helper: sends R558-S RestSetting (0x3B) + board eFuse unlock across all GPIO pairs. */
 fp_result_t fp_factory_reset_sensor(void);
+
+/*
+ * Recovery ladder for a module that asks for its password (0x21/0x13 on every instruction).
+ *
+ * Tries, in order: stored EF_FP_CONF credentials, credentials re-derived from this die, development
+ * credentials, 4-byte candidates supplied by the owner (`user_passwords`, len must be a multiple of
+ * 4) and finally the factory password. Each password is tried at the stored, the last observed and
+ * the factory address. Non-destructive: only VfyPwd (0x13) is sent. On success the verified
+ * credentials are stored as STAGED, so a following fp_pair() resumes without touching the module
+ * password again. `out` (optional) receives the full report including a one-line telemetry summary.
+ */
+fp_result_t fp_recover_sensor(const uint8_t *user_passwords, size_t user_password_len,
+                              fp_recover_report_t *out);
 
 /*
  * Executes one bounded pass (`pass` = 0..16, or 0xFF to reset calibration) of the 5-stage R558-S

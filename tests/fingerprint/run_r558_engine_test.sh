@@ -12,7 +12,8 @@ defs="$(grep '^C_DEFINES' "$flags" | sed 's/^C_DEFINES = //')"
 out="$(mktemp -d)"
 eval gcc -std=gnu11 -Wall -Wextra -Werror -DENABLE_R558_FINGERPRINT=1 $defs $inc \
     "$here/engine_test.c" "$root/src/fido/fp_r558.c" "$root/src/fido/fp_r558_sensor.c" \
-    "$root/src/fido/fp_r558_unlock.c" "$root/src/fido/fp_led.c" -o "$out/engine_test"
+    "$root/src/fido/fp_r558_unlock.c" "$root/src/fido/fp_r558_recover.c" \
+    "$root/src/fido/fp_led.c" -o "$out/engine_test"
 "$out/engine_test"
 eval gcc -std=gnu11 -Wall -Wextra -Werror -DENABLE_R558_FINGERPRINT=1 $defs $inc \
     "$here/unlock_test.c" "$root/src/fido/fp_r558_unlock.c" "$root/src/fido/fp_r558_sensor.c" \

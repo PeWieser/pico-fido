@@ -353,9 +353,19 @@ static int cbor_vendor_generic(uint8_t cmd, const uint8_t *data, size_t len) {
          *   0x06 backup            -> {1: bytes(43) backup blob}   (R3, plaintext: the caller must encrypt it)
          *   0x07 restore           -> key 2 param {1: bytes(43)}, {}  (R3, checks the sensor before trusting it)
          *   0x08 probe             -> live UART multi-pin scan + LED ring flash + full status map {1..10}
+         *   0x0B recover           -> non-destructive password recovery ladder (key 2, optional: 4-byte
+         *                             password candidates of the owner). Status map + {14: found,
+         *                             15: source}. Sends only VfyPwd (0x13); never erases or glitches.
+         *
          * Subcommands 0x02-0x07 need a PIN token (ACFG). No button: the sensor is the only interaction.
+         * The rescue subcommands 0x09/0x0A/0x0B work without a PIN on purpose: they can only restore
+         * access with credentials this device can already derive, they never reveal a password, and a
+         * locked-out owner cannot be asked for a fingerprint first.
          */
-        if (vendorCmd == 0x01 || vendorCmd == 0x08 || vendorCmd == 0x09 || vendorCmd == 0x0A) {
+        if (vendorCmd == 0x01 || vendorCmd == 0x08 || vendorCmd == 0x09 || vendorCmd == 0x0A ||
+            vendorCmd == 0x0B) {
+            bool recover_found = false;
+            const char *recover_source = "none";
             if (vendorCmd == 0x08) {
                 fp_probe();
             }
@@ -375,9 +385,25 @@ static int cbor_vendor_generic(uint8_t cmd, const uint8_t *data, size_t len) {
                     CBOR_ERROR(CTAP2_ERR_NOT_ALLOWED);
                 }
             }
+            else if (vendorCmd == 0x0B) {
+                if (vendorParam.present == true && (vendorParam.len % 4u) != 0u) {
+                    CBOR_ERROR(CTAP1_ERR_INVALID_LEN);
+                }
+                const uint8_t *cands = (vendorParam.present == true && vendorParam.len > 0u)
+                                       ? vendorParam.data : NULL;
+                size_t cands_len = cands != NULL ? vendorParam.len : 0u;
+                fp_recover_report_t rep;
+                fp_result_t rres = fp_recover_sensor(cands, cands_len, &rep);
+                recover_found = rep.found;
+                recover_source = fp_recover_source_name(rep.source);
+                mbedtls_platform_zeroize(&rep, sizeof(rep));
+                if (rres == FP_ERR_STORAGE) {
+                    CBOR_ERROR(fp_result_to_ctap(rres));
+                }
+            }
             fp_status_t st;
             fp_get_status(&st);
-            CBOR_CHECK(cbor_encoder_create_map(&encoder, &mapEncoder, 13));
+            CBOR_CHECK(cbor_encoder_create_map(&encoder, &mapEncoder, 15));
             CBOR_CHECK(cbor_encode_uint(&mapEncoder, 0x01));
             CBOR_CHECK(cbor_encode_boolean(&mapEncoder, st.paired));
             CBOR_CHECK(cbor_encode_uint(&mapEncoder, 0x02));
@@ -410,6 +436,10 @@ static int cbor_vendor_generic(uint8_t cmd, const uint8_t *data, size_t len) {
             CBOR_CHECK(cbor_encode_uint(&mapEncoder, st.last_conf));
             CBOR_CHECK(cbor_encode_uint(&mapEncoder, 0x0D));
             CBOR_CHECK(cbor_encode_uint(&mapEncoder, st.last_transport));
+            CBOR_CHECK(cbor_encode_uint(&mapEncoder, 0x0E));
+            CBOR_CHECK(cbor_encode_boolean(&mapEncoder, recover_found));
+            CBOR_CHECK(cbor_encode_uint(&mapEncoder, 0x0F));
+            CBOR_CHECK(cbor_encode_text_stringz(&mapEncoder, recover_source));
         }
         else if (vendorCmd >= 0x02 && vendorCmd <= 0x07) {
             int auth_ret = fp_pin_auth((uint8_t)pinUvAuthProtocol, &pinUvAuthParam, raw_vendor_params, raw_vendor_params_len, vendorCmd);
